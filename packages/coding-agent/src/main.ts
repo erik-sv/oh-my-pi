@@ -20,7 +20,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import type { Args } from "./cli/args";
+import { type Args, parseArgs } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
@@ -794,12 +794,6 @@ export async function runRootCommand(
 		});
 		return { pipedInput, fileText: processed.text, fileImages: processed.images };
 	});
-	const { initialMessage, initialImages } = buildInitialMessage({
-		parsed: parsedArgs,
-		fileText,
-		fileImages,
-		stdinContent: pipedInput,
-	});
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 	const mode = parsedArgs.mode || "text";
@@ -963,7 +957,15 @@ export async function runRootCommand(
 			notifs.push({ kind: "error", message: modelRegistryError.message });
 		}
 
-		applyExtensionFlagValues(session, rawArgs);
+		const extensionFlags = applyExtensionFlagValues(session, rawArgs);
+		const initialArgs =
+			extensionFlags.size > 0 ? parseArgs([...rawArgs], session.extensionRunner?.getFlags()) : parsedArgs;
+		const { initialMessage, initialImages } = buildInitialMessage({
+			parsed: initialArgs,
+			fileText,
+			fileImages,
+			stdinContent: pipedInput,
+		});
 
 		if (!isInteractive && !session.model) {
 			if (modelFallbackMessage) {
@@ -1008,7 +1010,7 @@ export async function runRootCommand(
 				changelogMarkdown,
 				notifs,
 				versionCheckPromise,
-				parsedArgs.messages,
+				initialArgs.messages,
 				setToolUIContext,
 				lspServers,
 				mcpManager,
@@ -1019,7 +1021,7 @@ export async function runRootCommand(
 		} else {
 			await runPrintMode(session, {
 				mode,
-				messages: parsedArgs.messages,
+				messages: initialArgs.messages,
 				initialMessage,
 				initialImages,
 			});
