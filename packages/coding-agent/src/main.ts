@@ -20,7 +20,8 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
-import { type Args, parseArgs } from "./cli/args";
+import type { Args } from "./cli/args";
+import { applyExtensionFlags } from "./cli/extension-flags";
 import { processFileArguments } from "./cli/file-processor";
 import { buildInitialMessage } from "./cli/initial-message";
 import { runListModelsCommand } from "./cli/list-models";
@@ -166,37 +167,6 @@ export async function submitInteractiveInput(
 	}
 }
 
-function applyExtensionFlagValues(session: AgentSession, rawArgs: string[]): Map<string, boolean | string> {
-	const extensionRunner = session.extensionRunner;
-	if (!extensionRunner) {
-		return new Map();
-	}
-
-	const extFlags = extensionRunner.getFlags();
-	if (extFlags.size > 0) {
-		for (let i = 0; i < rawArgs.length; i++) {
-			const arg = rawArgs[i];
-			if (!arg.startsWith("--")) {
-				continue;
-			}
-			const flagName = arg.slice(2);
-			const extFlag = extFlags.get(flagName);
-			if (!extFlag) {
-				continue;
-			}
-			if (extFlag.type === "boolean") {
-				extensionRunner.setFlagValue(flagName, true);
-				continue;
-			}
-			if (i + 1 < rawArgs.length) {
-				extensionRunner.setFlagValue(flagName, rawArgs[++i]);
-			}
-		}
-	}
-
-	return extensionRunner.getFlagValues();
-}
-
 type AcpSessionFactory = (cwd: string) => Promise<AgentSession>;
 
 export interface AcpSessionFactoryOptions {
@@ -239,7 +209,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 		if (args.parsedArgs.apiKey && !args.baseOptions.model && nextSession.model) {
 			args.authStorage.setRuntimeApiKey(nextSession.model.provider, args.parsedArgs.apiKey);
 		}
-		applyExtensionFlagValues(nextSession, args.rawArgs);
+		applyExtensionFlags(nextSession.extensionRunner, args.rawArgs);
 		return nextSession;
 	};
 }
@@ -784,16 +754,7 @@ export async function runRootCommand(
 	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
 		Bun.env.PI_NO_TITLE = "1";
 	}
-	const { pipedInput, fileText, fileImages } = await logger.time("prepareInitialMessage", async () => {
-		const pipedInput = await readPipedInput();
-		if (parsedArgs.fileArgs.length === 0) {
-			return { pipedInput, fileText: undefined, fileImages: undefined };
-		}
-		const processed = await processFileArguments(parsedArgs.fileArgs, {
-			autoResizeImages: settingsInstance.get("images.autoResize"),
-		});
-		return { pipedInput, fileText: processed.text, fileImages: processed.images };
-	});
+	const pipedInput = await logger.time("readPipedInput", readPipedInput);
 	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
 	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
 	const mode = parsedArgs.mode || "text";
@@ -957,13 +918,23 @@ export async function runRootCommand(
 			notifs.push({ kind: "error", message: modelRegistryError.message });
 		}
 
-		const extensionFlags = applyExtensionFlagValues(session, rawArgs);
-		const initialArgs =
-			extensionFlags.size > 0 ? parseArgs([...rawArgs], session.extensionRunner?.getFlags()) : parsedArgs;
+		const initialArgs = applyExtensionFlags(session.extensionRunner, rawArgs) ?? parsedArgs;
+		// Process @file args from the extension-aware parse, so an extension
+		// string-flag value such as `--target @notes.md` is consumed as the flag's
+		// value rather than read as a file into the prompt. File args are not
+		// needed earlier (session setup depends only on pipedInput/mode).
+		const processedFiles =
+			initialArgs.fileArgs.length > 0
+				? await logger.time("processFileArguments", () =>
+						processFileArguments(initialArgs.fileArgs, {
+							autoResizeImages: settingsInstance.get("images.autoResize"),
+						}),
+					)
+				: undefined;
 		const { initialMessage, initialImages } = buildInitialMessage({
 			parsed: initialArgs,
-			fileText,
-			fileImages,
+			fileText: processedFiles?.text,
+			fileImages: processedFiles?.images,
 			stdinContent: pipedInput,
 		});
 
