@@ -126,6 +126,106 @@ describe("buildSessionContext", () => {
 			expect(ctx.messages).toHaveLength(4);
 			expect(ctx.messages.map(m => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
 		});
+		it("neutralizes signed thinking when stripping dangling trailing tool calls", () => {
+			const assistantEntry: SessionMessageEntry = {
+				type: "message",
+				id: "2",
+				parentId: "1",
+				timestamp: "2025-01-01T00:00:00Z",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "private chain", thinkingSignature: "sig_123" },
+						{ type: "redactedThinking", data: "enc_blob" },
+						{ type: "text", text: "calling tool" },
+						{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "README.md" } },
+					],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-test",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "toolUse",
+					timestamp: 1,
+				},
+			};
+			const entries: SessionEntry[] = [msg("1", null, "user", "hello"), assistantEntry];
+			const ctx = buildSessionContext(entries);
+			expect(ctx.messages).toHaveLength(2);
+			expect(ctx.messages[1]?.role).toBe("assistant");
+			if (ctx.messages[1]?.role !== "assistant") throw new Error("Expected assistant");
+			expect(ctx.messages[1].content).toEqual([
+				{ type: "thinking", thinking: "private chain", thinkingSignature: undefined },
+				{ type: "text", text: "calling tool" },
+			]);
+		});
+		it("rewinds trailing empty error retries to the last successful turn", () => {
+			const successfulAssistant: SessionMessageEntry = {
+				type: "message",
+				id: "2",
+				parentId: "1",
+				timestamp: "2025-01-01T00:00:00Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: "all good" }],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-test",
+					usage: {
+						input: 1,
+						output: 1,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 2,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: 1,
+				},
+			};
+			const failedAssistant: SessionMessageEntry = {
+				type: "message",
+				id: "4",
+				parentId: "3",
+				timestamp: "2025-01-01T00:00:00Z",
+				message: {
+					role: "assistant",
+					content: [],
+					api: "anthropic-messages",
+					provider: "anthropic",
+					model: "claude-test",
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "error",
+					errorMessage: "upstream failed",
+					timestamp: 2,
+				},
+			};
+			const entries: SessionEntry[] = [
+				msg("1", null, "user", "hello"),
+				successfulAssistant,
+				msg("3", "2", "user", "retry please"),
+				failedAssistant,
+			];
+			const ctx = buildSessionContext(entries);
+			expect(ctx.messages).toHaveLength(2);
+			expect(ctx.messages[0]?.role).toBe("user");
+			expect(ctx.messages[1]?.role).toBe("assistant");
+			if (ctx.messages[1]?.role !== "assistant") throw new Error("Expected assistant");
+			expect(ctx.messages[1].content).toEqual([{ type: "text", text: "all good" }]);
+		});
 
 		it("tracks thinking level changes", () => {
 			const entries: SessionEntry[] = [

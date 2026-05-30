@@ -701,6 +701,45 @@ export function buildSessionContext(
 			appendMessage(entry);
 		}
 	}
+	// If the last assistant turn still contains tool calls, its matching results never
+	// made it into the persisted path. Replaying that dangling tool_use batch causes
+	// `transformMessages` to synthesize aborted tool results and a <turn-aborted> note,
+	// which can wedge the model into re-issuing the same calls forever.
+	//
+	// Rewriting that trailing turn is necessary, but once we touch it we must also
+	// neutralize protected Anthropic reasoning blocks. Signed `thinking` /
+	// `redactedThinking` content on a modified latest assistant turn is rejected by
+	// Anthropic as "thinking blocks in the latest assistant message cannot be
+	// modified". Drop encrypted redacted blocks entirely and clear signed-thinking
+	// signatures so the Anthropic encoder downgrades them to plain text on replay.
+	// If nothing usable remains, drop the turn outright.
+	const lastMessage = messages[messages.length - 1];
+	if (lastMessage?.role === "assistant" && lastMessage.content.some(block => block.type === "toolCall")) {
+		const normalized = lastMessage.content
+			.filter(block => block.type !== "toolCall" && block.type !== "redactedThinking")
+			.map(block =>
+				block.type === "thinking" && block.thinkingSignature ? { ...block, thinkingSignature: undefined } : block,
+			);
+		if (normalized.length === 0) {
+			messages.pop();
+		} else {
+			messages[messages.length - 1] = { ...lastMessage, content: normalized };
+		}
+	}
+	const isEmptyErrorAssistant = (message: SessionContext["messages"][number] | undefined): boolean =>
+		Boolean(
+			message &&
+				message.role === "assistant" &&
+				(message.stopReason === "error" || message.stopReason === "aborted") &&
+				Array.isArray(message.content) &&
+				message.content.length === 0,
+		);
+	while (isEmptyErrorAssistant(messages[messages.length - 1])) {
+		messages.pop();
+		if (messages[messages.length - 1]?.role === "user") {
+			messages.pop();
+		}
+	}
 
 	return {
 		messages,

@@ -114,11 +114,8 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-describe("anthropic thinking filter — rewritten-thinking meta-prompt", () => {
-	it("collapses a thinking block whose mid-stream content reveals the marker", async () => {
-		// Marker appears after a short preamble — first delta is innocuous, second carries
-		// the meta-prompt phrase. The remainder of the broken summary should never reach
-		// downstream consumers.
+describe("anthropic thinking passthrough", () => {
+	it("preserves thinking content and signature even when it mentions rewritten thinking", async () => {
 		const events = thinkingStreamEvents(
 			[
 				"I don't see any current ",
@@ -130,31 +127,34 @@ describe("anthropic thinking filter — rewritten-thinking meta-prompt", () => {
 		);
 		const { events: emitted, thinking } = await runStream(events);
 
-		expect(thinking.thinking).toBe("Thinking...");
-		expect(thinking.thinkingSignature).toBe("");
+		expect(thinking.thinking).toBe(
+			"I don't see any current rewritten thinking or next thinking to process. Could you provide the next thinking that needs to be rewritten?",
+		);
+		expect(thinking.thinkingSignature).toBe("sig_broken");
 
-		// First delta (pre-marker) is the only thinking_delta that should have been emitted.
 		const thinkingDeltas = emitted.filter(
 			(e): e is Extract<AssistantMessageEvent, { type: "thinking_delta" }> => e.type === "thinking_delta",
 		);
-		expect(thinkingDeltas.map(d => d.delta)).toEqual(["I don't see any current "]);
+		expect(thinkingDeltas.map(d => d.delta)).toEqual([
+			"I don't see any current ",
+			"rewritten thinking or next thinking to process. ",
+			"Could you provide the next thinking that needs to be rewritten?",
+		]);
 
-		// thinking_end carries the replacement content so any downstream renderer
-		// re-rendering from the final event reflects "Thinking...".
 		const thinkingEnd = emitted.find(
 			(e): e is Extract<AssistantMessageEvent, { type: "thinking_end" }> => e.type === "thinking_end",
 		);
-		expect(thinkingEnd?.content).toBe("Thinking...");
+		expect(thinkingEnd?.content).toBe(
+			"I don't see any current rewritten thinking or next thinking to process. Could you provide the next thinking that needs to be rewritten?",
+		);
 
-		// Trailing assistant text is preserved untouched.
 		const text = emitted.find(
 			(e): e is Extract<AssistantMessageEvent, { type: "text_end" }> => e.type === "text_end",
 		);
 		expect(text?.content).toBe("final answer");
 	});
 
-	it("collapses a thinking block whose marker only becomes apparent at content_block_stop", async () => {
-		// Single delta carries the entire broken summary — detection happens on stop.
+	it("preserves single-chunk thinking content at content_block_stop", async () => {
 		const events = thinkingStreamEvents(
 			["A complete rewritten thinking explanation in one chunk."],
 			"sig_late_marker",
@@ -162,13 +162,13 @@ describe("anthropic thinking filter — rewritten-thinking meta-prompt", () => {
 		);
 		const { events: emitted, thinking } = await runStream(events);
 
-		expect(thinking.thinking).toBe("Thinking...");
-		expect(thinking.thinkingSignature).toBe("");
+		expect(thinking.thinking).toBe("A complete rewritten thinking explanation in one chunk.");
+		expect(thinking.thinkingSignature).toBe("sig_late_marker");
 
 		const thinkingEnd = emitted.find(
 			(e): e is Extract<AssistantMessageEvent, { type: "thinking_end" }> => e.type === "thinking_end",
 		);
-		expect(thinkingEnd?.content).toBe("Thinking...");
+		expect(thinkingEnd?.content).toBe("A complete rewritten thinking explanation in one chunk.");
 	});
 
 	it("leaves legitimate thinking blocks untouched (no marker, signature retained)", async () => {

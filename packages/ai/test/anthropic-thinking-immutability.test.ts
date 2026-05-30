@@ -23,6 +23,11 @@ describe("Anthropic thinking replay immutability", () => {
 			content: "continue",
 			timestamp: Date.now(),
 		};
+		const nextUser: UserMessage = {
+			role: "user",
+			content: "follow up",
+			timestamp: Date.now(),
+		};
 		const assistant: AssistantMessage = {
 			role: "assistant",
 			content: [
@@ -50,14 +55,72 @@ describe("Anthropic thinking replay immutability", () => {
 			stopReason: "toolUse",
 			timestamp: Date.now(),
 		};
+		const trailingAssistant: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "done" }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
 
-		const params = convertAnthropicMessages([user, assistant], model, false);
+		const params = convertAnthropicMessages([user, assistant, nextUser, trailingAssistant], model, false);
 		const assistantParam = params.find(message => message.role === "assistant");
 		expect(assistantParam).toBeDefined();
 		expect(assistantParam?.content).toEqual([
 			{ type: "thinking", thinking: `analysis ${malformed}`, signature: "sig_thinking" },
 			{ type: "text", text: `text ${malformed.toWellFormed()}` },
 			{ type: "tool_use", id: "toolu_123", name: "read", input: { path: "README.md" } },
+		]);
+	});
+	it("drops legacy unsigned Thinking... placeholders instead of replaying them as text", () => {
+		const user: UserMessage = {
+			role: "user",
+			content: "continue",
+			timestamp: Date.now(),
+		};
+		const assistant: AssistantMessage = {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "Thinking...", thinkingSignature: "" },
+				{ type: "text", text: "Found a recoverable candidate." },
+				{
+					type: "toolCall",
+					id: "toolu_456",
+					name: "bash",
+					arguments: { command: "echo ok" },
+				},
+			],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+
+		const params = convertAnthropicMessages([user, assistant], model, false);
+		const assistantParam = params.find(message => message.role === "assistant");
+		expect(assistantParam).toBeDefined();
+		expect(assistantParam?.content).toEqual([
+			{ type: "text", text: "Found a recoverable candidate." },
+			{ type: "tool_use", id: "toolu_456", name: "bash", input: { command: "echo ok" } },
 		]);
 	});
 });

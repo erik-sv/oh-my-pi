@@ -64,6 +64,8 @@ export function transformMessages<TApi extends Api>(
 				index === latestAssistantIndex &&
 				model.api === "anthropic-messages" &&
 				assistantMsg.api === "anthropic-messages";
+			const mustNeutralizeLatestAnthropicThinking =
+				mustPreserveLatestAnthropicThinking && assistantMsg.content.some(block => block.type === "toolCall");
 			// Aborted/errored messages may have partially-streamed thinking signatures.
 			// A partial signature is invalid and will be rejected by the API, so we must
 			// strip signatures from thinking blocks in these messages.
@@ -73,7 +75,9 @@ export function transformMessages<TApi extends Api>(
 				if (block.type === "thinking") {
 					// Strip signature from aborted/errored messages — it's likely incomplete
 					const sanitized =
-						hasInvalidSignatures && block.thinkingSignature ? { ...block, thinkingSignature: undefined } : block;
+						(hasInvalidSignatures || mustNeutralizeLatestAnthropicThinking) && block.thinkingSignature
+							? { ...block, thinkingSignature: undefined }
+							: block;
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
 					// even if the thinking text is empty (OpenAI encrypted reasoning)
@@ -88,7 +92,7 @@ export function transformMessages<TApi extends Api>(
 				}
 
 				if (block.type === "redactedThinking") {
-					if (mustPreserveLatestAnthropicThinking) return block;
+					if (mustNeutralizeLatestAnthropicThinking) return [];
 					if (isSameModel) return block;
 					return [];
 				}
