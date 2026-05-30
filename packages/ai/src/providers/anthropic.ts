@@ -654,6 +654,17 @@ function convertContentBlocks(
 	return blocks;
 }
 
+/**
+ * Marker phrase that Claude has been observed to hallucinate inside reasoning summaries
+ * (e.g. "I don't see any current rewritten thinking or next thinking to process. Could
+ * you provide..."). When this substring appears in a streamed thinking block we collapse
+ * the entire block to {@link BROKEN_THINKING_REPLACEMENT} and drop the signature so
+ * downstream UI/transcripts don't surface the meta-prompt and replay can't re-anchor on
+ * the garbled chain.
+ */
+const BROKEN_THINKING_MARKER = "rewritten thinking";
+const BROKEN_THINKING_REPLACEMENT = "Thinking...";
+
 export type AnthropicEffort = "low" | "medium" | "high" | "xhigh" | "max";
 export type AnthropicThinkingDisplay = "summarized" | "omitted";
 
@@ -1210,6 +1221,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const requestTimeoutMs =
 				firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0 ? firstEventTimeoutMs : undefined;
 			const blocks = output.content as Block[];
+			// Recent Claude releases occasionally hallucinate meta-prompts asking the operator
+			// to supply "rewritten thinking" / "next thinking" as reasoning content. The summary
+			// is useless and confuses the UI, so we collapse any thinking block whose stream
+			// contains the marker phrase down to a plain "Thinking..." placeholder and drop the
+			// (now invalid) signature so subsequent turns don't replay the garbled chain.
+			const suppressedThinkingBlocks = new WeakSet<Block>();
 			stream.push({ type: "start", partial: output });
 			// Retry loop for transient errors from the stream.
 			// Provider-level transport/rate-limit failures: only before any streamed content starts.
@@ -1364,7 +1381,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const index = blocks.findIndex(b => b.index === event.index);
 								const block = blocks[index];
 								if (block && block.type === "thinking") {
+									if (suppressedThinkingBlocks.has(block)) continue;
 									block.thinking += event.delta.thinking;
+									if (block.thinking.includes(BROKEN_THINKING_MARKER)) {
+										suppressedThinkingBlocks.add(block);
+										block.thinking = BROKEN_THINKING_REPLACEMENT;
+										block.thinkingSignature = "";
+										continue;
+									}
 									stream.push({
 										type: "thinking_delta",
 										contentIndex: index,
@@ -1388,7 +1412,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							} else if (event.delta.type === "signature_delta") {
 								const index = blocks.findIndex(b => b.index === event.index);
 								const block = blocks[index];
-								if (block && block.type === "thinking") {
+								if (block && block.type === "thinking" && !suppressedThinkingBlocks.has(block)) {
 									block.thinkingSignature = block.thinkingSignature || "";
 									block.thinkingSignature += event.delta.signature;
 								}
@@ -1406,6 +1430,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "thinking") {
+									if (
+										!suppressedThinkingBlocks.has(block) &&
+										block.thinking.includes(BROKEN_THINKING_MARKER)
+									) {
+										suppressedThinkingBlocks.add(block);
+										block.thinking = BROKEN_THINKING_REPLACEMENT;
+										block.thinkingSignature = "";
+									}
 									stream.push({
 										type: "thinking_end",
 										contentIndex: index,
@@ -2229,6 +2261,17 @@ export function convertAnthropicMessages(
 	const developerParamIndices: number[] = [];
 
 	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
+	// Anthropic only consumes `thinking`/`redacted_thinking` from the MOST RECENT
+	// assistant turn — these are needed solely to continue an in-flight tool-use turn.
+	// Thinking on earlier turns is ignored by the API, yet replaying it across a long
+	// or recovered resume is a liability: any non-verbatim re-serialization (an unsigned
+	// "Thinking…" placeholder downgraded to text, a stale/partial signature, unicode
+	// normalization) makes the turn's thinking differ from the original response, and
+	// Anthropic rejects the whole request with "messages.X.content.Y: `thinking` or
+	// `redacted_thinking` blocks in the latest assistant message cannot be modified".
+	// So we drop thinking from every assistant turn except the latest, where it is kept
+	// byte-for-byte. This also trims dead reasoning tokens from the cached prefix.
+	const latestAssistantIndex = transformedMessages.findLastIndex(m => m.role === "assistant");
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
@@ -2267,9 +2310,9 @@ export function convertAnthropicMessages(
 						text: block.text.toWellFormed(),
 					});
 				} else if (block.type === "thinking") {
+					if (i !== latestAssistantIndex) continue;
 					if (hasSignedThinking) {
 						if (!block.thinkingSignature || block.thinkingSignature.trim().length === 0) {
-							if (block.thinking.trim() === "Thinking...") continue;
 							if (block.thinking.trim().length === 0) continue;
 							blocks.push({
 								type: "text",
@@ -2284,7 +2327,6 @@ export function convertAnthropicMessages(
 						});
 						continue;
 					}
-					if (block.thinking.trim() === "Thinking...") continue;
 					if (block.thinking.trim().length === 0) continue;
 					if (!block.thinkingSignature || block.thinkingSignature.trim().length === 0) {
 						if (isNonSigningAnthropicEndpoint(model)) {
@@ -2307,6 +2349,7 @@ export function convertAnthropicMessages(
 						});
 					}
 				} else if (block.type === "redactedThinking") {
+					if (i !== latestAssistantIndex) continue;
 					if (block.data.trim().length === 0) continue;
 					blocks.push({
 						type: "redacted_thinking",

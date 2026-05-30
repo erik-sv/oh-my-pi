@@ -23,11 +23,6 @@ describe("Anthropic thinking replay immutability", () => {
 			content: "continue",
 			timestamp: Date.now(),
 		};
-		const nextUser: UserMessage = {
-			role: "user",
-			content: "follow up",
-			timestamp: Date.now(),
-		};
 		const assistant: AssistantMessage = {
 			role: "assistant",
 			content: [
@@ -55,25 +50,8 @@ describe("Anthropic thinking replay immutability", () => {
 			stopReason: "toolUse",
 			timestamp: Date.now(),
 		};
-		const trailingAssistant: AssistantMessage = {
-			role: "assistant",
-			content: [{ type: "text", text: "done" }],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-		};
 
-		const params = convertAnthropicMessages([user, assistant, nextUser, trailingAssistant], model, false);
+		const params = convertAnthropicMessages([user, assistant], model, false);
 		const assistantParam = params.find(message => message.role === "assistant");
 		expect(assistantParam).toBeDefined();
 		expect(assistantParam?.content).toEqual([
@@ -82,45 +60,92 @@ describe("Anthropic thinking replay immutability", () => {
 			{ type: "tool_use", id: "toolu_123", name: "read", input: { path: "README.md" } },
 		]);
 	});
-	it("drops legacy unsigned Thinking... placeholders instead of replaying them as text", () => {
-		const user: UserMessage = {
-			role: "user",
-			content: "continue",
-			timestamp: Date.now(),
-		};
-		const assistant: AssistantMessage = {
-			role: "assistant",
-			content: [
-				{ type: "thinking", thinking: "Thinking...", thinkingSignature: "" },
-				{ type: "text", text: "Found a recoverable candidate." },
-				{
-					type: "toolCall",
-					id: "toolu_456",
-					name: "bash",
-					arguments: { command: "echo ok" },
-				},
-			],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "toolUse",
-			timestamp: Date.now(),
-		};
+});
 
-		const params = convertAnthropicMessages([user, assistant], model, false);
-		const assistantParam = params.find(message => message.role === "assistant");
-		expect(assistantParam).toBeDefined();
-		expect(assistantParam?.content).toEqual([
-			{ type: "text", text: "Found a recoverable candidate." },
-			{ type: "tool_use", id: "toolu_456", name: "bash", input: { command: "echo ok" } },
+describe("Anthropic historical thinking is dropped (only latest assistant keeps it)", () => {
+	const mkAssistant = (content: AssistantMessage["content"], stopReason: AssistantMessage["stopReason"]): AssistantMessage => ({
+		role: "assistant",
+		content,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason,
+		timestamp: Date.now(),
+	});
+
+	it("drops thinking/redacted_thinking from earlier assistant turns but keeps the latest verbatim", () => {
+		const user1: UserMessage = { role: "user", content: "do a thing", timestamp: 1 };
+		const historical = mkAssistant(
+			[
+				{ type: "thinking", thinking: "old reasoning", thinkingSignature: "sig_old" },
+				{ type: "redactedThinking", data: "enc_old" },
+				{ type: "text", text: "calling read" },
+				{ type: "toolCall", id: "toolu_old", name: "read", arguments: { path: "a" } },
+			],
+			"toolUse",
+		);
+		const toolResult = {
+			role: "toolResult" as const,
+			toolCallId: "toolu_old",
+			toolName: "read",
+			content: [{ type: "text" as const, text: "file body" }],
+			timestamp: 3,
+		};
+		const latest = mkAssistant(
+			[
+				{ type: "thinking", thinking: "fresh reasoning", thinkingSignature: "sig_fresh" },
+				{ type: "text", text: "the answer" },
+			],
+			"stop",
+		);
+
+		const params = convertAnthropicMessages([user1, historical, toolResult, latest], model, false);
+		const assistants = params.filter(p => p.role === "assistant");
+		expect(assistants).toHaveLength(2);
+
+		// Historical assistant: thinking + redacted dropped, text + tool_use preserved.
+		expect(assistants[0].content).toEqual([
+			{ type: "text", text: "calling read" },
+			{ type: "tool_use", id: "toolu_old", name: "read", input: { path: "a" } },
+		]);
+
+		// Latest assistant: thinking preserved byte-for-byte (signature intact).
+		expect(assistants[1].content).toEqual([
+			{ type: "thinking", thinking: "fresh reasoning", signature: "sig_fresh" },
+			{ type: "text", text: "the answer" },
+		]);
+	});
+
+	it("does not re-serialize an unsigned 'Thinking…' placeholder in a historical turn (it is dropped, not turned into text)", () => {
+		// Reproduces the poisoned-resume shape: a historical turn carries an unsigned
+		// placeholder thinking block alongside a signed one. The old code converted the
+		// unsigned block to text (modifying the turn → Anthropic 400). It must be dropped.
+		const user1: UserMessage = { role: "user", content: "go", timestamp: 1 };
+		const historical = mkAssistant(
+			[
+				{ type: "thinking", thinking: "Thinking...", thinkingSignature: "" },
+				{ type: "thinking", thinking: "real", thinkingSignature: "sig_real" },
+				{ type: "text", text: "doing it" },
+				{ type: "toolCall", id: "toolu_x", name: "bash", arguments: { command: "ls" } },
+			],
+			"toolUse",
+		);
+		const toolResult = {
+			role: "toolResult" as const,
+			toolCallId: "toolu_x",
+			toolName: "bash",
+			content: [{ type: "text" as const, text: "ok" }],
+			timestamp: 3,
+		};
+		const latest = mkAssistant([{ type: "text", text: "done" }], "stop");
+
+		const params = convertAnthropicMessages([user1, historical, toolResult, latest], model, false);
+		const historicalParam = params.find(p => p.role === "assistant");
+		// No thinking blocks AND no stray text derived from the placeholder.
+		expect(historicalParam?.content).toEqual([
+			{ type: "text", text: "doing it" },
+			{ type: "tool_use", id: "toolu_x", name: "bash", input: { command: "ls" } },
 		]);
 	});
 });

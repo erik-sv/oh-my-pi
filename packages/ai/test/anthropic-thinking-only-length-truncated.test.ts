@@ -101,15 +101,13 @@ describe("transformMessages drops thinking-only assistant turns", () => {
 		);
 		expect(truncatedSurvivors.length).toBe(0);
 
-		// Fresh assistant turn survives, but as the latest tool-using Anthropic turn
-		// its protected reasoning is neutralized for safe replay.
+		// Fresh assistant turn must survive untouched.
 		const freshSurvivor = transformed.find(
 			m =>
 				m.role === "assistant" &&
-				(m as AssistantMessage).content.some(b => b.type === "toolCall" && b.id === "toolu_fresh"),
-		) as AssistantMessage | undefined;
+				(m as AssistantMessage).content.some(b => b.type === "thinking" && b.thinkingSignature === "sig_fresh"),
+		);
 		expect(freshSurvivor).toBeDefined();
-		expect(freshSurvivor?.content.some(b => b.type === "thinking" && b.thinkingSignature === "sig_fresh")).toBe(false);
 
 		// End-to-end: the wire-level Anthropic params must NOT have two adjacent
 		// `assistant` entries, which is the exact failure mode in the 400 dump.
@@ -121,8 +119,8 @@ describe("transformMessages drops thinking-only assistant turns", () => {
 			).toBe(false);
 		}
 
-		// The truncated stub contributes no signed thinking on the wire, and the fresh
-		// latest tool-using assistant has its signature cleared for replay safety.
+		// And the only surviving signed thinking block on the wire must come from
+		// the fresh assistant — not the truncated stub.
 		const wireThinkingSignatures = params
 			.filter(p => p.role === "assistant")
 			.flatMap(p => (Array.isArray(p.content) ? p.content : []))
@@ -130,7 +128,7 @@ describe("transformMessages drops thinking-only assistant turns", () => {
 				return typeof block === "object" && block !== null && (block as { type?: string }).type === "thinking";
 			})
 			.map(block => block.signature);
-		expect(wireThinkingSignatures).toEqual([]);
+		expect(wireThinkingSignatures).toEqual(["sig_fresh"]);
 	});
 
 	it("drops error-stop thinking-only assistant turn AND emits the aborted-turn developer note", () => {
@@ -187,47 +185,5 @@ describe("transformMessages drops thinking-only assistant turns", () => {
 				(m as AssistantMessage).content.some(b => b.type === "thinking" && b.thinkingSignature === "sig_keep"),
 		);
 		expect(kept).toBeDefined();
-	});
-	it("neutralizes signed latest-assistant thinking when the turn contains tool calls", () => {
-		const user: UserMessage = { role: "user", content: "run tool", timestamp: 1 };
-		const latest: AssistantMessage = {
-			role: "assistant",
-			content: [
-				{ type: "thinking", thinking: "private reasoning", thinkingSignature: "sig_latest" },
-				{ type: "redactedThinking", data: "enc_payload" },
-				{ type: "text", text: "calling tool" },
-				{ type: "toolCall", id: "toolu_latest", name: "read", arguments: { path: "x" } },
-			],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "toolUse",
-			timestamp: 2,
-		};
-
-		const transformed = transformMessages([user, latest], model);
-		const replayLatest = transformed[1] as AssistantMessage;
-		expect(replayLatest.role).toBe("assistant");
-		expect(replayLatest.content).toEqual([
-			{ type: "thinking", thinking: "private reasoning", thinkingSignature: undefined },
-			{ type: "text", text: "calling tool" },
-			{ type: "toolCall", id: "toolu_latest", name: "read", arguments: { path: "x" } },
-		]);
-
-		const params = convertAnthropicMessages([user, latest], model, false);
-		const assistantParam = params.find(message => message.role === "assistant");
-		expect(assistantParam?.content).toEqual([
-			{ type: "text", text: "private reasoning" },
-			{ type: "text", text: "calling tool" },
-			{ type: "tool_use", id: "toolu_latest", name: "read", input: { path: "x" } },
-		]);
 	});
 });
