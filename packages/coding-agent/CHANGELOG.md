@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Fixed spawned peer-coms agents lingering as orphaned idle OMP sessions by adding parent liveness checks, a spawned-peer idle timeout, and parent-session shutdown of child peers.
 
 ## [15.5.11] - 2026-05-29
 
