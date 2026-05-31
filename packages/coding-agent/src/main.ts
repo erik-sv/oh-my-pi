@@ -65,6 +65,9 @@ import {
 import type { AgentSession } from "./session/agent-session";
 import type { AuthStorage } from "./session/auth-storage";
 import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
+import { setDefaultSessionStorage } from "./session/session-storage";
+import { SqlSessionStorage } from "./session/sql-session-storage";
+import { SQL } from "bun";
 import { resolvePromptInput } from "./system-prompt";
 import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { AUTO_THINKING } from "./thinking";
@@ -382,6 +385,51 @@ async function flushChangelogVersion(): Promise<void> {
 	} catch (error: unknown) {
 		logger.warn("Failed to persist lastChangelogVersion", { error });
 	}
+}
+
+/**
+ * When `--session-storage sql` is requested, build a SQL-backed
+ * {@link SqlSessionStorage} from the connection in OMP_SESSION_DB_URL (a
+ * `bun:sql` connection string) or OMP_SESSION_DB_OPTIONS (a JSON object with
+ * `adapter` plus `bun:sql` connection fields — `database`, `username`,
+ * `password`, `port`, and either `path` for a unix socket or `hostname`), and
+ * install it as the process-wide default storage so every SessionManager
+ * factory persists transcripts to the database instead of JSONL files.
+ *
+ * No-op for the default "file" backend. Throws when "sql" is requested without
+ * a usable connection so a misconfiguration fails loudly at startup rather than
+ * silently falling back to files (which would split a deployment's transcripts
+ * across two backends).
+ */
+async function setupSessionStorageBackend(parsed: Args): Promise<void> {
+	if (parsed.sessionStorage !== "sql") return;
+
+	const url = $env.OMP_SESSION_DB_URL?.trim();
+	const optionsJson = $env.OMP_SESSION_DB_OPTIONS?.trim();
+	if (!url && !optionsJson) {
+		throw new Error(
+			"--session-storage sql requires OMP_SESSION_DB_URL or OMP_SESSION_DB_OPTIONS to be set.",
+		);
+	}
+
+	let client: SQL;
+	if (url) {
+		client = new SQL(url);
+	} else {
+		let options: Record<string, unknown>;
+		try {
+			options = JSON.parse(optionsJson as string) as Record<string, unknown>;
+		} catch (err) {
+			throw new Error(
+				`OMP_SESSION_DB_OPTIONS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		client = new SQL(options);
+	}
+
+	const storage = await SqlSessionStorage.create({ client });
+	setDefaultSessionStorage(storage);
+	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
 }
 
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
@@ -873,6 +921,11 @@ export async function runRootCommand(
 			modelMatchPreferences,
 		);
 	}
+
+	// Install the session storage backend (SQL vs file) before any
+	// SessionManager is created, so every factory and the resume picker below
+	// share the same backend.
+	await logger.time("setupSessionStorageBackend", setupSessionStorageBackend, parsedArgs);
 
 	// Create session manager based on CLI flags
 	let sessionManager = await logger.time(

@@ -29,6 +29,13 @@ export interface Args {
 	mode?: Mode;
 	noSession?: boolean;
 	sessionDir?: string;
+	/**
+	 * Session transcript storage backend. "file" (default) writes JSONL to the
+	 * session directory; "sql" persists transcripts to a SQL database via
+	 * `Bun.SQL`, with the connection sourced from OMP_SESSION_DB_URL or
+	 * OMP_SESSION_DB_OPTIONS. See main.ts buildSessionStorageFromEnv.
+	 */
+	sessionStorage?: "file" | "sql";
 	providerSessionId?: string;
 	fork?: string;
 	models?: string[];
@@ -54,6 +61,7 @@ export interface Args {
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
 	unknownFlags: Map<string, boolean | string>;
 }
+
 
 export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { type: "boolean" | "string" }>): Args {
 	// Work on a copy: the `--option=value` handling below splices the value
@@ -147,6 +155,13 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.noSession = true;
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
 			result.sessionDir = args[++i];
+		} else if (arg === "--session-storage" && i + 1 < args.length) {
+			const value = args[++i];
+			if (value === "file" || value === "sql") {
+				result.sessionStorage = value;
+			} else {
+				logger.warn("Unknown --session-storage value; expected 'file' or 'sql'", { value });
+			}
 		} else if (arg === "--models" && i + 1 < args.length) {
 			result.models = args[++i].split(",").map(s => s.trim());
 		} else if (arg === "--no-tools") {
