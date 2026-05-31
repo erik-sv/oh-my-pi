@@ -4,7 +4,7 @@ import type { SessionStorage, SessionStorageStat, SessionStorageWriter } from ".
 /**
  * Supported `bun:sql` adapter dialects. `Bun.SQL` reports this string on
  * `client.options.adapter`; we detect it once at construction and pick the
- * correct DDL / upsert / concat syntax for the underlying engine.
+ * correct DDL / insert / concat syntax for the underlying engine.
  */
 export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
 
@@ -36,16 +36,16 @@ export interface SqlSessionStorageOptions {
 	 */
 	adapter?: SqlSessionStorageAdapter;
 	/**
-	 * Table name to use. Default: `omp_session_files`. Must match
+	 * Table name to use. Default: `omp_session_chunks`. Must match
 	 * `[A-Za-z_][A-Za-z0-9_]{0,62}` — inlined into prepared statements at
 	 * startup, so we accept identifier-safe inputs only (no quoted/dotted
 	 * names).
 	 */
 	table?: string;
 	/**
-	 * If true, run `CREATE TABLE IF NOT EXISTS` during `create()`.
-	 * Default: true. Disable when the table is owned by an external
-	 * migration.
+	 * If true, run `CREATE TABLE IF NOT EXISTS` (+ supporting index) during
+	 * `create()`. Default: true. Disable when the table is owned by an
+	 * external migration.
 	 */
 	createTable?: boolean;
 }
@@ -57,24 +57,27 @@ interface MirrorEntry {
 
 interface DialectQueries {
 	createTable: string;
-	/** Insert or replace the full content for `path`. Used for `writeText`/`flags="w"` truncate. */
-	upsertReplace: string;
-	/** Insert if missing; otherwise append the new chunk to existing content. Used for `writeLine`. */
-	upsertAppend: string;
-	/** Delete a single row by path. */
+	/** Supporting index for prefix listing. Empty when the PK already covers it (MySQL). */
+	createIndex: string;
+	/** Insert a single chunk row (path, seq, content, mtime_ms). Used by writeLine appends. */
+	insertChunk: string;
+	/** Delete every chunk row for a single path. Used by unlink / truncate / writeText. */
 	delete: string;
-	/** Delete every row whose `path` starts with the supplied LIKE pattern. */
+	/** Delete every chunk row whose `path` starts with the supplied LIKE pattern. */
 	deletePrefix: string;
-	/** Move a row from one path to another (caller deletes any conflicting destination first). */
+	/** Re-point every chunk row from one path to another (caller deletes any conflicting destination first). */
 	rename: string;
-	/** Read everything for the in-memory mirror warm-up. */
+	/** Read every chunk for the in-memory mirror warm-up, ordered for in-JS reassembly. */
 	selectAll: string;
 }
 
-const DEFAULT_TABLE = "omp_session_files";
+const DEFAULT_TABLE = "omp_session_chunks";
 const IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/;
 const LIKE_ESCAPE_CHAR = "#";
 const LIKE_ESCAPE_RE = /[%_#]/g;
+// Cap rows per batched INSERT so a huge `writeText`/compaction stays well under
+// the PostgreSQL 65535 bound-parameter ceiling (4 params/row → 2000 rows).
+const MAX_INSERT_ROWS = 500;
 
 function enoent(p: string): NodeJS.ErrnoException {
 	const err = new Error(`ENOENT: no such file, '${p}'`) as NodeJS.ErrnoException;
@@ -95,6 +98,26 @@ function escapeLikeLiteral(value: string): string {
 	return value.replace(LIKE_ESCAPE_RE, ch => `${LIKE_ESCAPE_CHAR}${ch}`);
 }
 
+/**
+ * Split a full file body into per-line chunks, each retaining its trailing
+ * `"\n"`. A final newline-less remainder is kept as its own chunk. The empty
+ * string produces zero chunks. `chunks.join("")` reproduces the input
+ * byte-for-byte — the parity invariant the chunk store relies on.
+ */
+function splitChunks(content: string): string[] {
+	if (content.length === 0) return [];
+	const out: string[] = [];
+	let start = 0;
+	for (let i = 0; i < content.length; i++) {
+		if (content.charCodeAt(i) === 10 /* "\n" */) {
+			out.push(content.slice(start, i + 1));
+			start = i + 1;
+		}
+	}
+	if (start < content.length) out.push(content.slice(start));
+	return out;
+}
+
 function detectAdapter(client: SqlSessionStorageClient): SqlSessionStorageAdapter {
 	const reported = String(client.options?.adapter ?? "").toLowerCase();
 	if (reported === "postgres" || reported === "postgresql" || reported === "pg") return "postgres";
@@ -113,57 +136,56 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		return {
 			createTable:
 				`CREATE TABLE IF NOT EXISTS ${table} (` +
-				`path VARCHAR(512) NOT NULL PRIMARY KEY, ` +
+				`path VARCHAR(512) NOT NULL, ` +
+				`seq BIGINT NOT NULL, ` +
 				`content LONGTEXT NOT NULL, ` +
-				`mtime_ms BIGINT NOT NULL` +
+				`mtime_ms BIGINT NOT NULL, ` +
+				`PRIMARY KEY (path, seq)` +
 				`) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
-			upsertReplace:
-				`INSERT INTO ${table} (path, content, mtime_ms) VALUES (?, ?, ?) ` +
-				`ON DUPLICATE KEY UPDATE content = VALUES(content), mtime_ms = VALUES(mtime_ms)`,
-			upsertAppend:
-				`INSERT INTO ${table} (path, content, mtime_ms) VALUES (?, ?, ?) ` +
-				`ON DUPLICATE KEY UPDATE content = CONCAT(content, VALUES(content)), mtime_ms = VALUES(mtime_ms)`,
+			// `path` is the leftmost PK column, so prefix LIKE scans already use
+			// the primary index — no secondary index needed (and MySQL lacks
+			// `CREATE INDEX IF NOT EXISTS`).
+			createIndex: "",
+			insertChunk: `INSERT INTO ${table} (path, seq, content, mtime_ms) VALUES (?, ?, ?, ?)`,
 			delete: `DELETE FROM ${table} WHERE path = ?`,
 			deletePrefix: `DELETE FROM ${table} WHERE path LIKE ? ESCAPE '${LIKE_ESCAPE_CHAR}'`,
-			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
-			selectAll: `SELECT path, content, mtime_ms FROM ${table}`,
+			rename: `UPDATE ${table} SET path = ? WHERE path = ?`,
+			selectAll: `SELECT path, seq, content, mtime_ms FROM ${table} ORDER BY path, seq`,
 		};
 	}
 
-	// PostgreSQL + SQLite — both support `ON CONFLICT(path) DO UPDATE …` and
-	// `||` for string concatenation. The `excluded` keyword references the
-	// row that would have been inserted, in both engines.
-	const mtimeType = adapter === "postgres" ? "BIGINT" : "INTEGER";
-	const tableQualifier = `${table}.content`;
+	// PostgreSQL + SQLite — both support `CREATE INDEX IF NOT EXISTS` and the
+	// same INSERT/DELETE syntax; only the integer type name and placeholder
+	// style differ.
+	const intType = adapter === "postgres" ? "BIGINT" : "INTEGER";
 	return {
 		createTable:
 			`CREATE TABLE IF NOT EXISTS ${table} (` +
-			`path TEXT PRIMARY KEY, ` +
+			`path TEXT NOT NULL, ` +
+			`seq ${intType} NOT NULL, ` +
 			`content TEXT NOT NULL, ` +
-			`mtime_ms ${mtimeType} NOT NULL` +
+			`mtime_ms ${intType} NOT NULL, ` +
+			`PRIMARY KEY (path, seq)` +
 			`)`,
-		upsertReplace:
-			`INSERT INTO ${table} (path, content, mtime_ms) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}) ` +
-			`ON CONFLICT (path) DO UPDATE SET content = excluded.content, mtime_ms = excluded.mtime_ms`,
-		upsertAppend:
-			`INSERT INTO ${table} (path, content, mtime_ms) ` +
-			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}) ` +
-			`ON CONFLICT (path) DO UPDATE SET content = ${tableQualifier} || excluded.content, mtime_ms = excluded.mtime_ms`,
+		createIndex: `CREATE INDEX IF NOT EXISTS idx_${table}_path ON ${table} (path)`,
+		insertChunk:
+			`INSERT INTO ${table} (path, seq, content, mtime_ms) ` +
+			`VALUES (${placeholder(1)}, ${placeholder(2)}, ${placeholder(3)}, ${placeholder(4)})`,
 		delete: `DELETE FROM ${table} WHERE path = ${placeholder(1)}`,
 		deletePrefix: `DELETE FROM ${table} WHERE path LIKE ${placeholder(1)} ESCAPE '${LIKE_ESCAPE_CHAR}'`,
-		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)}`,
-		selectAll: `SELECT path, content, mtime_ms FROM ${table}`,
+		rename: `UPDATE ${table} SET path = ${placeholder(1)} WHERE path = ${placeholder(2)}`,
+		selectAll: `SELECT path, seq, content, mtime_ms FROM ${table} ORDER BY path, seq`,
 	};
 }
 
 interface DbRow {
 	path: string;
+	seq: number | bigint | string;
 	content: string;
 	mtime_ms: number | bigint | string;
 }
 
-function rowMtime(value: number | bigint | string): number {
+function toNumber(value: number | bigint | string): number {
 	if (typeof value === "number") return value;
 	if (typeof value === "bigint") return Number(value);
 	return Number.parseInt(value, 10);
@@ -171,11 +193,17 @@ function rowMtime(value: number | bigint | string): number {
 
 /**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
- * session JSONL file maps to a row keyed by `path`; one table stores
- * everything.
+ * session JSONL file is stored as an **append-only set of chunk rows** — one
+ * row per JSONL line, keyed by `(path, seq)`. The full file body for a path is
+ * the concatenation of its `content` columns in ascending `seq` order.
  *
  * Works against PostgreSQL, MySQL/MariaDB, and SQLite by selecting the
- * dialect-correct DDL, upsert, and string-concat syntax at construction.
+ * dialect-correct DDL and placeholder syntax at construction.
+ *
+ * Why chunk rows instead of one growing blob: Postgres (and every other engine
+ * here) stores TEXT values immutably, so appending to a single-blob row
+ * rewrites the entire value on every line — O(n) per append, O(n²) over a
+ * transcript. One row per line makes each append a single O(1) INSERT.
  *
  * Trade-offs vs `FileSessionStorage`:
  * - An in-memory mirror is loaded on construction so the interface's
@@ -184,10 +212,9 @@ function rowMtime(value: number | bigint | string): number {
  *   matching `FileSessionStorage`'s existing single-writer assumption — peer
  *   processes need {@link refresh} to pick up out-of-band writes.
  * - `writeLineSync` updates the mirror synchronously and queues an async
- *   upsert that appends the line to the existing row (or inserts it as the
- *   first chunk). The promise is awaited by `flush()` / `close()` /
- *   {@link drain}. A SIGKILL between the sync mirror update and the network
- *   round-trip loses the last line.
+ *   INSERT of the new chunk row. The promise is awaited by `flush()` /
+ *   `close()` / {@link drain}. A SIGKILL between the sync mirror update and the
+ *   network round-trip loses the last line.
  * - Blobs (image data) and tool artifact files still live on disk via
  *   `BlobStore` / `ArtifactManager`. Those are out of scope for this storage.
  */
@@ -197,6 +224,8 @@ export class SqlSessionStorage implements SessionStorage {
 	readonly #table: string;
 	readonly #q: DialectQueries;
 	readonly #mirror = new Map<string, MirrorEntry>();
+	/** Next chunk seq to assign per path. Reset to 0 on truncate; set to row count on writeText/refresh. */
+	readonly #seq = new Map<string, number>();
 	readonly #writers = new Set<SqlSessionStorageWriter>();
 	#nextMtimeMs = 0;
 	#pendingTail: Promise<void> = Promise.resolve();
@@ -214,13 +243,14 @@ export class SqlSessionStorage implements SessionStorage {
 
 	/**
 	 * Apply the dialect-correct DDL (unless `createTable: false` is set) and
-	 * warm the in-memory mirror with every existing row. Must be awaited
+	 * warm the in-memory mirror with every existing chunk. Must be awaited
 	 * before passing the storage into `SessionManager.create()`.
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const storage = new SqlSessionStorage(options);
 		if (options.createTable !== false) {
 			await storage.#client.unsafe(storage.#q.createTable);
+			if (storage.#q.createIndex) await storage.#client.unsafe(storage.#q.createIndex);
 		}
 		await storage.refresh();
 		return storage;
@@ -237,16 +267,40 @@ export class SqlSessionStorage implements SessionStorage {
 	/**
 	 * Re-load the mirror from the database. Call this from a different
 	 * process that took over the table, or after an out-of-band write made
-	 * by another agent.
+	 * by another agent. Chunks are reassembled into full file bodies grouped
+	 * by `path` in ascending `seq` order.
 	 */
 	async refresh(): Promise<void> {
 		this.#mirror.clear();
+		this.#seq.clear();
 		const rows = (await this.#client.unsafe(this.#q.selectAll)) as DbRow[];
+		// Rows arrive ordered by (path, seq), so we can accumulate each path's
+		// body in a single pass.
+		let curPath: string | undefined;
+		let parts: string[] = [];
+		let maxSeq = -1;
+		let maxMtime = 0;
+		const flush = (): void => {
+			if (curPath === undefined) return;
+			this.#mirror.set(curPath, { content: parts.join(""), mtimeMs: maxMtime });
+			this.#seq.set(curPath, maxSeq + 1);
+			if (maxMtime > this.#nextMtimeMs) this.#nextMtimeMs = maxMtime;
+		};
 		for (const row of rows) {
-			const mtimeMs = rowMtime(row.mtime_ms);
-			this.#mirror.set(row.path, { content: row.content, mtimeMs });
-			if (mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = mtimeMs;
+			if (row.path !== curPath) {
+				flush();
+				curPath = row.path;
+				parts = [];
+				maxSeq = -1;
+				maxMtime = 0;
+			}
+			parts.push(row.content);
+			const seq = toNumber(row.seq);
+			if (seq > maxSeq) maxSeq = seq;
+			const mtimeMs = toNumber(row.mtime_ms);
+			if (mtimeMs > maxMtime) maxMtime = mtimeMs;
 		}
+		flush();
 	}
 
 	/**
@@ -300,7 +354,12 @@ export class SqlSessionStorage implements SessionStorage {
 	writeTextSync(path: string, content: string): void {
 		const mtimeMs = this.#allocMtimeMs();
 		this.#mirror.set(path, { content, mtimeMs });
-		this.#trackPending(this.#upsertReplace(path, content, mtimeMs));
+		const chunks = splitChunks(content);
+		// Set the seq watermark synchronously so a writer opened immediately
+		// after (e.g. compaction's writeTextSync → re-open append) continues
+		// from the correct seq without waiting on the DB round-trip.
+		this.#seq.set(path, chunks.length);
+		this.#trackPending(this.#remoteReplace(path, chunks, mtimeMs));
 	}
 
 	readTextSync(path: string): string {
@@ -359,7 +418,9 @@ export class SqlSessionStorage implements SessionStorage {
 	async writeText(path: string, content: string): Promise<void> {
 		const mtimeMs = this.#allocMtimeMs();
 		this.#mirror.set(path, { content, mtimeMs });
-		await this.#upsertReplace(path, content, mtimeMs);
+		const chunks = splitChunks(content);
+		this.#seq.set(path, chunks.length);
+		await this.#remoteReplace(path, chunks, mtimeMs);
 	}
 
 	async rename(src: string, dst: string): Promise<void> {
@@ -369,27 +430,36 @@ export class SqlSessionStorage implements SessionStorage {
 		// the await resolves consistently. If the DB update fails the mirror
 		// is rolled back below.
 		const dstPrev = this.#mirror.get(dst);
+		const dstPrevSeq = this.#seq.get(dst);
+		const srcSeq = this.#seq.get(src);
 		this.#mirror.delete(src);
 		this.#mirror.set(dst, entry);
+		this.#seq.delete(src);
+		if (srcSeq !== undefined) this.#seq.set(dst, srcSeq);
 
 		try {
 			// `fs.promises.rename` overwrites the destination when one
 			// exists; mirror that here so the JSONL atomic-rewrite flow
-			// (temp file → rename) keeps working unchanged.
+			// (temp file → rename) keeps working unchanged. Delete every
+			// destination chunk before re-pointing the source chunks.
 			if (dstPrev !== undefined) {
 				await this.#client.unsafe(this.#q.delete, [dst]);
 			}
-			await this.#client.unsafe(this.#q.rename, [dst, entry.mtimeMs, src]);
+			await this.#client.unsafe(this.#q.rename, [dst, src]);
 		} catch (err) {
 			this.#mirror.delete(dst);
+			this.#seq.delete(dst);
 			if (dstPrev !== undefined) this.#mirror.set(dst, dstPrev);
+			if (dstPrevSeq !== undefined) this.#seq.set(dst, dstPrevSeq);
 			this.#mirror.set(src, entry);
+			if (srcSeq !== undefined) this.#seq.set(src, srcSeq);
 			throw toError(err);
 		}
 	}
 
 	async unlink(path: string): Promise<void> {
 		const existed = this.#mirror.delete(path);
+		this.#seq.delete(path);
 		await this.#client.unsafe(this.#q.delete, [path]);
 		if (!existed) {
 			throw enoent(path);
@@ -412,7 +482,10 @@ export class SqlSessionStorage implements SessionStorage {
 		}
 		if (victims.length === 0) return;
 
-		for (const key of victims) this.#mirror.delete(key);
+		for (const key of victims) {
+			this.#mirror.delete(key);
+			this.#seq.delete(key);
+		}
 		const likePattern = `${escapeLikeLiteral(prefix)}%`;
 		try {
 			await this.#client.unsafe(this.#q.deletePrefix, [likePattern]);
@@ -438,38 +511,79 @@ export class SqlSessionStorage implements SessionStorage {
 		this.#writers.delete(writer);
 	}
 
-	_mirrorAppend(path: string, line: string): { content: string; mtimeMs: number } {
+	/**
+	 * Synchronously append `line` to the mirror and allocate this line's chunk
+	 * `seq`. Returns the seq + mtime the queued remote INSERT must use, so the
+	 * row order matches the in-memory body exactly.
+	 */
+	_mirrorAppend(path: string, line: string): { content: string; mtimeMs: number; seq: number } {
 		const existing = this.#mirror.get(path);
 		const content = existing ? existing.content + line : line;
 		const mtimeMs = this.#allocMtimeMs();
 		this.#mirror.set(path, { content, mtimeMs });
-		return { content, mtimeMs };
+		const seq = this.#seq.get(path) ?? 0;
+		this.#seq.set(path, seq + 1);
+		return { content, mtimeMs, seq };
 	}
 
 	_mirrorTruncate(path: string): void {
 		this.#mirror.set(path, { content: "", mtimeMs: this.#allocMtimeMs() });
+		this.#seq.set(path, 0);
 	}
 
+	/** Remove every chunk row for `path` (the seq watermark was reset synchronously by `_mirrorTruncate`). */
 	async _remoteTruncate(path: string): Promise<void> {
-		const entry = this.#mirror.get(path);
-		const mtimeMs = entry?.mtimeMs ?? this.#allocMtimeMs();
-		await this.#upsertReplace(path, "", mtimeMs);
+		await this.#client.unsafe(this.#q.delete, [path]);
 	}
 
-	/**
-	 * Append a chunk to the row at `path`, inserting if the row doesn't
-	 * exist yet. Single round-trip via the dialect-specific `upsertAppend`.
-	 */
-	async _remoteAppend(path: string, line: string, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.upsertAppend, [path, line, mtimeMs]);
+	/** Insert one chunk row at `seq` — a single O(1) round-trip per appended line. */
+	async _remoteAppend(path: string, line: string, seq: number, mtimeMs: number): Promise<void> {
+		await this.#client.unsafe(this.#q.insertChunk, [path, seq, line, mtimeMs]);
 	}
 
 	_attachPending(promise: Promise<void>): void {
 		this.#trackPending(promise);
 	}
 
-	async #upsertReplace(path: string, content: string, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.upsertReplace, [path, content, mtimeMs]);
+	/**
+	 * Replace the entire chunk set for `path`: delete every existing row, then
+	 * batch-insert the new chunks at seq 0..n-1. Used by `writeText` /
+	 * `writeTextSync` (atomic temp-file rewrites, draft sidecars, compaction).
+	 */
+	async #remoteReplace(path: string, chunks: string[], mtimeMs: number): Promise<void> {
+		await this.#client.unsafe(this.#q.delete, [path]);
+		await this.#insertChunks(path, 0, chunks, mtimeMs);
+	}
+
+	async #insertChunks(path: string, startSeq: number, chunks: string[], mtimeMs: number): Promise<void> {
+		for (let off = 0; off < chunks.length; off += MAX_INSERT_ROWS) {
+			const batch = chunks.slice(off, off + MAX_INSERT_ROWS);
+			const { sql, values } = this.#buildBatchInsert(startSeq + off, batch, path, mtimeMs);
+			await this.#client.unsafe(sql, values);
+		}
+	}
+
+	#buildBatchInsert(
+		startSeq: number,
+		batch: string[],
+		path: string,
+		mtimeMs: number,
+	): { sql: string; values: unknown[] } {
+		const isPg = this.#adapter === "postgres";
+		const tuples: string[] = [];
+		const values: unknown[] = [];
+		let p = 1;
+		for (let i = 0; i < batch.length; i++) {
+			if (isPg) {
+				tuples.push(`($${p}, $${p + 1}, $${p + 2}, $${p + 3})`);
+				p += 4;
+			} else {
+				tuples.push("(?, ?, ?, ?)");
+			}
+			values.push(path, startSeq + i, batch[i], mtimeMs);
+		}
+		const sql = `INSERT INTO ${this.#table} (path, seq, content, mtime_ms) VALUES ${tuples.join(", ")}`;
+		return { sql, values };
 	}
 }
 
@@ -492,7 +606,8 @@ class SqlSessionStorageWriter implements SessionStorageWriter {
 		const flags = options?.flags ?? "a";
 		if (flags === "w") {
 			// Mirror `FileSessionStorageWriter`'s `flags: "w"` contract by
-			// truncating both the mirror and the underlying row immediately.
+			// truncating both the mirror and the underlying chunk rows
+			// immediately.
 			storage._mirrorTruncate(path);
 			this.#enqueueRaw(() => storage._remoteTruncate(path));
 		}
@@ -526,15 +641,15 @@ class SqlSessionStorageWriter implements SessionStorageWriter {
 	writeLineSync(line: string): void {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
-		const { mtimeMs } = this.#storage._mirrorAppend(this.#path, line);
-		this.#enqueueRaw(() => this.#storage._remoteAppend(this.#path, line, mtimeMs));
+		const { mtimeMs, seq } = this.#storage._mirrorAppend(this.#path, line);
+		this.#enqueueRaw(() => this.#storage._remoteAppend(this.#path, line, seq, mtimeMs));
 	}
 
 	async writeLine(line: string): Promise<void> {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
-		const { mtimeMs } = this.#storage._mirrorAppend(this.#path, line);
-		await this.#enqueueRaw(() => this.#storage._remoteAppend(this.#path, line, mtimeMs));
+		const { mtimeMs, seq } = this.#storage._mirrorAppend(this.#path, line);
+		await this.#enqueueRaw(() => this.#storage._remoteAppend(this.#path, line, seq, mtimeMs));
 	}
 
 	async flush(): Promise<void> {

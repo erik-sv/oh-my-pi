@@ -53,7 +53,7 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import type { SessionStorage, SessionStorageWriter } from "./session-storage";
-import { FileSessionStorage, MemorySessionStorage } from "./session-storage";
+import { FileSessionStorage, getDefaultSessionStorage, MemorySessionStorage } from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -786,7 +786,7 @@ async function readTerminalBreadcrumb(cwd: string): Promise<string | null> {
 /** Exported for testing */
 export async function loadEntriesFromFile(
 	filePath: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<FileEntry[]> {
 	let content: string;
 	try {
@@ -1033,7 +1033,7 @@ async function getSortedSessions(sessionDir: string, storage: SessionStorage): P
 /** Exported for testing */
 export async function findMostRecentSession(
 	sessionDir: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<string | null> {
 	const sessions = await getSortedSessions(sessionDir, storage);
 	return sessions[0]?.path || null;
@@ -1422,7 +1422,7 @@ class NdjsonFileWriter {
 export async function getRecentSessions(
 	sessionDir: string,
 	limit = 3,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
 	const sessions = await getSortedSessions(sessionDir, storage);
 	return sessions.slice(0, limit);
@@ -1739,7 +1739,7 @@ export async function resolveResumableSession(
 	sessionArg: string,
 	cwd: string,
 	sessionDir?: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<ResolvedSessionMatch | undefined> {
 	const localSessionDir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 	const localSessions = await SessionManager.list(cwd, localSessionDir, storage);
@@ -3195,7 +3195,7 @@ export class SessionManager {
 	static getDefaultSessionDir(
 		cwd: string,
 		agentDir?: string,
-		storage: SessionStorage = new FileSessionStorage(),
+		storage: SessionStorage = getDefaultSessionStorage(),
 	): string {
 		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir));
 	}
@@ -3205,7 +3205,7 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.omp/agent/sessions/<encoded-cwd>/).
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
+	static create(cwd: string, sessionDir?: string, storage: SessionStorage = getDefaultSessionStorage()): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#initNewSession();
@@ -3220,7 +3220,7 @@ export class SessionManager {
 		sourcePath: string,
 		cwd: string,
 		sessionDir?: string,
-		storage: SessionStorage = new FileSessionStorage(),
+		storage: SessionStorage = getDefaultSessionStorage(),
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
@@ -3250,7 +3250,7 @@ export class SessionManager {
 	static async open(
 		filePath: string,
 		sessionDir?: string,
-		storage: SessionStorage = new FileSessionStorage(),
+		storage: SessionStorage = getDefaultSessionStorage(),
 	): Promise<SessionManager> {
 		// Extract cwd from session header if possible, otherwise use getProjectDir()
 		const entries = await loadEntriesFromFile(filePath, storage);
@@ -3271,7 +3271,7 @@ export class SessionManager {
 	static async continueRecent(
 		cwd: string,
 		sessionDir?: string,
-		storage: SessionStorage = new FileSessionStorage(),
+		storage: SessionStorage = getDefaultSessionStorage(),
 	): Promise<SessionManager> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		// Prefer terminal-scoped breadcrumb (handles concurrent sessions correctly)
@@ -3304,7 +3304,7 @@ export class SessionManager {
 	static async list(
 		cwd: string,
 		sessionDir?: string,
-		storage: SessionStorage = new FileSessionStorage(),
+		storage: SessionStorage = getDefaultSessionStorage(),
 	): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		try {
@@ -3319,7 +3319,7 @@ export class SessionManager {
 	/**
 	 * List all sessions across all project directories.
 	 */
-	static async listAll(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
+	static async listAll(storage: SessionStorage = getDefaultSessionStorage()): Promise<SessionInfo[]> {
 		const sessionsRoot = path.join(getDefaultAgentDir(), "sessions");
 		try {
 			const files = await Array.fromAsync(new Bun.Glob("*/*.jsonl").scan(sessionsRoot), name =>

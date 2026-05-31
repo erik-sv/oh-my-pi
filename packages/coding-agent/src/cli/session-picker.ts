@@ -1,14 +1,14 @@
 import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
 import { SessionSelectorComponent } from "../modes/components/session-selector";
 import type { SessionInfo } from "../session/session-manager";
-import { FileSessionStorage } from "../session/session-storage";
+import { getDefaultSessionStorage } from "../session/session-storage";
 
 /** Show TUI session selector and return selected session path or null if cancelled */
 export async function selectSession(sessions: SessionInfo[]): Promise<string | null> {
 	const { promise, resolve } = Promise.withResolvers<string | null>();
 	const ui = new TUI(new ProcessTerminal());
 	let resolved = false;
-	const storage = new FileSessionStorage();
+	const storage = getDefaultSessionStorage();
 
 	const showSelector = () => {
 		const selector = new SessionSelectorComponent(

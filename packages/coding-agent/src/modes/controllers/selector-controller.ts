@@ -28,7 +28,7 @@ import {
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
-import { FileSessionStorage } from "../../session/session-storage";
+import { getDefaultSessionStorage } from "../../session/session-storage";
 import {
 	isImageProviderPreference,
 	isSearchProviderPreference,
@@ -722,7 +722,7 @@ export class SelectorController {
 					if (!(await this.#detachActiveSessionBeforeDeletion(session.path))) {
 						return false;
 					}
-					const storage = new FileSessionStorage();
+					const storage = getDefaultSessionStorage();
 					try {
 						await storage.deleteSessionWithArtifacts(session.path);
 						return true;
@@ -806,7 +806,7 @@ export class SelectorController {
 		}
 
 		// Check if session file exists (may not exist for brand new sessions)
-		const storage = new FileSessionStorage();
+		const storage = getDefaultSessionStorage();
 		const fileExists = await storage.exists(sessionFile);
 		if (!fileExists) {
 			this.ctx.showError("Session has not been saved yet");
