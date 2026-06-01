@@ -19,6 +19,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readPendingDisplayTag } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
+import { startSessionTerminalTitleAnimation, stopSessionTerminalTitleAnimation } from "../../utils/title-generator";
 import { interruptHint } from "../shared";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
@@ -199,6 +200,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		startSessionTerminalTitleAnimation(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -613,6 +615,7 @@ export class EventController {
 	}
 	async #handleAgentEnd(_event: Extract<AgentSessionEvent, { type: "agent_end" }>): Promise<void> {
 		this.#assistantMessageStreaming = false;
+		stopSessionTerminalTitleAnimation();
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;

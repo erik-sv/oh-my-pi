@@ -11,6 +11,7 @@
 ### Added
 
 - Added Tab completion to `omp shell` for `.help`, `.exit`, and `cd`/`pushd` directory arguments using the shell session's current working directory.
+- Added an animated braille spinner to the terminal title while a session is generating, restoring the static `π: <title>` form when work completes.
 
 ### Fixed
 
@@ -231,6 +232,7 @@
 ### Added
 
 - Added Tab completion to `omp shell` for `.help`, `.exit`, and `cd`/`pushd` directory arguments using the shell session's current working directory.
+- Added an animated braille spinner to the terminal title while a session is generating, restoring the static `π: <title>` form when work completes.
 
 ## [15.7.3] - 2026-05-31
 

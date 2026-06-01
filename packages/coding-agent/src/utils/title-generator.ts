@@ -15,9 +15,14 @@ import { tinyTitleClient } from "../tiny/title-client";
 
 const TITLE_SYSTEM_PROMPT = prompt.render(titleSystemPrompt);
 
-const DEFAULT_TERMINAL_TITLE = "π";
+const DEFAULT_TERMINAL_TITLE_ICON = "π";
+const WORKING_TERMINAL_TITLE_ICONS = ["π⠋", "π⠙", "π⠹", "π⠸", "π⠼", "π⠴", "π⠦", "π⠧", "π⠇", "π⠏"] as const;
+const TERMINAL_TITLE_ANIMATION_INTERVAL_MS = 160;
 const TERMINAL_TITLE_CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
-
+let terminalTitleAnimation: NodeJS.Timeout | undefined;
+let terminalTitleAnimationFrame = 0;
+let terminalTitleSessionName: string | undefined;
+let terminalTitleCwd: string | undefined;
 export const TITLE_LOCAL_FALLBACK_DELAY_MS = 10_000;
 const TITLE_MAX_TOKENS = 30;
 const REASONING_SAFE_MAX_TOKENS = 1024;
@@ -319,9 +324,13 @@ function getFallbackTerminalTitle(cwd: string | undefined): string | undefined {
 	return sanitizeTerminalTitlePart(baseName);
 }
 
-export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?: string): string {
+function formatSessionTerminalTitleWithIcon(icon: string, sessionName: string | undefined, cwd?: string): string {
 	const label = sanitizeTerminalTitlePart(sessionName) ?? getFallbackTerminalTitle(cwd);
-	return label ? `${DEFAULT_TERMINAL_TITLE}: ${label}` : DEFAULT_TERMINAL_TITLE;
+	return label ? `${icon}: ${label}` : icon;
+}
+
+export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?: string): string {
+	return formatSessionTerminalTitleWithIcon(DEFAULT_TERMINAL_TITLE_ICON, sessionName, cwd);
 }
 
 /**
@@ -329,11 +338,47 @@ export function formatSessionTerminalTitle(sessionName: string | undefined, cwd?
  */
 export function setTerminalTitle(title: string): void {
 	if (!process.stdout.isTTY) return;
-	process.stdout.write(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE}\x07`);
+	process.stdout.write(`\x1b]0;${sanitizeTerminalTitlePart(title) ?? DEFAULT_TERMINAL_TITLE_ICON}\x07`);
+}
+
+function setAnimatedSessionTerminalTitle(): void {
+	const icon = WORKING_TERMINAL_TITLE_ICONS[terminalTitleAnimationFrame] ?? DEFAULT_TERMINAL_TITLE_ICON;
+	setTerminalTitle(formatSessionTerminalTitleWithIcon(icon, terminalTitleSessionName, terminalTitleCwd));
 }
 
 export function setSessionTerminalTitle(sessionName: string | undefined, cwd?: string): void {
+	terminalTitleSessionName = sessionName;
+	terminalTitleCwd = cwd;
+	if (terminalTitleAnimation) {
+		setAnimatedSessionTerminalTitle();
+		return;
+	}
 	setTerminalTitle(formatSessionTerminalTitle(sessionName, cwd));
+}
+
+export function startSessionTerminalTitleAnimation(sessionName: string | undefined, cwd?: string): void {
+	terminalTitleSessionName = sessionName;
+	terminalTitleCwd = cwd;
+	if (!process.stdout.isTTY) return;
+	if (terminalTitleAnimation) {
+		setAnimatedSessionTerminalTitle();
+		return;
+	}
+	terminalTitleAnimationFrame = 0;
+	setAnimatedSessionTerminalTitle();
+	terminalTitleAnimation = setInterval(() => {
+		terminalTitleAnimationFrame = (terminalTitleAnimationFrame + 1) % WORKING_TERMINAL_TITLE_ICONS.length;
+		setAnimatedSessionTerminalTitle();
+	}, TERMINAL_TITLE_ANIMATION_INTERVAL_MS);
+	terminalTitleAnimation.unref?.();
+}
+
+export function stopSessionTerminalTitleAnimation(): void {
+	if (!terminalTitleAnimation) return;
+	clearInterval(terminalTitleAnimation);
+	terminalTitleAnimation = undefined;
+	terminalTitleAnimationFrame = 0;
+	setSessionTerminalTitle(terminalTitleSessionName, terminalTitleCwd);
 }
 
 /**
