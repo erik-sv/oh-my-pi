@@ -1,3 +1,20 @@
 {
-	"extensions": ["./packages/coding-agent/examples/extensions/peer-coms.ts"]
+	"extensions": ["./packages/coding-agent/examples/extensions/peer-coms.ts"],
+	"theme": { "dark": "dark-one" },
+	"symbolPreset": "unicode",
+	"startup": { "quiet": true },
+	"steeringMode": "all",
+	"followUpMode": "all",
+	"interruptMode": "immediate",
+	"loop": { "mode": "prompt" },
+	"contextPromotion": { "enabled": false },
+	"compaction": {
+		"enabled": true,
+		"thresholdPercent": 85,
+		"thresholdTokens": -1,
+		"handoffSaveToDisk": false
+	},
+	"edit": { "mode": "hashline" },
+	"providers": { "webSearch": "auto" },
+	"tools": { "discoveryMode": "mcp-only" }
 }
