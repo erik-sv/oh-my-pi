@@ -3455,6 +3455,10 @@
 
 ## [15.9.3] - 2026-06-05
 
+### Added
+
+- Added Tab completion to `omp shell` for `.help`, `.exit`, and `cd`/`pushd` directory arguments using the shell session's current working directory.
+
 ### Fixed
 
 - Fixed `@`-mention auto-read injecting an unrelated, same-named file when a mention did not point at a real path — e.g. an npm scope like `@scope/`, a partial path, or a bare token. `generateFileMentionMessages` resolution previously fell back to prefix and repo-wide fuzzy matching (globbing the whole project on every such mention) and auto-read the single "best" guess. Resolution is now exact-only: a mention is auto-read only when it resolves to an existing file or directory; otherwise it is left as prose. The TUI `@`-selector already inserts the real, complete path before send, so post-send guessing was both unnecessary and the source of the wrong-file reads. Directories still resolve and are listed. Removes the per-mention `**/*` project scan.
@@ -3667,6 +3671,9 @@
 ### Fixed
 
 - Fixed plugin install failing for sources pinned to a SHA: `git.clone()` no longer adds `--depth 1` when `options.sha` is set, so the checkout of arbitrary commits succeeds instead of bailing out with "shallow clone may not contain this commit" ([#1589](https://github.com/can1357/oh-my-pi/issues/1589)).
+### Added
+
+- Added Tab completion to `omp shell` for `.help`, `.exit`, and `cd`/`pushd` directory arguments using the shell session's current working directory.
 
 ## [15.7.3] - 2026-05-31
 
