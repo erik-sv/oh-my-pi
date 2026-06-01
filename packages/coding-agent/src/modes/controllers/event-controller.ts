@@ -30,6 +30,7 @@ import { nextActionableTask } from "../../tools/todo";
 import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
 import { canonicalizeMessage } from "../../utils/thinking-display";
+import { startSessionTerminalTitleAnimation, stopSessionTerminalTitleAnimation } from "../../utils/title-generator";
 import { interruptHint } from "../shared";
 import { createAssistantMessageComponent } from "../utils/interactive-context-helpers";
 import { assistantUsageIsBilled } from "../utils/transcript-render-helpers";
@@ -365,6 +366,7 @@ export class EventController {
 	}
 
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
+		startSessionTerminalTitleAnimation(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -1073,6 +1075,7 @@ export class EventController {
 		this.ctx.statusLine.markActivityEnd();
 		this.#streamingReveal.stop();
 		this.#toolArgsReveal.flushAll();
+		stopSessionTerminalTitleAnimation();
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
