@@ -2,7 +2,12 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { generateSessionTitle } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
+import {
+	generateSessionTitle,
+	setSessionTerminalTitle,
+	startSessionTerminalTitleAnimation,
+	stopSessionTerminalTitleAnimation,
+} from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { logger } from "@oh-my-pi/pi-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
@@ -36,7 +41,39 @@ function createRegistry(model: Model<Api>) {
 	} as never;
 }
 
+function captureTerminalTitleWrites(): { writes: string[]; restore: () => void } {
+	const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+	const originalWrite = process.stdout.write;
+	const writes: string[] = [];
+	Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+	process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+		writes.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
+		return true;
+	}) as typeof process.stdout.write;
+	return {
+		writes,
+		restore: () => {
+			process.stdout.write = originalWrite;
+			if (originalIsTTY) {
+				Object.defineProperty(process.stdout, "isTTY", originalIsTTY);
+			} else {
+				Reflect.deleteProperty(process.stdout, "isTTY");
+			}
+		},
+	};
+}
+
+function parseTerminalTitleWrite(write: string | undefined): string {
+	expect(write).toBeDefined();
+	const text = write!;
+	expect(text.startsWith("\x1b]0;")).toBe(true);
+	expect(text.endsWith("\x07")).toBe(true);
+	return text.slice(4, -1);
+}
+
 afterEach(() => {
+	stopSessionTerminalTitleAnimation();
+	vi.useRealTimers();
 	vi.restoreAllMocks();
 });
 
@@ -266,5 +303,25 @@ describe("title generator", () => {
 		const userContent = sentMessages?.[0]?.content ?? "";
 		expect(userContent).not.toContain("Claude Code v2.1.158");
 		expect(userContent).toContain("pick provider then theme");
+	});
+
+	it("animates the terminal title icon while assistant work is active", () => {
+		vi.useFakeTimers();
+		const capture = captureTerminalTitleWrites();
+		try {
+			startSessionTerminalTitleAnimation("Fix terminal title", "/tmp/oh-my-pi");
+			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π⠋: Fix terminal title");
+
+			vi.advanceTimersByTime(160);
+			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π⠙: Fix terminal title");
+
+			setSessionTerminalTitle("Keep new title", "/tmp/oh-my-pi");
+			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π⠙: Keep new title");
+
+			stopSessionTerminalTitleAnimation();
+			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π: Keep new title");
+		} finally {
+			capture.restore();
+		}
 	});
 });

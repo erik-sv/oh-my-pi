@@ -19,6 +19,7 @@ import type { PlanApprovalDetails } from "../../plan-mode/approved-plan";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import { isSilentAbort, readPendingDisplayTag, resolveAbortLabel } from "../../session/messages";
 import type { ResolveToolDetails } from "../../tools/resolve";
+import { startSessionTerminalTitleAnimation, stopSessionTerminalTitleAnimation } from "../../utils/title-generator";
 import { interruptHint } from "../shared";
 import { StreamingRevealController } from "./streaming-reveal";
 import { ToolArgsRevealController } from "./tool-args-reveal";
@@ -237,6 +238,7 @@ export class EventController {
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
 		this.#agentTurnActive = true;
 		this.#interrupting = false;
+		startSessionTerminalTitleAnimation(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
@@ -796,6 +798,7 @@ export class EventController {
 		this.#agentTurnActive = false;
 		this.#streamingReveal.stop();
 		this.#toolArgsReveal.flushAll();
+		stopSessionTerminalTitleAnimation();
 		if (this.ctx.loadingAnimation) {
 			this.ctx.loadingAnimation.stop();
 			this.ctx.loadingAnimation = undefined;
