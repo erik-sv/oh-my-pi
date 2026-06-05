@@ -61,3 +61,12 @@ web-search, update, archive-read, file-mention, and provider compatibility fixes
 Verify with package checks and focused tests for coding-agent session storage,
 ACP plan mode, file mentions, archive reads, update CLI, and task async fallback.
 ```
+
+## Completion update - 2026-06-05
+- Local checkout aligned to fork and then rebased onto upstream/npm 15.9.3.
+- Fork main updated with force-with-lease to cd03a5019.
+- Active linked omp reports omp/15.9.3.
+- Preserved fork commits: peer-coms, SQL chunk session storage, peer-collab skill, update script, shell tab completion, title spinner, project workflow settings, TEAM_001 log.
+- Added integration fix commit cd03a5019 for SQL chunk storage on upstream IndexedSessionStorage plus formatting/import fixes.
+- Verification: bun check passed; targeted bun tests passed for SQL session storage, file mentions, task async fallback, update CLI, and title generator.
+- Remaining untracked local artifact: .upstream-review/ (left untouched).
