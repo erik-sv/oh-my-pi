@@ -53,7 +53,7 @@ import {
 	stripInternalDetailsFields,
 } from "./messages";
 import type { SessionStorage, SessionStorageWriter } from "./session-storage";
-import { FileSessionStorage, getDefaultSessionStorage, MemorySessionStorage } from "./session-storage";
+import { getDefaultSessionStorage, MemorySessionStorage } from "./session-storage";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -3404,7 +3404,11 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in session header)
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.omp/agent/sessions/<encoded-cwd>/).
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = getDefaultSessionStorage()): SessionManager {
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = getDefaultSessionStorage(),
+	): SessionManager {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#initNewSession();

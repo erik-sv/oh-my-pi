@@ -6,8 +6,8 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { SQL } from "bun";
 import { SqlSessionStorage, type SqlSessionStorageClient } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { SQL } from "bun";
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
 	const client = new SQL("sqlite::memory:");
@@ -131,7 +131,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		const rows = (await client.unsafe(`SELECT seq, content FROM omp_session_chunks WHERE path = ? ORDER BY seq`, [
 			"/sessions/p/keep.jsonl",
 		])) as Array<{ seq: number; content: string }>;
-		expect(rows).toEqual([{ seq: 1, content: "fresh\n" }]);
+		expect(rows).toEqual([{ seq: 0, content: "fresh\n" }]);
 		await client.end();
 	});
 

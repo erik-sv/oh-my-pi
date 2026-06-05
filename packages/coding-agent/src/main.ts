@@ -20,6 +20,7 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
 import chalk from "chalk";
 import { reset as resetCapabilities } from "./capability";
 import type { Args } from "./cli/args";
@@ -67,7 +68,6 @@ import type { AuthStorage } from "./session/auth-storage";
 import { resolveResumableSession, type SessionInfo, SessionManager } from "./session/session-manager";
 import { setDefaultSessionStorage } from "./session/session-storage";
 import { SqlSessionStorage } from "./session/sql-session-storage";
-import { SQL } from "bun";
 import { resolvePromptInput } from "./system-prompt";
 import { initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
 import { AUTO_THINKING } from "./thinking";
@@ -407,9 +407,7 @@ async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 	const url = $env.OMP_SESSION_DB_URL?.trim();
 	const optionsJson = $env.OMP_SESSION_DB_OPTIONS?.trim();
 	if (!url && !optionsJson) {
-		throw new Error(
-			"--session-storage sql requires OMP_SESSION_DB_URL or OMP_SESSION_DB_OPTIONS to be set.",
-		);
+		throw new Error("--session-storage sql requires OMP_SESSION_DB_URL or OMP_SESSION_DB_OPTIONS to be set.");
 	}
 
 	let client: SQL;
@@ -1124,7 +1122,6 @@ export async function runRootCommand(
 		if (modelRegistryError) {
 			notifs.push({ kind: "error", message: modelRegistryError.message });
 		}
-
 
 		if (!isInteractive && !session.model) {
 			if (modelFallbackMessage) {

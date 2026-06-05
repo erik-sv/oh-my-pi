@@ -61,6 +61,7 @@ interface DialectQueries {
 	rename: string;
 	loadIndex: string;
 	readChunks: string;
+	readFirstChunks: string;
 	maxSeq: string;
 }
 
@@ -71,6 +72,7 @@ interface IndexRow {
 }
 
 interface ChunkRow {
+	seq?: number | bigint | string;
 	content: string;
 }
 
@@ -127,7 +129,12 @@ function detectAdapter(client: SqlSessionStorageClient): SqlSessionStorageAdapte
 
 function buildQueries(adapter: SqlSessionStorageAdapter, table: string): DialectQueries {
 	const placeholder = adapter === "postgres" ? (n: number): string => `$${n}` : (_n: number): string => "?";
-	const byteLengthExpr = adapter === "mysql" ? "OCTET_LENGTH(content)" : adapter === "postgres" ? "octet_length(content)" : "length(cast(content AS blob))";
+	const byteLengthExpr =
+		adapter === "mysql"
+			? "OCTET_LENGTH(content)"
+			: adapter === "postgres"
+				? "octet_length(content)"
+				: "length(cast(content AS blob))";
 
 	if (adapter === "mysql") {
 		return {
@@ -147,6 +154,7 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
 			loadIndex: `SELECT path, SUM(${byteLengthExpr}) AS byte_len, MAX(mtime_ms) AS mtime_ms FROM ${table} GROUP BY path`,
 			readChunks: `SELECT content FROM ${table} WHERE path = ? ORDER BY seq`,
+			readFirstChunks: `SELECT seq, content FROM ${table} WHERE path = ? ORDER BY seq LIMIT 2`,
 			maxSeq: `SELECT MAX(seq) AS seq FROM ${table} WHERE path = ?`,
 		};
 	}
@@ -168,6 +176,7 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)}`,
 		loadIndex: `SELECT path, SUM(${byteLengthExpr}) AS byte_len, MAX(mtime_ms) AS mtime_ms FROM ${table} GROUP BY path`,
 		readChunks: `SELECT content FROM ${table} WHERE path = ${placeholder(1)} ORDER BY seq`,
+		readFirstChunks: `SELECT seq, content FROM ${table} WHERE path = ${placeholder(1)} ORDER BY seq LIMIT 2`,
 		maxSeq: `SELECT MAX(seq) AS seq FROM ${table} WHERE path = ${placeholder(1)}`,
 	};
 }
@@ -314,7 +323,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
-		const seq = await this.#nextSeq(path);
+		const firstChunks = (await this.#client.unsafe(this.#q.readFirstChunks, [path])) as ChunkRow[];
+		if (firstChunks.length === 1 && firstChunks[0].content === "") {
+			await this.#client.unsafe(this.#q.delete, [path]);
+			await this.#insertChunks(path, [line], mtimeMs);
+			return;
+		}
+		const lastFirstSeq = firstChunks.length === 1 ? toNumber(firstChunks[0].seq) + 1 : undefined;
+		const seq = lastFirstSeq ?? (await this.#nextSeq(path));
 		await this.#insertChunks(path, [line], mtimeMs, seq);
 	}
 
