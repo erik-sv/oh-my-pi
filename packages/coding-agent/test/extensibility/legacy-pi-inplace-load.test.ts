@@ -755,4 +755,31 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		const siblingUrl = `${url.pathToFileURL(await fs.realpath(path.join(dir, "unrelated.ts"))).href}?nonce=${Date.now()}`;
 		await expect(import(siblingUrl)).rejects.toThrow(/@earendil-works\/pi-ai/);
 	});
+
+	it("loads ESM asset imports natively instead of parsing them as JavaScript", async () => {
+		const dir = await writePackage({
+			"package.json": JSON.stringify({ name: "asset-import-ext", version: "1.0.0" }),
+			"prompt.md": "# Spawn Prompt\n\nbody",
+			"config.json": JSON.stringify({ mode: "peer" }),
+			"index.ts": [
+				'import promptText from "./prompt.md" with { type: "text" };',
+				'import config from "./config.json";',
+				"export const prompt = promptText;",
+				"export const cfg = config;",
+				"export default function (pi) { void pi; }",
+			].join("\n"),
+		});
+
+		const mod = (await loadLegacyPiModule(path.join(dir, "index.ts"))) as {
+			prompt: string;
+			cfg: { mode: string };
+		};
+
+		// Asset modules are excluded from the rewrite graph, so the `.md` text
+		// import and the native JSON import load through Bun's own loaders rather
+		// than being force-parsed as JS — regression for the peer-coms
+		// `import … "./peer-coms-spawn.md" with { type: "text" }` Syntax Error.
+		expect(mod.prompt).toBe("# Spawn Prompt\n\nbody");
+		expect(mod.cfg).toEqual({ mode: "peer" });
+	});
 });
