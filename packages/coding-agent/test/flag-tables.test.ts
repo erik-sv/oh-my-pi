@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { parseArgs, validateToolNames } from "../src/cli/args";
 import { OPTIONAL_VALUE_FLAGS, restartArgv, STRING_VALUE_FLAGS } from "../src/cli/flag-tables";
 import { CliUsageError } from "../src/cli/usage-error";
+import { launchHelp } from "../src/commands/launch-help";
 
 /**
  * Catches the set → args.ts direction of drift between
@@ -82,6 +83,20 @@ describe("--session-dir", () => {
 				Bun.env.PI_CODING_AGENT_SESSION_DIR = previous;
 			}
 		}
+	});
+});
+
+describe("--session-storage", () => {
+	it("accepts the file and sql storage backends", () => {
+		expect(parseArgs(["--session-storage", "file"]).sessionStorage).toBe("file");
+		expect(parseArgs(["--session-storage", "sql"]).sessionStorage).toBe("sql");
+	});
+
+	it("is documented with the supported values", () => {
+		expect(launchHelp.flags["session-storage"]).toMatchObject({
+			kind: "string",
+			options: ["file", "sql"],
+		});
 	});
 });
 

@@ -23,6 +23,7 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { SQL } from "bun";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags, validateToolNames } from "./cli/args";
 import { applyExtensionFlags, type ExtensionFlagSink } from "./cli/extension-flags";
@@ -99,6 +100,8 @@ import {
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
+import { setDefaultSessionStorage } from "./session/session-storage";
+import { SqlSessionStorage } from "./session/sql-session-storage";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
@@ -937,6 +940,67 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 	parsed.messages.splice(messageIndex, 1);
 }
 
+const SQL_SESSION_POOL_MAX = 2;
+
+export function parseSqlSessionDbOptions(optionsJson: string): {
+	connectionOptions: Record<string, unknown>;
+	createTable: boolean;
+} {
+	let options: unknown;
+	try {
+		options = JSON.parse(optionsJson);
+	} catch (err) {
+		throw new Error(`OMP_SESSION_DB_OPTIONS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	if (options === null || typeof options !== "object" || Array.isArray(options)) {
+		throw new Error("OMP_SESSION_DB_OPTIONS must be a JSON object.");
+	}
+
+	const { createTable = true, ...connectionOptions } = options as Record<string, unknown>;
+	if (typeof createTable !== "boolean") {
+		throw new Error("OMP_SESSION_DB_OPTIONS createTable must be a boolean.");
+	}
+	return { connectionOptions: { ...connectionOptions, max: SQL_SESSION_POOL_MAX }, createTable };
+}
+
+/**
+ * When `--session-storage sql` is requested, build a SQL-backed
+ * {@link SqlSessionStorage} from the connection in OMP_SESSION_DB_URL (a
+ * `bun:sql` connection string) or OMP_SESSION_DB_OPTIONS (a JSON object with
+ * `adapter` plus `bun:sql` connection fields — `database`, `username`,
+ * `password`, `port`, and either `path` for a unix socket or `hostname`), and
+ * install it as the process-wide default storage so every SessionManager
+ * factory persists transcripts to the database instead of JSONL files.
+ *
+ * No-op for the default "file" backend. Throws when "sql" is requested without
+ * a usable connection so a misconfiguration fails loudly at startup rather than
+ * silently falling back to files (which would split a deployment's transcripts
+ * across two backends).
+ */
+async function setupSessionStorageBackend(parsed: Args): Promise<void> {
+	if (parsed.sessionStorage !== "sql") return;
+
+	const url = $env.OMP_SESSION_DB_URL?.trim();
+	const optionsJson = $env.OMP_SESSION_DB_OPTIONS?.trim();
+	if (!url && !optionsJson) {
+		throw new Error("--session-storage sql requires OMP_SESSION_DB_URL or OMP_SESSION_DB_OPTIONS to be set.");
+	}
+
+	let client: SQL;
+	let createTable = true;
+	if (url) {
+		client = new SQL(url, { max: SQL_SESSION_POOL_MAX });
+	} else {
+		const parsedOptions = parseSqlSessionDbOptions(optionsJson as string);
+		client = new SQL(parsedOptions.connectionOptions);
+		createTable = parsedOptions.createTable;
+	}
+
+	const storage = await SqlSessionStorage.create({ client, createTable });
+	setDefaultSessionStorage(storage);
+	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
+}
+
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
 export async function createSessionManager(
 	parsed: Args,
@@ -1445,6 +1509,10 @@ export async function runRootCommand(
 		const mode = parsedArgs.mode || "text";
 		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
 		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
+
+		// Install the session storage backend before any SessionManager is created,
+		// so all factories and resume pickers share one durable backend.
+		await logger.time("setupSessionStorageBackend", setupSessionStorageBackend, parsedArgs);
 
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).

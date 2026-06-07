@@ -5,7 +5,7 @@ import { HistoryStorage } from "../session/history-storage";
 import type { SessionInfo } from "../session/session-listing";
 import { SessionManager } from "../session/session-manager";
 import { loadPinnedSessionIds } from "../session/session-pins";
-import { FileSessionStorage } from "../session/session-storage";
+import { getDefaultSessionStorage } from "../session/session-storage";
 
 /** Presentation and capability controls for the standalone session picker. */
 export interface SessionPickerOptions {
@@ -32,7 +32,7 @@ export async function selectSession(
 	const { promise, resolve } = Promise.withResolvers<SessionInfo | null>();
 	const ui = new TUI(new ProcessTerminal());
 	let resolved = false;
-	const storage = new FileSessionStorage();
+	const storage = getDefaultSessionStorage();
 
 	// Rank sessions with prompt-history matches too, recovering prompts the 4KB
 	// session-list prefix never sees. Best-effort: a missing/locked history.db

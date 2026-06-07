@@ -53,11 +53,12 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		await storage.drain();
 		await manager.close();
 
-		const rows = (await client.unsafe(`SELECT content FROM omp_session_files WHERE path = ?`, [
+		const chunkRows = (await client.unsafe(`SELECT content FROM omp_session_chunks WHERE path = ? ORDER BY seq`, [
 			sessionFilePath,
 		])) as Array<{ content: string }>;
-		expect(rows).toHaveLength(1);
-		const lines = rows[0].content.trim().split("\n");
+		expect(chunkRows.length).toBeGreaterThanOrEqual(3);
+		const content = chunkRows.map(r => r.content).join("");
+		const lines = content.trim().split("\n");
 		expect(lines.length).toBeGreaterThanOrEqual(3);
 		// The fixed-width title slot is always the first physical line; the session header follows.
 		const slot = JSON.parse(lines[0]);

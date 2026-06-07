@@ -4,7 +4,12 @@ import type { Message } from "@oh-my-pi/pi-ai";
 import { getSessionsDir, logger, parseJsonlLenient, toError } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { computeDefaultSessionDir } from "./session-paths";
-import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
+import {
+	FileSessionStorage,
+	getDefaultSessionStorage,
+	type SessionStorage,
+	type SessionStorageStat,
+} from "./session-storage";
 import { lookupSessionTitle, recordSessionTitle } from "./title-index";
 
 /**
@@ -625,7 +630,7 @@ export function listSessionsReadOnly(sessionDir: string, storage: SessionStorage
 
 /** List all sessions across all project directories (newest first). */
 export async function listAllSessions(
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 	sessionsRoot: string = getSessionsDir(),
 ): Promise<SessionInfo[]> {
 	try {
@@ -641,7 +646,7 @@ export async function listAllSessions(
 /** Exported for testing */
 export async function findMostRecentSession(
 	sessionDir: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<string | null> {
 	const sessions = await scanSessionDir(sessionDir, storage, false);
 	return sessions[0]?.path ?? null;
@@ -669,7 +674,7 @@ function sessionIdFromSessionPath(file: string): string | undefined {
 export async function getRecentSessions(
 	sessionDir: string,
 	limit = 4,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<RecentSessionInfo[]> {
 	let files: string[];
 	try {
@@ -743,10 +748,10 @@ export async function resolveResumableSession(
 	sessionArg: string,
 	cwd: string,
 	sessionDir?: string,
-	storageOrOptions: SessionStorage | ResolveResumableSessionOptions = new FileSessionStorage(),
+	storageOrOptions: SessionStorage | ResolveResumableSessionOptions = getDefaultSessionStorage(),
 	options: ResolveResumableSessionOptions = {},
 ): Promise<ResolvedSessionMatch | undefined> {
-	const storage = isSessionStorage(storageOrOptions) ? storageOrOptions : new FileSessionStorage();
+	const storage = isSessionStorage(storageOrOptions) ? storageOrOptions : getDefaultSessionStorage();
 	const resolvedOptions = isSessionStorage(storageOrOptions) ? options : storageOrOptions;
 	const localSessionDir = sessionDir ?? computeDefaultSessionDir(cwd, storage);
 	const localSessions = await listSessions(localSessionDir, storage);
