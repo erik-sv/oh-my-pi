@@ -2,8 +2,9 @@
  * SQL-Backed Sessions (PostgreSQL / MySQL / SQLite)
  *
  * Store session JSONL in a SQL database via `bun:sql`. One table, one row
- * per session file — works against PostgreSQL, MySQL/MariaDB, and SQLite
- * with the dialect picked automatically from the connection URL.
+ * per JSONL line (append-only chunk rows keyed by path+seq) — works against
+ * PostgreSQL, MySQL/MariaDB, and SQLite with the dialect picked automatically
+ * from the connection URL.
  *
  * Useful when:
  * - sessions need to be queryable from existing analytics infra (just JOIN
@@ -33,7 +34,7 @@ const client = new SQL(process.env.SESSIONS_DB_URL ?? "sqlite::memory:");
 // dialect) and warms the in-memory mirror with every existing row.
 const storage = await SqlSessionStorage.create({
 	client,
-	table: "omp_session_files", // optional, this is the default
+	table: "omp_session_chunks", // optional, this is the default
 	// createTable: false,       // set if migrations are owned elsewhere
 });
 

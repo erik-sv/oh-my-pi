@@ -5,7 +5,7 @@ import { buildSessionContext } from "./session-context";
 import type { FileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isImageBlock } from "./session-persistence";
-import { FileSessionStorage, type SessionStorage } from "./session-storage";
+import { getDefaultSessionStorage, type SessionStorage } from "./session-storage";
 
 /** Exported for compaction.test.ts */
 export function parseSessionEntries(content: string): FileEntry[] {
@@ -15,7 +15,7 @@ export function parseSessionEntries(content: string): FileEntry[] {
 /** Exported for testing */
 export async function loadEntriesFromFile(
 	filePath: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<FileEntry[]> {
 	let content: string;
 	try {
