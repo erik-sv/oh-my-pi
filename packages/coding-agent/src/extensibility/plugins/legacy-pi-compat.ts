@@ -508,6 +508,18 @@ function escapeRegExp(value: string): string {
 // native Bun resolutions.
 const EXTENSION_GRAPH_SPECIFIER_REGEX = /(?:from\s+|import\s+|import\s*\(\s*)["']((?:\.\.?\/|#)[^"']+)["']/g;
 
+// Bun source loaders the legacy-import rewrite applies to. Anything else —
+// `.md`, `.json`, `.html`, `.css`, `.txt`, `.svg`, `.wasm`, … — is an asset: it
+// carries no legacy `@(scope)/pi-*` imports to rewrite, and it must reach Bun's
+// native loader so ESM import attributes (`with { type: "text" }`) and the
+// built-in asset loaders apply, instead of the asset source being force-parsed
+// as JavaScript by the rewrite `onLoad` hook (which throws `Syntax Error`).
+const REWRITABLE_MODULE_EXTENSIONS = new Set([".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"]);
+
+function isRewritableModule(modulePath: string): boolean {
+	return REWRITABLE_MODULE_EXTENSIONS.has(path.extname(modulePath).toLowerCase());
+}
+
 // Extension entry realpaths that already have a load-time rewrite hook
 // installed. Each `Bun.plugin()` registration is process-global and permanent,
 // so we register at most one hook per entry.
@@ -524,11 +536,14 @@ async function realpathOrSelf(p: string): Promise<string> {
 
 /**
  * Walk the extension's relative-import graph starting at `entryRealPath`,
- * returning the realpath of every reachable source module. Only relative
+ * returning the realpath of every reachable code module. Only relative
  * specifiers (`./`, `../`) are followed — bare and absolute imports are left to
  * Bun's native resolver — so the set is exactly the extension's own source,
  * wherever it physically lives (a `../src` sibling, a symlinked sub-tree, …).
  * This mirrors the module set the old temp-dir mirror tracked, minus the copy.
+ * Asset modules (`.md`, `.json`, `.html`, …) reached through the graph are not
+ * tracked: they have no legacy imports to rewrite, so they are left to Bun's
+ * native loader rather than being force-parsed as JavaScript.
  */
 async function collectExtensionModules(entryRealPath: string): Promise<Set<string>> {
 	const modules = new Set<string>();
@@ -553,7 +568,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Set<strin
 				const resolved = specifier.startsWith("#")
 					? await resolvePackageImportSpecifier(specifier, file)
 					: await realpathOrSelf(Bun.resolveSync(specifier, dir));
-				if (resolved && !modules.has(resolved)) {
+				if (resolved && isRewritableModule(resolved) && !modules.has(resolved)) {
 					queue.push(resolved);
 				}
 			} catch {
