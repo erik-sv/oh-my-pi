@@ -424,6 +424,35 @@ export class FileSessionStorage implements SessionStorage {
 	}
 }
 
+// ── Default session storage registry ────────────────────────────────────────
+// SessionManager factory methods and CLI helpers default their `storage`
+// parameter to the process-wide default returned here. It is a lazily-created
+// FileSessionStorage unless the runtime overrides it once at startup (e.g.
+// main.ts wiring a SqlSessionStorage from OMP_SESSION_DB_URL/OPTIONS). Routing
+// every factory through a single default guarantees reads, writes, listing, and
+// deletion all target the same backend — there is no path that writes to SQL
+// while another tails the filesystem.
+let defaultSessionStorage: SessionStorage | undefined;
+
+/**
+ * Override the process-wide default {@link SessionStorage}. Call once during
+ * startup, before any SessionManager is created. Passing `undefined` restores
+ * the lazily-created FileSessionStorage default (used by tests).
+ */
+export function setDefaultSessionStorage(storage: SessionStorage | undefined): void {
+	defaultSessionStorage = storage;
+}
+
+/**
+ * The process-wide default {@link SessionStorage}. Defaults to a shared
+ * FileSessionStorage instance when nothing has been set, preserving the
+ * historical file-backed behavior.
+ */
+export function getDefaultSessionStorage(): SessionStorage {
+	if (!defaultSessionStorage) defaultSessionStorage = new FileSessionStorage();
+	return defaultSessionStorage;
+}
+
 function matchesPattern(name: string, pattern: string): boolean {
 	if (pattern === "*") return true;
 	if (pattern.startsWith("*.")) {
