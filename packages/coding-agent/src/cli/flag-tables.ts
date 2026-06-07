@@ -167,6 +167,13 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--session-dir": (result, value) => {
 		result.sessionDir = value;
 	},
+	"--session-storage": (result, value, deps) => {
+		if (value === "file" || value === "sql") {
+			result.sessionStorage = value;
+		} else {
+			deps.logger.warn("Unknown --session-storage value; expected 'file' or 'sql'", { value });
+		}
+	},
 	"--models": (result, value) => {
 		result.models = value.split(",").map(s => s.trim());
 	},

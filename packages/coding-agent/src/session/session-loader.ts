@@ -13,7 +13,7 @@ import {
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isImageBlock, isImageDataPayload } from "./session-persistence";
-import { FileSessionStorage, type SessionStorage } from "./session-storage";
+import { getDefaultSessionStorage, type SessionStorage } from "./session-storage";
 import {
 	parseTitleSlotFromContent,
 	parseTitleSlotLine,
@@ -180,7 +180,7 @@ export async function loadEntriesFromFileStream(filePath: string): Promise<{
 /** Read only the fixed-size head window to detect a physical title slot. */
 export async function readTitleSlotFromFile(
 	filePath: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<SessionTitleSlotEntry | undefined> {
 	let head: string;
 	try {
@@ -201,7 +201,7 @@ export function parseSessionEntries(content: string): FileEntry[] {
 /** Exported for testing */
 export async function loadEntriesFromFile(
 	filePath: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storage: SessionStorage = getDefaultSessionStorage(),
 ): Promise<FileEntry[]> {
 	let loaded: { entries: FileEntry[]; titleSlot: SessionTitleUpdate | undefined };
 	try {

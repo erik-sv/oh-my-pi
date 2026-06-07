@@ -21,6 +21,7 @@ import {
 	setProjectDir,
 	VERSION,
 } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
 import chalk from "chalk";
 import { reset as resetCapabilities } from "./capability";
 import { type Args, reportUnrecognizedFlags } from "./cli/args";
@@ -75,6 +76,8 @@ import type { AuthStorage } from "./session/auth-storage";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
+import { setDefaultSessionStorage } from "./session/session-storage";
+import { SqlSessionStorage } from "./session/sql-session-storage";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
@@ -663,6 +666,49 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 	parsed.messages.splice(messageIndex, 1);
 }
 
+/**
+ * When `--session-storage sql` is requested, build a SQL-backed
+ * {@link SqlSessionStorage} from the connection in OMP_SESSION_DB_URL (a
+ * `bun:sql` connection string) or OMP_SESSION_DB_OPTIONS (a JSON object with
+ * `adapter` plus `bun:sql` connection fields — `database`, `username`,
+ * `password`, `port`, and either `path` for a unix socket or `hostname`), and
+ * install it as the process-wide default storage so every SessionManager
+ * factory persists transcripts to the database instead of JSONL files.
+ *
+ * No-op for the default "file" backend. Throws when "sql" is requested without
+ * a usable connection so a misconfiguration fails loudly at startup rather than
+ * silently falling back to files (which would split a deployment's transcripts
+ * across two backends).
+ */
+async function setupSessionStorageBackend(parsed: Args): Promise<void> {
+	if (parsed.sessionStorage !== "sql") return;
+
+	const url = $env.OMP_SESSION_DB_URL?.trim();
+	const optionsJson = $env.OMP_SESSION_DB_OPTIONS?.trim();
+	if (!url && !optionsJson) {
+		throw new Error("--session-storage sql requires OMP_SESSION_DB_URL or OMP_SESSION_DB_OPTIONS to be set.");
+	}
+
+	let client: SQL;
+	if (url) {
+		client = new SQL(url);
+	} else {
+		let options: Record<string, unknown>;
+		try {
+			options = JSON.parse(optionsJson as string) as Record<string, unknown>;
+		} catch (err) {
+			throw new Error(
+				`OMP_SESSION_DB_OPTIONS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+		client = new SQL(options);
+	}
+
+	const storage = await SqlSessionStorage.create({ client });
+	setDefaultSessionStorage(storage);
+	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
+}
+
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
 export async function createSessionManager(
 	parsed: Args,
@@ -1232,6 +1278,11 @@ export async function runRootCommand(
 	// id from UUID-shaped values owned by later extension flags.
 	normalizeContinueSessionArgs(parsedArgs, rawArgs);
 
+	// Install the session storage backend (SQL vs file) before any
+	// SessionManager is created, so every factory and the resume picker below
+	// share the same backend.
+	await logger.time("setupSessionStorageBackend", setupSessionStorageBackend, parsedArgs);
+
 	// Create session manager based on CLI flags. SessionResolutionError signals a
 	// user-facing failure (unknown --resume/--fork id, non-interactive fork
 	// prompt, --fork with --no-session): print + exit cleanly instead of letting
@@ -1502,7 +1553,6 @@ export async function runRootCommand(
 		if (modelRegistryError) {
 			notifs.push({ kind: "error", message: modelRegistryError.message });
 		}
-
 
 		if (!isInteractive && !session.model) {
 			if (modelRegistryError) {
