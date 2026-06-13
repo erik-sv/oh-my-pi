@@ -68,6 +68,22 @@ say "linking omp -> $FORK_DIR/packages/coding-agent"
 ( cd packages/coding-agent && bun link >/dev/null 2>&1 || true )
 bun link @oh-my-pi/pi-coding-agent >/dev/null 2>&1 || true
 
+# 6.5) Register the last30days research skill via OMP's marketplace (idempotent,
+#      best-effort). Lightweight reference: NO third-party code is vendored into
+#      this fork — `omp plugin` fetches it into ~/.omp/plugins on each machine and
+#      `marketplace.autoUpdate` keeps it current. Runtime needs Python 3.12+ on PATH;
+#      key-free sources (reddit/hackernews/polymarket/github) work out of the box,
+#      while X/YouTube/TikTok/etc. need their own API keys. The skill is third-party
+#      and flagged High-Risk by its own installer scan (reads browser cookies, hits
+#      many external APIs) — prefer running it sandboxed with explicit env.
+if command -v omp >/dev/null; then
+  say "registering last30days skill marketplace (mvanhorn/last30days-skill)"
+  omp plugin marketplace list 2>/dev/null | grep -q 'last30days-skill' \
+    || omp plugin marketplace add mvanhorn/last30days-skill || true
+  omp plugin list 2>/dev/null | grep -q 'last30days@last30days-skill' \
+    || omp plugin install last30days@last30days-skill || true
+fi
+
 # 7) Report.
 HEAD_SHA="$(git rev-parse --short HEAD)"
 VER="$(grep -m1 '"version"' packages/coding-agent/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '?')"
