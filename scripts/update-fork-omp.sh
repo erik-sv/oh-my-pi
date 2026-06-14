@@ -62,6 +62,22 @@ git checkout -B main origin/main
 say "bun install"
 bun install
 
+# 5.5) Ensure the host's native addon exists. `*.node` is gitignored and the
+#      workspace ships no prebuilt, so a fresh checkout on ANY OS must compile
+#      crates/pi-natives once (needs a Rust toolchain; rust-toolchain.toml pins
+#      the nightly, which rustup auto-installs). Idempotent: skip when a matching
+#      .node is already built.
+NATIVE_DIR="$FORK_DIR/packages/natives/native"
+HOST_TAG="$(bun -e 'process.stdout.write(process.platform + "-" + process.arch)')"
+if compgen -G "$NATIVE_DIR/pi_natives.${HOST_TAG}"'*.node' >/dev/null; then
+  say "native addon for $HOST_TAG already present"
+else
+  command -v cargo >/dev/null \
+    || die "native addon for $HOST_TAG is missing and no Rust toolchain found. Install rustup (https://rustup.rs), then re-run."
+  say "building native addon for $HOST_TAG (one-time; requires Rust)"
+  bun --cwd=packages/natives run build
+fi
+
 # 6) (Re)link the omp binary to this checkout's source, so `omp` runs the fork.
 #    Safe to re-run; bun link is idempotent.
 say "linking omp -> $FORK_DIR/packages/coding-agent"
