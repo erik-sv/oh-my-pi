@@ -855,7 +855,7 @@ function lastAssistantText(ctx: ExtensionContext, startIndex = 0): { text: strin
 }
 
 export default function peerComs(pi: ExtensionAPI) {
-	const { z } = pi.zod;
+	const z = pi.zod;
 
 	pi.registerFlag("peer-name", {
 		description: "Name for this peer-coms agent",
