@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fork (erik-sv/oh-my-pi)
+
+These changes are carried by the AgentDesk fork on top of canonical v16.0.1 and are not part of upstream:
+
+- **SQL session storage** (`--session-storage sql`): persists transcripts to a SQL database as append-only chunk rows (one row per JSONL line, keyed by `(path, seq)`) in `omp_session_chunks`, so each append is an O(1) INSERT instead of rewriting the whole blob. The backend is built from `OMP_SESSION_DB_URL` / `OMP_SESSION_DB_OPTIONS` and installed as the process-wide default storage, routing every `SessionManager` factory and the resume/listing paths (`session-listing`, `session-loader`) through it. Powers AgentDesk's RPC sessions reading OMP transcripts directly from Postgres.
+- **peer-coms**: flat peer-to-peer collaboration between running OMP agents (`peer_send`/`peer_get`/`peer_await`/`peer_spawn`/`peer_shutdown` tools; `--peer-name`/`--peer-project`/`--peer-purpose` flags), shipped as the `peer-coms` example extension plus the `peer-collab` skill and bundled agent definitions.
+- **Animated terminal title spinner** while a session is generating; restores the static title on stop.
+- **Tab completion in the `omp` shell**.
+- **Extension asset imports via Bun's native loader**: legacy/`-e` extensions that statically import non-code assets (e.g. `import x from "./y.md" with { type: "text" }`) no longer fail with a syntax error.
+- Shared project workflow/tool settings via `.omp/` project config.
+
 ## [16.0.1] - 2026-06-15
 
 ### Breaking Changes

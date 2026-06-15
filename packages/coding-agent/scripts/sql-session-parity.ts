@@ -37,27 +37,23 @@ async function main(): Promise<void> {
 	};
 
 	const writer = storage.openWriter(path);
-	writer.writeLineSync(push({ type: "session", id: "parity-1", version: 3, cwd: "/repo" }));
+	await writer.append(push({ type: "session", id: "parity-1", version: 3, cwd: "/repo" }));
 	for (let turn = 0; turn < 50; turn++) {
-		writer.writeLineSync(push({ type: "message", id: `u${turn}`, role: "user", content: `prompt ${turn}` }));
-		writer.writeLineSync(
-			push({
+		await writer.append(push({ type: "message", id: `u${turn}`, role: "user", content: `prompt ${turn}` }));
+		await writer.append(push({
 				type: "message",
 				id: `a${turn}`,
 				role: "assistant",
 				content: [{ type: "text", text: `reply ${turn}` }],
-			}),
-		);
+			}));
 		if (turn % 7 === 0) {
 			// Tool call + result pair; exercise a deeper content shape.
-			writer.writeLineSync(
-				push({
+			await writer.append(push({
 					type: "message",
 					id: `t${turn}`,
 					role: "tool",
 					content: `result block\nwith internal newline kept verbatim`,
-				}),
-			);
+				}));
 		}
 	}
 	await writer.close();
@@ -76,7 +72,7 @@ async function main(): Promise<void> {
 	// new line lands at the end, not clobbering an existing chunk.
 	const writer2 = storage.openWriter(path);
 	const tail = push({ type: "message", id: "final", role: "assistant", content: "done" });
-	writer2.writeLineSync(tail);
+	await writer2.append(tail);
 	await writer2.close();
 	await storage.drain();
 	assert((await storage.readText(path)) === lines.join(""), "post-refresh append mismatch");
