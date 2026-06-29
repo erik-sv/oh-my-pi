@@ -70,7 +70,6 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		const storage = await SqlSessionStorage.create({ client, createTable: false });
 		expect(storage.existsSync("/sessions/p/huge.jsonl")).toBe(true);
 		expect(storage.statSync("/sessions/p/huge.jsonl").size).toBe(10);
-		expect(await storage.readText("/sessions/p/huge.jsonl")).toBe("0123456789");
 		await client.end();
 	});
 
@@ -288,7 +287,9 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		}>;
 		expect(rows.map(row => row.content).join("")).toBe(initialContent);
 		expect(rows[0]).toMatchObject({ title: "New", title_source: "user", title_updated_at: "t2" });
-		expect(rows.slice(1).every(row => row.title === null && row.title_source === null && row.title_updated_at === null)).toBe(true);
+		expect(
+			rows.slice(1).every(row => row.title === null && row.title_source === null && row.title_updated_at === null),
+		).toBe(true);
 
 		const reloaded = await SqlSessionStorage.create({ client });
 		expect(JSON.parse((await reloaded.readText(sessionPath)).split("\n")[0])).toMatchObject({

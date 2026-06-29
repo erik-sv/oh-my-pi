@@ -342,7 +342,6 @@ export type ReadonlySessionManager = Pick<
 	| "putBlobSync"
 >;
 
-
 interface SessionManagerStateSnapshot {
 	cwd: string;
 	sessionDir: string;
