@@ -62,19 +62,38 @@ git checkout -B main origin/main
 say "bun install"
 bun install
 
-# 5.5) Ensure the host's native addon exists. `*.node` is gitignored and the
-#      workspace ships no prebuilt, so a fresh checkout on ANY OS must compile
-#      crates/pi-natives once (needs a Rust toolchain; rust-toolchain.toml pins
-#      the nightly, which rustup auto-installs). Idempotent: skip when a matching
-#      .node is already built.
+# 5.5) Ensure the host's native addon is present AND matches this release.
+#      `*.node` is gitignored and the workspace ships no prebuilt, so a fresh
+#      checkout on ANY OS must compile crates/pi-natives once (needs a Rust
+#      toolchain; rust-toolchain.toml pins the nightly, which rustup
+#      auto-installs). The addon is rebuilt in lock-step with the package
+#      version: napi-rs emits a `__piNativesV{major}_{minor}_{patch}` sentinel
+#      symbol whose name encodes the version (packages/natives loader-state.js).
+#      A `.node` left from a previous release lacks the current sentinel and
+#      MUST be rebuilt — a host-tag match ALONE is not enough, or a post-upgrade
+#      dev tree silently runs a stale addon missing the new native exports
+#      (workspace loads skip the loader's version validation). The sentinel name
+#      is embedded as a string in the compiled .node, so a crash-free `grep`
+#      (no dlopen, so no SIGILL on a CPU-variant mismatch) settles freshness.
+#      Idempotent: skip only when a host-tag .node embeds the current sentinel.
 NATIVE_DIR="$FORK_DIR/packages/natives/native"
 HOST_TAG="$(bun -e 'process.stdout.write(process.platform + "-" + process.arch)')"
-if compgen -G "$NATIVE_DIR/pi_natives.${HOST_TAG}"'*.node' >/dev/null; then
-  say "native addon for $HOST_TAG already present"
+NATIVE_VER="$(grep -m1 '"version"' packages/natives/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '0.0.0')"
+SENTINEL="__piNativesV$(printf '%s' "$NATIVE_VER" | tr -c 'A-Za-z0-9' '_')"
+native_addon_current() {
+  local f
+  for f in "$NATIVE_DIR/pi_natives.${HOST_TAG}"*.node; do
+    [ -e "$f" ] || continue
+    grep -qa "$SENTINEL" "$f" && return 0
+  done
+  return 1
+}
+if native_addon_current; then
+  say "native addon for $HOST_TAG matches pi-natives@$NATIVE_VER ($SENTINEL present)"
 else
   command -v cargo >/dev/null \
-    || die "native addon for $HOST_TAG is missing and no Rust toolchain found. Install rustup (https://rustup.rs), then re-run."
-  say "building native addon for $HOST_TAG (one-time; requires Rust)"
+    || die "native addon for $HOST_TAG is missing or stale (need sentinel $SENTINEL) and no Rust toolchain found. Install rustup (https://rustup.rs), then re-run."
+  say "building native addon for $HOST_TAG @ $NATIVE_VER (compiles crates/pi-natives; requires Rust)"
   bun --cwd=packages/natives run build
 fi
 
