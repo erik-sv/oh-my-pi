@@ -8,7 +8,7 @@ import {
 	startSessionTerminalTitleAnimation,
 	stopSessionTerminalTitleAnimation,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -50,6 +50,7 @@ function createRegistry(model: Model<Api>) {
 function captureTerminalTitleWrites(): { writes: string[]; restore: () => void } {
 	const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
 	const originalWrite = process.stdout.write;
+	const previousHeadless = setTerminalHeadless(false);
 	const writes: string[] = [];
 	Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
 	process.stdout.write = ((chunk: string | Uint8Array): boolean => {
@@ -59,6 +60,7 @@ function captureTerminalTitleWrites(): { writes: string[]; restore: () => void }
 	return {
 		writes,
 		restore: () => {
+			setTerminalHeadless(previousHeadless);
 			process.stdout.write = originalWrite;
 			if (originalIsTTY) {
 				Object.defineProperty(process.stdout, "isTTY", originalIsTTY);
