@@ -47,3 +47,74 @@ shape (pi.zod is now the z object) and the SQL parity script to the v16
 async writer.append API (sync writer APIs removed upstream). Add a
 consolidated fork CHANGELOG entry and TEAM_006 fold-in log.
 ```
+
+## Upstream v16.2.5 review - 2026-06-29
+- Current fork `origin/main` remains `b9a0817a5` at `omp/16.0.1`; canonical `upstream/main` is `ca9f2847e` at `omp/16.2.5`.
+- Divergence after fetch: fork is 12 commits ahead and 2014 commits behind canonical.
+- Diff size `origin/main..upstream/main`: 2733 files changed, 847 added, 1636 modified, 70 deleted, 180 renamed.
+- Largest changed areas: `packages/coding-agent` 1245 files, `packages/ai` 402, `crates/vendor` 269, `packages/utils` 173, `packages/catalog` 87, `packages/tui` 70, `python/robomp` 66.
+- Notable upstream additions: Ruby and Julia eval runtimes, `task/isolation-runner.ts`, typed yield assembly, provider concurrency management, `grep`/`glob` tool rename, `ssh://` file handling, ACP bridge tool, in-house document conversion under `src/markit`, DuckDuckGo/Firecrawl/TinyFish/xAI web search providers, Devin and GitLab Duo providers, WATCHDOG advisor configuration, remote compaction V2.
+- Breaking upstream changes to account for: eval single-cell API and `agent_type` -> `agent` / `return_handle` -> `handle`; `search` -> `grep` and `find` -> `glob`; `history://` transcript reads removed; `readHashLines` removed; legacy `AgentSession.nextToolChoice()` removed.
+- All 12 fork commits remain unique versus canonical. Preserve: peer-coms agents, peer-collab skill, update helper, shell tab completion, terminal title spinner, Bun-native extension asset loading, `.omp` workflow settings, SQL `omp_session_chunks`, last30days registration, team logs, v16.0.1 adaptation, native-addon install fallback.
+- `git merge-tree --write-tree origin/main upstream/main` predicts content conflicts in: `packages/coding-agent/src/modes/interactive-mode.ts`, `packages/coding-agent/src/session/session-listing.ts`, `packages/coding-agent/src/session/session-loader.ts`, `packages/coding-agent/src/session/session-manager.ts`, `packages/coding-agent/src/session/sql-session-storage.ts`, `packages/coding-agent/src/utils/title-generator.ts`, `packages/coding-agent/test/session/sql-session-storage-manager.test.ts`, `packages/coding-agent/test/session/sql-session-storage.test.ts`.
+- Highest preservation risk: upstream now has its own SQL storage shape (`omp_session_files`, title metadata, updated storage contract). Do not accept upstream `sql-session-storage.ts` wholesale. Reimplement the fork's append-only `omp_session_chunks(path, seq, content, mtime_ms)` contract against the new upstream `SessionStorage`/`IndexedSessionStorage` APIs.
+- Medium preservation risk: terminal title spinner must be replayed over upstream title lifecycle, not kept by stale hunk. Upstream changed title generation, terminal-title test suppression, status line, and progress indicators.
+- Medium preservation risk: peer-coms/peer-collab must adapt to upstream agent registry, IRC broadcast, advisor non-peer, cold subagent revival, isolated worktree, and removed `history://` transcript semantics.
+- Medium preservation risk: fork `.omp` agent definitions, skills, settings, `scripts/update-fork-omp.sh`, and `.teams` logs appear as deletions in the direct upstream diff because they are fork-local. Keep them unless a file has an explicit upstream replacement.
+
+## Suggested commit message if implementing v16.2.5 sync
+```text
+chore(fork): rebase OMP fork onto canonical v16.2.5
+
+Replay the fork-specific peer-coms, peer-collab, shell completion,
+terminal-title spinner, project .omp settings, update helper, last30days
+registration, and AgentDesk SQL transcript-storage changes onto canonical
+v16.2.5.
+
+Adapt SQL session storage to upstream's current SessionStorage contract while
+preserving the fork's append-only omp_session_chunks(path, seq, content,
+mtime_ms) ingest contract. Reapply the title spinner on top of the current
+interactive lifecycle and keep upstream provider-concurrency, typed-yield,
+advisor, grep/glob, eval, and extension-loader changes intact.
+
+Verify with typecheck plus focused tests for SQL session storage/list/load,
+RPC startup with --session-storage sql, peer-coms extension loading, shell
+completion, title-generator spinner lifecycle, update-fork-omp native-addon
+fallback, and grep/glob renamed tool prompts.
+```
+
+## Upstream v16.2.5 sync execution - 2026-06-29
+- Created branch `sync/upstream-v16.2.5` from `upstream/main` and replayed all 12 fork commits.
+- Preserved fork artifacts: peer-coms extension/tests/docs, peer-collab skill, project `.omp` agents/settings/skills, update helper, shell completion, title spinner, Bun asset-loader intent, SQL chunk storage, last30days registration, team logs, and native-addon fallback docs.
+- Adapted SQL storage to upstream title-slot APIs while keeping `omp_session_chunks`; title metadata now lives on `seq = 0` and updates without rewriting content chunks.
+- Adapted peer-coms auth-broker import to upstream `@oh-my-pi/pi-ai/auth-broker`.
+- Adapted title-spinner test to opt out of upstream headless-terminal suppression with `setTerminalHeadless(false)`.
+- Installed dependencies with `bun install` after upstream dependency changes.
+- Verification passed:
+  - `bun test packages/coding-agent/test/session/sql-session-storage.test.ts packages/coding-agent/test/session/sql-session-storage-manager.test.ts`
+  - `bun test packages/coding-agent/test/title-generator.test.ts packages/coding-agent/test/shell-cli.test.ts packages/coding-agent/test/extensibility/legacy-pi-inplace-load.test.ts packages/coding-agent/test/peer-coms.test.ts`
+  - `bun run --cwd packages/coding-agent check`
+
+## Suggested final commit message
+```text
+chore(fork): finish canonical v16.2.5 sync
+
+Replay all fork-only OMP commits onto canonical upstream/main v16.2.5 and keep
+the fork contracts intact.
+
+Preserve peer-coms, peer-collab, shell completion, terminal-title spinner,
+project .omp settings, update helper, last30days registration, Bun extension
+asset loading, team logs, native-addon install fallback, and AgentDesk SQL
+session ingest support.
+
+Adapt SQL session storage to upstream title-slot APIs while retaining
+omp_session_chunks as append-only rows keyed by path and seq. Store title
+metadata on seq 0 and update it without rewriting transcript chunks. Adapt
+peer-coms auth-broker imports and terminal-title tests to upstream API and
+headless-terminal behavior.
+
+Verification:
+- bun test packages/coding-agent/test/session/sql-session-storage.test.ts packages/coding-agent/test/session/sql-session-storage-manager.test.ts
+- bun test packages/coding-agent/test/title-generator.test.ts packages/coding-agent/test/shell-cli.test.ts packages/coding-agent/test/extensibility/legacy-pi-inplace-load.test.ts packages/coding-agent/test/peer-coms.test.ts
+- bun run --cwd packages/coding-agent check
+```

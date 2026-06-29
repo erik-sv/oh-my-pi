@@ -21,7 +21,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { type AuthBrokerServerHandle, startAuthBroker } from "@oh-my-pi/pi-ai";
+import { type AuthBrokerServerHandle, startAuthBroker } from "@oh-my-pi/pi-ai/auth-broker";
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { getAgentDir, prompt } from "@oh-my-pi/pi-utils";
 import peerComsSpawnPrompt from "./peer-coms-spawn.md" with { type: "text" };

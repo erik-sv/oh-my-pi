@@ -233,7 +233,6 @@ export function parseArgs(inputArgs: string[], extensionFlags?: Map<string, { ty
 			result.continue = true;
 		} else if (arg === "--no-session") {
 			result.noSession = true;
-
 		} else if (arg === "--no-tools") {
 			result.noTools = true;
 		} else if (arg === "--no-lsp") {
