@@ -36,6 +36,7 @@ export type RpcCommand =
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "abort_and_prompt"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "new_session"; parentSession?: string }
+	| { id?: string; type: "ephemeral_turn"; prompt: string }
 
 	// State
 	| { id?: string; type: "get_state" }
@@ -162,6 +163,10 @@ export interface RpcHandoffResult {
 	savedPath?: string;
 }
 
+export interface RpcEphemeralTurnResult {
+	replyText: string;
+}
+
 export type RpcSubagentSubscriptionLevel = "off" | "progress" | "events";
 
 export interface RpcSubagentSnapshot {
@@ -210,6 +215,7 @@ export type RpcResponse =
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| { id?: string; type: "response"; command: "abort_and_prompt"; success: true }
 	| { id?: string; type: "response"; command: "new_session"; success: true; data: { cancelled: boolean } }
+	| { id?: string; type: "response"; command: "ephemeral_turn"; success: true; data: RpcEphemeralTurnResult }
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }

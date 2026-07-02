@@ -116,6 +116,7 @@ Important edge behavior from runtime:
 - `{ id?, type: "abort" }`
 - `{ id?, type: "abort_and_prompt", message: string, images?: ImageContent[] }`
 - `{ id?, type: "new_session", parentSession?: string }`
+- `{ id?, type: "ephemeral_turn", prompt: string }`
 
 ### Protocol
 
