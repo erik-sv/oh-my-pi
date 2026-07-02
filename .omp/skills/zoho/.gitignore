@@ -1,0 +1,8 @@
+# Never commit credentials or token caches. The skill reads these from
+# ~/.config/encypher/ at runtime; they must never live in the repo.
+*.env
+*token*.json
+.config/
+# Scratch / conversion output
+*.tmp
+tmp.*.docx
