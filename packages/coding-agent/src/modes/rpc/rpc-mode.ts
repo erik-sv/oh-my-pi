@@ -489,6 +489,35 @@ export async function handleRpcSessionChange(
 	throw new Error("Unsupported RPC session change command");
 }
 
+export type RpcEphemeralTurnSession = Pick<AgentSession, "isStreaming" | "isCompacting" | "runEphemeralTurn">;
+
+export type RpcEphemeralTurnCommand = Extract<RpcCommand, { type: "ephemeral_turn" }>;
+
+/**
+ * Run a single ephemeral side-channel turn over RPC (same pipeline as `/btw`).
+ * The primitive sends the main turn's tool catalog to preserve the provider
+ * prompt cache, discards any generated tool calls, and never persists into
+ * session history — only `replyText` crosses the RPC boundary. Refused while a
+ * response or compaction is in flight: hosts poll idle sessions for recaps and
+ * must never race a live turn.
+ */
+export async function handleRpcEphemeralTurn(
+	session: RpcEphemeralTurnSession,
+	command: RpcEphemeralTurnCommand,
+): Promise<{ replyText: string }> {
+	if (session.isStreaming) {
+		throw new Error("Cannot run ephemeral turn while a response is in progress");
+	}
+	if (session.isCompacting) {
+		throw new Error("Cannot run ephemeral turn while compaction is in progress");
+	}
+	if (typeof command.prompt !== "string" || !command.prompt.trim()) {
+		throw new Error("Prompt cannot be empty");
+	}
+	const { replyText } = await session.runEphemeralTurn({ promptText: command.prompt });
+	return { replyText };
+}
+
 function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
 	return tools.map((tool, index) => {
 		const name = typeof tool.name === "string" ? tool.name.trim() : "";
@@ -1018,6 +1047,14 @@ export async function runRpcMode(
 				const result = await handleRpcSessionChange(session, command, subagentRegistry);
 				if (!result.data.cancelled) await emitAvailableCommandsUpdate();
 				return success(id, result.type, result.data);
+			}
+
+			case "ephemeral_turn": {
+				try {
+					return success(id, "ephemeral_turn", await handleRpcEphemeralTurn(session, command));
+				} catch (err) {
+					return error(id, "ephemeral_turn", err instanceof Error ? err.message : String(err));
+				}
 			}
 
 			// =================================================================

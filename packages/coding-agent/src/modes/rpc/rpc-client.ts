@@ -16,6 +16,7 @@ import type {
 	RpcAvailableCommandsUpdateFrame,
 	RpcAvailableSlashCommand,
 	RpcCommand,
+	RpcEphemeralTurnResult,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcHandoffResult,
@@ -657,6 +658,17 @@ export class RpcClient {
 	 */
 	async handoff(customInstructions?: string): Promise<RpcHandoffResult | null> {
 		const response = await this.#send({ type: "handoff", customInstructions });
+		return this.#getData(response);
+	}
+
+	/**
+	 * Run a single ephemeral side-channel turn (same pipeline as `/btw`).
+	 * The reply is never persisted into session history and any tool calls the
+	 * model emits are discarded. Fails while a response or compaction is in
+	 * progress.
+	 */
+	async ephemeralTurn(prompt: string): Promise<RpcEphemeralTurnResult> {
+		const response = await this.#send({ type: "ephemeral_turn", prompt });
 		return this.#getData(response);
 	}
 
