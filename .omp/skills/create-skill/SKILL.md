@@ -149,6 +149,13 @@ agent's system prompt. Always include: "call the yield tool with your COMPLETE
 answer as its text payload - never yield empty/null" (GPT-family agents have
 lost payloads without it). See `reviewer-gpt55` / `sweep-opus` as references.
 
+The pin binds the AGENT, not the skill: the skill body chooses when to spawn
+that agent, the skill itself always runs on the calling session's model (OMP
+ignores skill-frontmatter `model:`/`effort:` - Claude Code metadata), and the
+agent is freely reusable by other skills. To run an ENTIRE skill on a specific
+model, delegate it: spawn a pinned agent whose assignment is "read
+`skill://<name>` and execute it".
+
 ## Step 5 - Verify (do not skip)
 
 1. Fence check: first line is exactly `---`, and the block closes with `---`.
