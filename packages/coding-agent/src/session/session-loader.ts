@@ -13,7 +13,7 @@ import {
 } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isImageBlock, isImageDataPayload } from "./session-persistence";
-import { getDefaultSessionStorage, type SessionStorage } from "./session-storage";
+import { FileSessionStorage, getDefaultSessionStorage, type SessionStorage } from "./session-storage";
 import {
 	parseTitleSlotFromContent,
 	parseTitleSlotLine,
