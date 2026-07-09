@@ -127,7 +127,7 @@ export class AgentLifecycleManager {
 		const adopted = this.#adopted.get(id);
 		if (!adopted) return;
 		const ref = this.#registry.get(id);
-		if (!ref?.session) return;
+		if (!ref?.session || ref.status !== "idle") return;
 		if (adopted.timer) {
 			clearTimeout(adopted.timer);
 			adopted.timer = undefined;
@@ -144,6 +144,21 @@ export class AgentLifecycleManager {
 		} finally {
 			this.#parking.delete(id);
 		}
+	}
+
+	/** Park every adopted agent that is currently idle, preserving its reviver. */
+	async parkIdleNow(): Promise<number> {
+		const ids: string[] = [];
+		for (const id of this.#adopted.keys()) {
+			const ref = this.#registry.get(id);
+			if (ref?.status === "idle" && ref.session) ids.push(id);
+		}
+		await Promise.all(ids.map(id => this.park(id)));
+		let parked = 0;
+		for (const id of ids) {
+			if (this.#registry.get(id)?.status === "parked") parked++;
+		}
+		return parked;
 	}
 
 	/**

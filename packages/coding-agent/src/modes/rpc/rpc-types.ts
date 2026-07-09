@@ -18,7 +18,20 @@ import type {
 	SubagentLifecyclePayload,
 	SubagentProgressPayload,
 } from "../../task";
+import type { TaskAdmissionPolicy } from "../../task/admission";
 import type { TodoPhase } from "../../tools/todo";
+
+export interface RpcTaskAdmissionPolicy extends TaskAdmissionPolicy {
+	/** Immediately park adopted idle subagents after applying this policy. */
+	parkIdle?: boolean;
+}
+
+export interface RpcTaskAdmissionResult {
+	applied: true;
+	running: number;
+	waiting: number;
+	parked: number;
+}
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -43,6 +56,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_subagent_subscription"; level: RpcSubagentSubscriptionLevel }
 	| { id?: string; type: "get_subagents" }
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
+	| { id?: string; type: "set_task_admission"; policy: RpcTaskAdmissionPolicy }
 
 	// Model
 	| { id?: string; type: "set_model"; provider: string; modelId: string }
@@ -214,6 +228,13 @@ export type RpcResponse =
 			command: "get_subagent_messages";
 			success: true;
 			data: RpcSubagentMessagesResult;
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_task_admission";
+			success: true;
+			data: RpcTaskAdmissionResult;
 	  }
 
 	// Model

@@ -7843,6 +7843,7 @@ export class AgentSession {
 			ui: noOpUIContext,
 			hasUI: false,
 			cwd: this.sessionManager.getCwd(),
+			taskDepth: 0,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.#modelRegistry,
 			model: this.model ?? undefined,

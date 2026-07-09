@@ -2,16 +2,21 @@
 // OMP_PEER_COMS_DIR in the test invocation so the extension module (which
 // captures PEER_COMS_DIR at import time) and this test agree on one location
 // without a dynamic import.
-import { expect, test } from "bun:test";
+import { beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { countLiveOtherPeers } from "./peer-coms.ts";
+import { countLiveOtherPeers, type RegistryEntry } from "./peer-coms.ts";
 
 const DIR = process.env.OMP_PEER_COMS_DIR;
 if (!DIR) throw new Error("run with OMP_PEER_COMS_DIR set to a scratch dir");
 
-function writeEntry(project: string, sessionId: string, pid: number): void {
+function writeEntry(
+	project: string,
+	sessionId: string,
+	pid: number,
+	identity?: Pick<RegistryEntry, "kind" | "proc_start_ticks">,
+): void {
 	const agentsDir = path.join(DIR as string, "projects", project, "agents");
 	fs.mkdirSync(agentsDir, { recursive: true });
 	const now = new Date().toISOString();
@@ -20,6 +25,7 @@ function writeEntry(project: string, sessionId: string, pid: number): void {
 		name: sessionId,
 		model: "test",
 		pid,
+		...identity,
 		endpoint: path.join(DIR as string, `${sessionId}.sock`),
 		cwd: "/tmp",
 		project,
@@ -31,8 +37,13 @@ function writeEntry(project: string, sessionId: string, pid: number): void {
 	fs.writeFileSync(path.join(agentsDir, `${sessionId}.json`), JSON.stringify(entry));
 }
 
+beforeEach(() => {
+	fs.rmSync(DIR, { recursive: true, force: true });
+});
+
 test("counts live non-self peers, prunes dead pids, excludes own pid", () => {
-	// pid 1 (init) is always alive and never this process's pid -> a live peer.
+	// Legacy rows without start ticks still dedupe by pid: both rows describe
+	// the same live init process and consume one full-process slot.
 	writeEntry("agentdesk", "peer-a", 1);
 	writeEntry("agentdesk", "peer-b", 1);
 	// An impossible pid resolves not-alive -> pruned, never counted.
@@ -40,5 +51,17 @@ test("counts live non-self peers, prunes dead pids, excludes own pid", () => {
 	// An entry carrying our own pid is the caller -> excluded from "other".
 	writeEntry("agentdesk", "self", process.pid);
 
-	expect(countLiveOtherPeers("*", undefined)).toBe(2);
+	expect(countLiveOtherPeers("*", undefined)).toBe(1);
+});
+
+test("counts a process and its opted-in logical sessions as one peer-cap process", () => {
+	const pid = 1;
+	const procStartTicks = 12345;
+	writeEntry("agentdesk", "peer-process", pid, { kind: "process", proc_start_ticks: procStartTicks });
+	writeEntry("agentdesk", "peer-session-a", pid, { kind: "session", proc_start_ticks: procStartTicks });
+	writeEntry("agentdesk", "peer-session-b", pid, { kind: "session", proc_start_ticks: procStartTicks });
+
+	// With a cap of two full processes, these three listable registry rows must
+	// consume one slot and leave the second slot available to peer_spawn.
+	expect(countLiveOtherPeers("*", undefined)).toBe(1);
 });

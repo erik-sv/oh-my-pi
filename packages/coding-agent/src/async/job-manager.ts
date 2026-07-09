@@ -1,4 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { Semaphore } from "../task/parallel";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -45,9 +46,8 @@ export interface AsyncJob {
 	 */
 	ownerId?: string;
 	/**
-	 * Job is registered but parked behind a caller-managed gate (e.g. a task
-	 * batch semaphore). Queued jobs do not count toward the running-job limit
-	 * until the caller invokes `markRunning()` from the run context.
+	 * Job is registered but parked behind caller-managed gates. It acquires a
+	 * manager running slot only when `markRunning()` is awaited.
 	 */
 	queued?: boolean;
 }
@@ -121,6 +121,9 @@ export class AsyncJobManager {
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
 	readonly #maxRunningJobs: number;
 	readonly #retentionMs: number;
+	readonly #runningSlots: Semaphore;
+	readonly #releaseJobSlots = new Map<string, () => void>();
+	#activeRunningSlots = 0;
 	#deliveryLoop: Promise<void> | undefined;
 	#disposed = false;
 
@@ -138,17 +141,13 @@ export class AsyncJobManager {
 		this.#onJobComplete = options.onJobComplete;
 		this.#maxRunningJobs = Math.max(1, Math.floor(options.maxRunningJobs ?? DEFAULT_MAX_RUNNING_JOBS));
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
+		this.#runningSlots = new Semaphore(this.#maxRunningJobs);
 	}
 
 	/** True when the running-job count has reached the configured cap. */
 	get atCapacity(): boolean {
 		if (this.#disposed) return true;
-		// Mirror register(): queued jobs hold no execution slot.
-		let activeCount = 0;
-		for (const job of this.#jobs.values()) {
-			if (job.status === "running" && !job.queued) activeCount++;
-		}
-		return activeCount >= this.#maxRunningJobs;
+		return this.#activeRunningSlots >= this.#maxRunningJobs;
 	}
 
 	register(
@@ -158,21 +157,15 @@ export class AsyncJobManager {
 			jobId: string;
 			signal: AbortSignal;
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
-			/** Clear the queued flag once the job actually starts executing. */
-			markRunning: () => void;
+			/** Acquire a running-job slot, then clear the queued flag. */
+			markRunning: () => Promise<void>;
 		}) => Promise<string>,
 		options?: AsyncJobRegisterOptions,
 	): string {
 		if (this.#disposed) {
 			throw new Error("Async job manager is disposed");
 		}
-		// Queued jobs hold no execution slot yet — only count jobs that are
-		// actually running so a large parked batch cannot starve registration.
-		let activeCount = 0;
-		for (const existing of this.#jobs.values()) {
-			if (existing.status === "running" && !existing.queued) activeCount++;
-		}
-		if (activeCount >= this.#maxRunningJobs) {
+		if (options?.queued !== true && this.#activeRunningSlots >= this.#maxRunningJobs) {
 			throw new Error(
 				`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
 			);
@@ -182,6 +175,25 @@ export class AsyncJobManager {
 		this.#suppressedDeliveries.delete(id);
 		const abortController = new AbortController();
 		const startTime = Date.now();
+		const startsQueued = options?.queued === true;
+		let jobSlotHeld = false;
+		if (!startsQueued) {
+			if (!this.#runningSlots.tryAcquire()) {
+				throw new Error(
+					`Background job limit reached (${this.#maxRunningJobs}). Wait for running jobs to finish or cancel one.`,
+				);
+			}
+			jobSlotHeld = true;
+			this.#activeRunningSlots++;
+		}
+		let markRunningPromise: Promise<void> | undefined;
+		const releaseJobSlot = () => {
+			if (!jobSlotHeld) return;
+			jobSlotHeld = false;
+			this.#activeRunningSlots--;
+			this.#runningSlots.release();
+		};
+		this.#releaseJobSlots.set(id, releaseJobSlot);
 
 		const job: AsyncJob = {
 			id,
@@ -192,7 +204,7 @@ export class AsyncJobManager {
 			abortController,
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
-			queued: options?.queued === true,
+			queued: startsQueued,
 		};
 
 		const reportProgress = async (text: string, details?: Record<string, unknown>): Promise<void> => {
@@ -213,7 +225,24 @@ export class AsyncJobManager {
 					signal: abortController.signal,
 					reportProgress,
 					markRunning: () => {
-						job.queued = false;
+						if (!job.queued) return Promise.resolve();
+						if (this.#runningSlots.tryAcquire()) {
+							jobSlotHeld = true;
+							this.#activeRunningSlots++;
+							job.queued = false;
+							return Promise.resolve();
+						}
+						markRunningPromise ??= (async () => {
+							await this.#runningSlots.acquire(abortController.signal);
+							if (abortController.signal.aborted || job.status === "cancelled") {
+								this.#runningSlots.release();
+								throw abortController.signal.reason ?? new Error("Background job aborted while queued");
+							}
+							jobSlotHeld = true;
+							this.#activeRunningSlots++;
+							job.queued = false;
+						})();
+						return markRunningPromise;
 					},
 				});
 				if (job.status === "cancelled") {
@@ -236,6 +265,9 @@ export class AsyncJobManager {
 				job.errorText = errorText;
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
+			} finally {
+				releaseJobSlot();
+				this.#releaseJobSlots.delete(id);
 			}
 		})();
 
@@ -254,6 +286,7 @@ export class AsyncJobManager {
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
+		this.#releaseJobSlots.get(id)?.();
 		job.abortController.abort();
 		this.#scheduleEviction(id);
 		return true;
@@ -388,6 +421,7 @@ export class AsyncJobManager {
 	cancelAll(filter?: AsyncJobFilter): void {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
+			this.#releaseJobSlots.get(job.id)?.();
 			job.abortController.abort();
 			this.#scheduleEviction(job.id);
 		}
@@ -472,6 +506,7 @@ export class AsyncJobManager {
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
 		this.#clearEvictionTimers();
 		this.#jobs.clear();
+		this.#releaseJobSlots.clear();
 		this.#deliveries.length = 0;
 		this.#inFlightDeliveries.length = 0;
 		this.#suppressedDeliveries.clear();

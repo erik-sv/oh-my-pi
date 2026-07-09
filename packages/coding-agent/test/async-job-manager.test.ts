@@ -176,6 +176,97 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(queuedJobId)?.status).toBe("completed");
 	});
 
+	test("accepts queued work at capacity and starts it only after a running slot is released", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const runningJobId = manager.register("bash", "running", async ({ signal }) => {
+			await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			return "running done";
+		});
+		const queuedStarted = Promise.withResolvers<void>();
+		const queuedJobId = manager.register(
+			"task",
+			"queued at capacity",
+			async ({ markRunning }) => {
+				await markRunning();
+				queuedStarted.resolve();
+				return "queued done";
+			},
+			{ queued: true },
+		);
+
+		const stateAtCapacity = await Promise.race([
+			queuedStarted.promise.then(() => "started" as const),
+			new Promise<"queued">(resolve => setImmediate(() => resolve("queued"))),
+		]);
+		expect(stateAtCapacity).toBe("queued");
+		expect(manager.getJob(queuedJobId)?.queued).toBe(true);
+
+		manager.cancel(runningJobId);
+		await queuedStarted.promise;
+		await manager.waitForAll();
+		expect(manager.getJob(queuedJobId)).toMatchObject({ queued: false, status: "completed" });
+	});
+
+	test("queued jobs never execute past maxRunningJobs", async () => {
+		const manager = new AsyncJobManager({
+			maxRunningJobs: 1,
+			onJobComplete: async () => {},
+		});
+		const transitionGate = Promise.withResolvers<void>();
+		const releases = new Map([
+			["first", Promise.withResolvers<void>()],
+			["second", Promise.withResolvers<void>()],
+		]);
+		const firstStarted = Promise.withResolvers<string>();
+		const secondStarted = Promise.withResolvers<string>();
+		const starts: string[] = [];
+		let active = 0;
+		let maxObserved = 0;
+
+		for (const label of releases.keys()) {
+			manager.register(
+				"task",
+				`${label} queued task`,
+				async ({ markRunning }) => {
+					await transitionGate.promise;
+					await markRunning();
+					active++;
+					maxObserved = Math.max(maxObserved, active);
+					starts.push(label);
+					(starts.length === 1 ? firstStarted : secondStarted).resolve(label);
+					await releases.get(label)!.promise;
+					active--;
+					return `${label} done`;
+				},
+				{ queued: true, id: label },
+			);
+		}
+
+		transitionGate.resolve();
+		const firstId = await firstStarted.promise;
+		try {
+			const stateBeforeRelease = await Promise.race([
+				secondStarted.promise.then(() => "started" as const),
+				new Promise<"blocked">(resolve => setImmediate(() => resolve("blocked"))),
+			]);
+			expect(stateBeforeRelease).toBe("blocked");
+			expect(manager.getJob(firstId)?.queued).toBe(false);
+			const waitingId = firstId === "first" ? "second" : "first";
+			expect(manager.getJob(waitingId)?.queued).toBe(true);
+
+			releases.get(firstId)!.resolve();
+			const secondId = await secondStarted.promise;
+			expect(secondId).toBe(waitingId);
+			expect(maxObserved).toBe(1);
+		} finally {
+			for (const release of releases.values()) release.resolve();
+			await manager.waitForAll();
+		}
+	});
+
 	test("evicts completed jobs after retention period", async () => {
 		const manager = new AsyncJobManager({
 			retentionMs: 25,

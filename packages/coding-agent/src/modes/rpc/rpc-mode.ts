@@ -25,10 +25,12 @@ import {
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
+import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
+import { TaskAdmission, type TaskAdmissionPolicy } from "../../task/admission";
 import type { EventBus } from "../../utils/event-bus";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
@@ -84,6 +86,44 @@ export type RpcSessionChangeSession = Pick<AgentSession, "newSession" | "switchS
 
 export type RpcSkillCommandSession = Pick<AgentSession, "promptCustomMessage" | "skills" | "skillsSettings">;
 export type RpcSkillCommandResult = { agentInvoked: true };
+
+interface ParsedRpcTaskAdmissionPolicy {
+	policy: TaskAdmissionPolicy;
+	parkIdle: boolean;
+}
+
+function parseRpcTaskAdmissionPolicy(value: unknown): ParsedRpcTaskAdmissionPolicy {
+	if (!isRecord(value)) throw new TypeError("Task admission policy must be an object");
+	const mode = value.mode;
+	if (mode !== "open" && mode !== "defer" && mode !== "deny") {
+		throw new TypeError(`Invalid task admission mode: ${String(mode)}`);
+	}
+	const reason = value.reason;
+	if (reason !== undefined && typeof reason !== "string") {
+		throw new TypeError("Task admission reason must be a string");
+	}
+	const maxNewAgents = value.maxNewAgents;
+	if (maxNewAgents !== undefined && (!Number.isInteger(maxNewAgents) || (maxNewAgents as number) < 0)) {
+		throw new TypeError("Task admission maxNewAgents must be a non-negative integer");
+	}
+	const ttlMs = value.ttlMs;
+	if (ttlMs !== undefined && (typeof ttlMs !== "number" || !Number.isFinite(ttlMs) || ttlMs <= 0)) {
+		throw new TypeError("Task admission ttlMs must be a finite positive number");
+	}
+	const parkIdle = value.parkIdle;
+	if (parkIdle !== undefined && typeof parkIdle !== "boolean") {
+		throw new TypeError("Task admission parkIdle must be a boolean");
+	}
+	return {
+		policy: {
+			mode,
+			reason,
+			maxNewAgents: maxNewAgents as number | undefined,
+			ttlMs: ttlMs as number | undefined,
+		},
+		parkIdle: parkIdle === true,
+	};
+}
 
 export async function tryRunRpcSkillCommand(
 	session: RpcSkillCommandSession,
@@ -1052,6 +1092,24 @@ export async function runRpcMode(
 					return success(id, "get_subagent_messages", transcript);
 				} catch (err) {
 					return error(id, "get_subagent_messages", err instanceof Error ? err.message : String(err));
+				}
+			}
+
+			case "set_task_admission": {
+				try {
+					const parsed = parseRpcTaskAdmissionPolicy(command.policy);
+					const admission = TaskAdmission.global();
+					admission.setPolicy(parsed.policy);
+					const parked = parsed.parkIdle ? await AgentLifecycleManager.global().parkIdleNow() : 0;
+					const running = session.asyncJobManager?.getRunningJobs().filter(job => !job.queued).length ?? 0;
+					return success(id, "set_task_admission", {
+						applied: true,
+						running,
+						waiting: admission.snapshot().waiting,
+						parked,
+					});
+				} catch (err) {
+					return error(id, "set_task_admission", err instanceof Error ? err.message : String(err));
 				}
 			}
 

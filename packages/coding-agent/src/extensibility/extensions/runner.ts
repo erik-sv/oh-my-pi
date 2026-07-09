@@ -255,6 +255,7 @@ export class ExtensionRunner {
 		private readonly modelRegistry: ModelRegistry,
 		getMemory?: () => MemoryRuntimeContext | undefined,
 		private readonly settings?: Settings,
+		private readonly taskDepth = 0,
 	) {
 		this.#uiContext = noOpUIContext;
 		this.#getMemoryFn = getMemory;
@@ -526,6 +527,7 @@ export class ExtensionRunner {
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			hasUI: this.hasUI(),
 			cwd: this.cwd,
+			taskDepth: this.taskDepth,
 			sessionManager: this.sessionManager,
 			modelRegistry: this.modelRegistry,
 			get model() {

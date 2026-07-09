@@ -142,6 +142,8 @@ export interface RegistryEntry {
 	model: string;
 	pid: number;
 	endpoint: string;
+	kind: "process" | "session";
+	proc_start_ticks: number | null;
 	cwd: string;
 	project: string;
 	explicit: boolean;
@@ -239,6 +241,23 @@ interface SpawnedPeerIdleShutdownOptions extends PeerShutdownOptions {
 
 function nowIso(): string {
 	return new Date().toISOString();
+}
+
+function currentProcessStartTicks(): number | null {
+	if (process.platform !== "linux") return null;
+	try {
+		const stat = fs.readFileSync("/proc/self/stat", "utf8");
+		const commandEnd = stat.lastIndexOf(")");
+		if (commandEnd < 0) return null;
+		const fieldsAfterCommand = stat
+			.slice(commandEnd + 1)
+			.trim()
+			.split(/\s+/);
+		const ticks = Number(fieldsAfterCommand[19]);
+		return Number.isSafeInteger(ticks) && ticks >= 0 ? ticks : null;
+	} catch {
+		return null;
+	}
 }
 
 export function isOwnRegistryEntry(
@@ -574,7 +593,13 @@ function uniquePeerName(project: string, desiredName: string): string {
 // cap and the ceiling agree on what counts as "a peer".
 export function countLiveOtherPeers(project: string, identity: RegistryEntry | undefined): number {
 	const projects = project === "*" ? listProjects() : [project];
-	return projects.flatMap(pruneRegistry).filter(entry => !isOwnRegistryEntry(entry, identity)).length;
+	const processIdentities = new Set<string>();
+	for (const entry of projects.flatMap(pruneRegistry)) {
+		if (isOwnRegistryEntry(entry, identity) || entry.kind === "session") continue;
+		const startTicks = entry.proc_start_ticks == null ? "" : String(entry.proc_start_ticks);
+		processIdentities.add(`${entry.pid}:${startTicks}`);
+	}
+	return processIdentities.size;
 }
 
 function resolveExecutableOnPath(command: string, pathValue = process.env.PATH): string | undefined {
@@ -891,6 +916,11 @@ export default function peerComs(pi: ExtensionAPI) {
 		type: "boolean",
 		default: false,
 	});
+	pi.registerFlag("peer-register-subagents", {
+		description: "Register in-process task sessions as peer-coms agents",
+		type: "boolean",
+		default: false,
+	});
 
 	let identity: RegistryEntry | undefined;
 	let server: net.Server | undefined;
@@ -904,6 +934,7 @@ export default function peerComs(pi: ExtensionAPI) {
 	let shuttingDown = false;
 	let processExitScheduled = false;
 	let peerAuthBroker: PeerAuthBroker | undefined;
+	let signalHandlersInstalled = false;
 
 	const pendingReplies = new Map<string, PendingReply>();
 	const inboundPrompts = new Map<string, InboundPrompt>();
@@ -1240,7 +1271,29 @@ export default function peerComs(pi: ExtensionAPI) {
 			});
 	}
 
+	const handleSigint = () => {
+		void shutdown();
+	};
+	const handleSigterm = () => {
+		void shutdown();
+	};
+
+	function installSignalHandlers(): void {
+		if (signalHandlersInstalled) return;
+		signalHandlersInstalled = true;
+		process.once("SIGINT", handleSigint);
+		process.once("SIGTERM", handleSigterm);
+	}
+
+	function removeSignalHandlers(): void {
+		if (!signalHandlersInstalled) return;
+		signalHandlersInstalled = false;
+		process.removeListener("SIGINT", handleSigint);
+		process.removeListener("SIGTERM", handleSigterm);
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
+		if (ctx.taskDepth > 0 && pi.getFlag("peer-register-subagents") !== true) return;
 		currentCtx = ctx;
 
 		const sessionId = randomId();
@@ -1273,6 +1326,8 @@ export default function peerComs(pi: ExtensionAPI) {
 			purpose,
 			model: ctx.model?.id ?? "unknown",
 			pid: process.pid,
+			kind: ctx.taskDepth > 0 ? "session" : "process",
+			proc_start_ticks: currentProcessStartTicks(),
 			endpoint,
 			cwd: ctx.cwd,
 			project,
@@ -1290,6 +1345,7 @@ export default function peerComs(pi: ExtensionAPI) {
 		heartbeat = setInterval(refreshPresence, HEARTBEAT_MS);
 		heartbeat.unref?.();
 		installSpawnedLifecycle();
+		installSignalHandlers();
 
 		pi.appendEntry("peer-coms-log", { event: "boot", session_id: sessionId, name, project, ts: nowIso() });
 	});
@@ -1773,6 +1829,7 @@ export default function peerComs(pi: ExtensionAPI) {
 	async function shutdown(): Promise<void> {
 		if (shuttingDown) return;
 		shuttingDown = true;
+		removeSignalHandlers();
 		if (parentWatch) clearInterval(parentWatch);
 		parentWatch = undefined;
 		idleShutdown?.cancel();
@@ -1813,11 +1870,5 @@ export default function peerComs(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		await shutdown();
-	});
-	process.once("SIGINT", () => {
-		void shutdown();
-	});
-	process.once("SIGTERM", () => {
-		void shutdown();
 	});
 }

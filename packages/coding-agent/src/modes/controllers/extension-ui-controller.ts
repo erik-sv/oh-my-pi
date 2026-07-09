@@ -469,11 +469,11 @@ export class ExtensionUiController {
 		previousSessionFile?: string,
 	): Promise<void> {
 		const event = { reason, previousSessionFile };
-		const uiContext = this.ctx.session.extensionRunner?.getUIContext();
-		if (!uiContext) {
-			return;
-		}
-		for (const registeredTool of this.ctx.session.extensionRunner?.getAllRegisteredTools() ?? []) {
+		const extensionRunner = this.ctx.session.extensionRunner;
+		if (!extensionRunner) return;
+		const uiContext = extensionRunner.getUIContext();
+		const taskDepth = extensionRunner.createContext().taskDepth;
+		for (const registeredTool of extensionRunner.getAllRegisteredTools()) {
 			if (registeredTool.definition.onSession) {
 				try {
 					await registeredTool.definition.onSession(event, {
@@ -482,6 +482,7 @@ export class ExtensionUiController {
 						compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 						hasUI: true,
 						cwd: this.ctx.sessionManager.getCwd(),
+						taskDepth,
 						sessionManager: this.ctx.session.sessionManager,
 						modelRegistry: this.ctx.session.modelRegistry,
 						model: this.ctx.session.model,

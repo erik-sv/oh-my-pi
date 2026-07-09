@@ -114,6 +114,40 @@ describe("AgentLifecycleManager", () => {
 		expect(ref?.sessionFile).toBe("/tmp/3-Sub.jsonl");
 	});
 
+	it("parkIdleNow parks only adopted idle agents and leaves them revivable", async () => {
+		const idle = makeSessionStub();
+		const revived = makeSessionStub();
+		const running = makeSessionStub();
+		const unadopted = makeSessionStub();
+
+		registerIdleSub("Idle-Sub", idle.session, "/tmp/Idle-Sub.jsonl");
+		lifecycle.adopt("Idle-Sub", { idleTtlMs: 0, revive: async () => revived.session });
+		registry.register({
+			id: "Running-Sub",
+			displayName: "task",
+			kind: "sub",
+			session: running.session,
+			sessionFile: "/tmp/Running-Sub.jsonl",
+			status: "running",
+		});
+		lifecycle.adopt("Running-Sub", { idleTtlMs: 0 });
+		registerIdleSub("Unadopted-Sub", unadopted.session);
+
+		const parked = await lifecycle.parkIdleNow();
+
+		expect(parked).toBe(1);
+		expect(idle.disposeCalls()).toBe(1);
+		expect(registry.get("Idle-Sub")).toMatchObject({ status: "parked", session: null });
+		expect(running.disposeCalls()).toBe(0);
+		expect(registry.get("Running-Sub")).toMatchObject({ status: "running", session: running.session });
+		expect(unadopted.disposeCalls()).toBe(0);
+		expect(registry.get("Unadopted-Sub")).toMatchObject({ status: "idle", session: unadopted.session });
+
+		const session = await lifecycle.ensureLive("Idle-Sub");
+		expect(session).toBe(revived.session);
+		expect(registry.get("Idle-Sub")).toMatchObject({ status: "idle", session: revived.session });
+	});
+
 	it("concurrent ensureLive calls during a slow revive coalesce into one reviver run", async () => {
 		const gate = deferred();
 		const revived = makeSessionStub();

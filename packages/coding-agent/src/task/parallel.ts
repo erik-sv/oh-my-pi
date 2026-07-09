@@ -105,6 +105,13 @@ export class Semaphore {
 		this.#max = normalizedMax > 0 ? normalizedMax : Number.POSITIVE_INFINITY;
 	}
 
+	/** Acquire immediately when capacity is available, without joining the queue. */
+	tryAcquire(): boolean {
+		if (this.#current >= this.#max) return false;
+		this.#current++;
+		return true;
+	}
+
 	/**
 	 * Resolves when a slot is available. Pass an `AbortSignal` so callers that
 	 * stop waiting (parent task cancelled, wall-clock budget elapsed) also stop

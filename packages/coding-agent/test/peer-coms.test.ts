@@ -1,4 +1,13 @@
-import { describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import { z } from "zod/v4";
 import {
 	assistantTextFromEntries,
 	buildPeerInboundContent,
@@ -18,13 +27,150 @@ import {
 } from "../examples/extensions/peer-coms";
 import { parseArgs } from "../src/cli/args";
 
+const peerExtensionPath = path.resolve(import.meta.dir, "../examples/extensions/peer-coms.ts");
+const registryIdentitySchema = z
+	.object({
+		session_id: z.string(),
+		name: z.string(),
+		pid: z.number().int().positive(),
+		endpoint: z.string(),
+		kind: z.enum(["process", "session"]).optional(),
+		proc_start_ticks: z.number().int().positive().optional(),
+	})
+	.passthrough();
+
+let peerAuthDir: TempDir;
+let peerAuthStorage: AuthStorage;
+let peerModelRegistry: ModelRegistry;
+
+interface PeerRegistrationHarness {
+	root: TempDir;
+	runner: ExtensionRunner;
+	project: string;
+}
+
+function initializePeerRunner(runner: ExtensionRunner): void {
+	runner.initialize(
+		{
+			sendMessage: () => {},
+			sendUserMessage: () => {},
+			appendEntry: () => {},
+			setLabel: () => {},
+			getActiveTools: () => [],
+			getAllTools: () => [],
+			setActiveTools: async () => {},
+			getCommands: () => [],
+			setModel: async () => false,
+			getThinkingLevel: () => undefined,
+			setThinkingLevel: () => {},
+			getSessionName: () => undefined,
+			setSessionName: async () => {},
+		},
+		{
+			getModel: () => undefined,
+			isIdle: () => true,
+			abort: () => {},
+			hasPendingMessages: () => false,
+			shutdown: () => {},
+			getContextUsage: () => undefined,
+			compact: async () => {},
+			getSystemPrompt: () => [],
+		},
+	);
+}
+
+function restoreEnv(name: string, value: string | undefined): void {
+	if (value === undefined) delete process.env[name];
+	else process.env[name] = value;
+}
+
+async function startPeerRegistration(taskDepth: number, registerSubagents: boolean): Promise<PeerRegistrationHarness> {
+	const root = TempDir.createSync("@omp-peer-identity-");
+	const project = "identity";
+	const previousDir = process.env.OMP_PEER_COMS_DIR;
+	const previousBrokerUrl = process.env.OMP_AUTH_BROKER_URL;
+	process.env.OMP_PEER_COMS_DIR = root.path();
+	process.env.OMP_AUTH_BROKER_URL = "http://127.0.0.1:1";
+
+	try {
+		const loaded = await loadExtensions([peerExtensionPath], root.path());
+		if (loaded.errors.length > 0 || loaded.extensions.length !== 1) {
+			throw new Error(`peer-coms fixture failed to load: ${JSON.stringify(loaded.errors)}`);
+		}
+		loaded.runtime.flagValues.set("peer-name", `peer-${taskDepth}`);
+		loaded.runtime.flagValues.set("peer-project", project);
+		loaded.runtime.flagValues.set("peer-purpose", "identity test");
+		loaded.runtime.flagValues.set("peer-register-subagents", registerSubagents);
+
+		const runner = new ExtensionRunner(
+			loaded.extensions,
+			loaded.runtime,
+			root.path(),
+			SessionManager.inMemory(),
+			peerModelRegistry,
+			undefined,
+			undefined,
+			taskDepth,
+		);
+		initializePeerRunner(runner);
+		const handlerErrors: string[] = [];
+		runner.onError(error => handlerErrors.push(`${error.event}: ${error.error}`));
+		await runner.emit({ type: "session_start" });
+		if (handlerErrors.length > 0) {
+			await runner.emit({ type: "session_shutdown" });
+			throw new Error(`peer-coms fixture failed to start: ${handlerErrors.join("; ")}`);
+		}
+		return { root, runner, project };
+	} catch (error) {
+		root.removeSync();
+		throw error;
+	} finally {
+		restoreEnv("OMP_PEER_COMS_DIR", previousDir);
+		restoreEnv("OMP_AUTH_BROKER_URL", previousBrokerUrl);
+	}
+}
+
+function peerFiles(harness: PeerRegistrationHarness, ...segments: string[]): string[] {
+	const dir = path.join(harness.root.path(), ...segments);
+	return fs.existsSync(dir) ? fs.readdirSync(dir).sort() : [];
+}
+
+function peerRegistryRows(harness: PeerRegistrationHarness) {
+	return peerFiles(harness, "projects", harness.project, "agents").map(file => {
+		const raw = JSON.parse(
+			fs.readFileSync(path.join(harness.root.path(), "projects", harness.project, "agents", file), "utf8"),
+		);
+		return registryIdentitySchema.parse(raw);
+	});
+}
+
+function currentProcessStartTicks(): number {
+	const stat = fs.readFileSync(`/proc/${process.pid}/stat`, "utf8");
+	const commandEnd = stat.lastIndexOf(")");
+	if (commandEnd < 0) throw new Error("current process stat has no command terminator");
+	const fieldsAfterCommand = stat
+		.slice(commandEnd + 1)
+		.trim()
+		.split(/\s+/);
+	const ticks = Number(fieldsAfterCommand[19]);
+	if (!Number.isSafeInteger(ticks) || ticks <= 0) throw new Error("current process stat has invalid start ticks");
+	return ticks;
+}
+
+async function stopPeerRegistration(harness: PeerRegistrationHarness): Promise<void> {
+	await harness.runner.emit({ type: "session_shutdown" });
+	harness.root.removeSync();
+}
+
 function entry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
-	return {
+	const base = {
 		session_id: "session-a",
 		name: "worker",
 		purpose: "testing",
 		model: "test-model",
 		pid: 100,
+		kind: "process" as const,
+		proc_start_ticks: 1,
 		endpoint: "/tmp/worker.sock",
 		cwd: "/repo",
 		project: "default",
@@ -35,7 +181,19 @@ function entry(overrides: Partial<RegistryEntry> = {}): RegistryEntry {
 		queue_depth: 0,
 		...overrides,
 	};
+	return base;
 }
+
+beforeAll(async () => {
+	peerAuthDir = TempDir.createSync("@omp-peer-auth-");
+	peerAuthStorage = await AuthStorage.create(path.join(peerAuthDir.path(), "auth.db"));
+	peerModelRegistry = new ModelRegistry(peerAuthStorage);
+});
+
+afterAll(() => {
+	peerAuthStorage.close();
+	peerAuthDir.removeSync();
+});
 
 describe("peer-coms hardening helpers", () => {
 	it("filters every registry entry owned by the current process", () => {
@@ -441,5 +599,42 @@ describe("peer-coms hardening helpers", () => {
 
 		timers[1]!.callback();
 		expect(events).toEqual(["context-shutdown", "exit:0"]);
+	});
+
+	it("does not create a peer endpoint or registry row for an in-process task without the opt-in", async () => {
+		const harness = await startPeerRegistration(1, false);
+		try {
+			expect(peerFiles(harness, "sockets")).toEqual([]);
+			expect(peerRegistryRows(harness)).toEqual([]);
+		} finally {
+			await stopPeerRegistration(harness);
+		}
+	});
+
+	it("registers a top-level peer as the current OS process identity", async () => {
+		const harness = await startPeerRegistration(0, false);
+		try {
+			const rows = peerRegistryRows(harness);
+			expect(rows).toHaveLength(1);
+			const row = rows[0];
+			if (!row) throw new Error("top-level peer registry row was not written");
+			expect(row.kind).toBe("process");
+			expect(row.proc_start_ticks).toBe(currentProcessStartTicks());
+		} finally {
+			await stopPeerRegistration(harness);
+		}
+	});
+
+	it("registers an opted-in task peer as a logical session rather than another OS process", async () => {
+		const harness = await startPeerRegistration(1, true);
+		try {
+			const rows = peerRegistryRows(harness);
+			expect(rows).toHaveLength(1);
+			const row = rows[0];
+			if (!row) throw new Error("opted-in task peer registry row was not written");
+			expect(row.kind).toBe("session");
+		} finally {
+			await stopPeerRegistration(harness);
+		}
 	});
 });
