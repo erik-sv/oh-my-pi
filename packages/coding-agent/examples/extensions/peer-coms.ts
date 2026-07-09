@@ -28,6 +28,11 @@ import peerComsSpawnPrompt from "./peer-coms-spawn.md" with { type: "text" };
 
 const PEER_COMS_DIR = process.env.OMP_PEER_COMS_DIR ?? path.join(os.homedir(), ".omp", "agent", "peer-coms");
 const MAX_HOPS = Number(process.env.OMP_PEER_COMS_MAX_HOPS ?? 5);
+// Max live peers a single agent may hold in its subnet at once; peer_spawn
+// refuses past it. 0 = unlimited (default; upstream behavior). Each peer is a
+// full independent OMP process, so unbounded fan-out is what drives the host
+// over its memory ceiling - that load belongs on in-process task/agent() subs.
+const MAX_PEERS = Number(process.env.OMP_PEER_COMS_MAX_PEERS ?? 0);
 const REPLY_TIMEOUT_MS = Number(process.env.OMP_PEER_COMS_REPLY_TIMEOUT_MS ?? 30 * 60 * 1000);
 const REPLY_RESULT_TTL_MS = Number(process.env.OMP_PEER_COMS_REPLY_RESULT_TTL_MS ?? 60_000);
 const HEARTBEAT_MS = Number(process.env.OMP_PEER_COMS_HEARTBEAT_MS ?? 10_000);
@@ -74,6 +79,7 @@ const PEER_RUNTIME_ENV_KEYS = [
 	"OMP_PEER_COMS_SPAWNED_IDLE_TIMEOUT_MS",
 	"OMP_PEER_COMS_PARENT_CHECK_MS",
 	"OMP_PEER_COMS_PARENT_PID",
+	"OMP_PEER_COMS_MAX_PEERS",
 ] as const;
 
 type Envelope = PromptEnvelope | ResponseEnvelope | PingEnvelope | ShutdownEnvelope;
@@ -561,6 +567,14 @@ function uniquePeerName(project: string, desiredName: string): string {
 		if (!liveNames.has(candidate)) return candidate;
 	}
 	return `${desiredName}-${randomId().slice(0, 4)}`;
+}
+
+// Live peers in this subnet other than the caller, across one project or all
+// ("*"). Mirrors what the AgentDesk reaper folds into the RSS ceiling, so the
+// cap and the ceiling agree on what counts as "a peer".
+export function countLiveOtherPeers(project: string, identity: RegistryEntry | undefined): number {
+	const projects = project === "*" ? listProjects() : [project];
+	return projects.flatMap(pruneRegistry).filter(entry => !isOwnRegistryEntry(entry, identity)).length;
 }
 
 function resolveExecutableOnPath(command: string, pathValue = process.env.PATH): string | undefined {
@@ -1325,7 +1339,10 @@ export default function peerComs(pi: ExtensionAPI) {
 		description:
 			"Spawn a new peer-coms Pi agent as an independent peer session. " +
 			"Use this when peer mode is valuable and no suitable live peer exists. " +
-			"The spawned peer can run a different model and can then be contacted with peer_send.",
+			"The spawned peer can run a different model and can then be contacted with peer_send." +
+			(MAX_PEERS > 0
+				? ` At most ${MAX_PEERS} peer${MAX_PEERS === 1 ? "" : "s"} may be live at once (each is a full OMP process); for parallel agent fan-out prefer the in-process \`task\` tool (or \`agent()\` in an eval cell) coordinating over \`irc\`, and peer_shutdown peers when the exchange is done.`
+				: ""),
 		parameters: z.object({
 			name: z.string().describe("Requested peer name, for example reviewer or planner."),
 			purpose: z.string().optional().describe("Short purpose shown to other peers."),
@@ -1349,6 +1366,17 @@ export default function peerComs(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const project = params.project ?? identity?.project ?? "default";
+			if (MAX_PEERS > 0) {
+				const liveOthers = countLiveOtherPeers("*", identity);
+				if (liveOthers >= MAX_PEERS) {
+					throw new Error(
+						`Peer cap reached: ${liveOthers} live peer${liveOthers === 1 ? "" : "s"} already running (limit ${MAX_PEERS}). ` +
+							`peer_spawn is for a few persistent cross-model second opinions, not fan-out: each peer is a full independent OMP process (hundreds of MB RSS) that lives until peer_shutdown. ` +
+							`For parallel agent fan-out use the native \`task\` tool (or \`agent()\` in an eval cell) and coordinate over \`irc\` - those subagents run inside this process at a fraction of the memory. ` +
+							`To free a slot for a genuine peer, \`peer_shutdown\` an existing one first.`,
+					);
+				}
+			}
 			const purpose = params.purpose ?? "";
 			const launchMode = params.launch_mode ?? (process.platform === "darwin" ? "terminal" : "detached");
 			const waitMs = params.wait_ms ?? 5_000;
