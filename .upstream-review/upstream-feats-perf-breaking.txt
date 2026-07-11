@@ -1,0 +1,81 @@
+d016150d0 fix(ai): prevented provider retry after streaming unsafe content
+5f543b957 feat(tui): enabled eager native scrollback rebuild for unknown POSIX viewports
+2003d7382 feat(eval): added per-cell inactivity timeout budgets in eval executors
+c637db974 feat(coding-agent): added markdown-aware magic-keyword flow for 3 modes
+9fabd5e4d feat(coding-agent): added onStatus in eval backends for status streams
+2ddc9c5bc feat(coding-agent): added turn-budget parsing, multipliers and hard caps
+42b79bc69 feat(coding-agent): added fuzzy token matching in coding-agent components
+ae5139358 feat(coding-agent): integrated shake commands and lifecycle
+7613c2a91 feat(coding-agent): expanded eval execution and bridge paths with workflow helpers
+5fae08d2b feat(coding-agent): added workflow keyword detection and notice plumbing
+19be67921 feat(coding-agent): added shake configuration and type modeling
+417a1a1d3 feat(agent): added shake compaction strategy primitives
+cf621d0ab feat(coding-agent-eval): added runEvalAgent bridge for agent plan checks
+d1bd14f02 feat(coding-agent): propagated mcpManager and localProtocolOptions to subagents
+a243f74f0 fix(tui): tightened append-tail guard to reject mis-located tail scrolls
+9fc93b0e3 Merge pull request #1527 from oldschoola/feat/plugin-install-github-urls
+22e564a85 feat(coding-agent): accept GitHub/git URLs in `plugin install`
+21d152c70 feat(coding-agent): async ConfigFile + ModelRegistry.create() factory; fix MemorySessionStorage O(N^2) appends
+3a733c480 perf(agent,ai,coding-agent): in-place state mutation + per-delta json-parse throttle + drop hot-path structuredClone
+c1a70f726 feat(coding-agent): migrated keybindings config to YAML with JSON migration
+756f32f68 feat(coding-agent-tools): added virtual multi-file search scope expansion
+f21c23277 feat(coding-agent/tools): implemented internal URL routing in SearchTool
+605555917 feat(coding-agent/modes): added rule amendment flow before saving generated TTSR rules
+9a5caba3a feat(modes): added OMFG mode with live draft panel and stream handling
+7f866a48a feat(coding-agent): added per-turn AUTO_THINKING in coding-agent session
+668faabfd feat(tiny): added providers.tinyModelDevice and tinyModelDtype settings
+caeaf4e4d feat(coding-agent): added builtin default rules and disable controls
+5d3adfab7 feat(tiny): added GPU-first device selection with CPU fallback for local models
+ebb927639 feat(coding-agent): added animated pending border for bash/eval blocks
+dfa6007f3 feat(coding-agent): removed recipe tool and all runner implementations
+a1ba50b4d feat(benchmark): added median, p1, and p99 token distribution stats
+cb00a0720 feat: added block replace syntax with block edits in hashline parser
+e7b7c3cc3 feat(coding-agent): added setup providers tabs for sign-in/web-search
+5f6316563 feat(setup-wizard): added interactive onboarding wizard on first launch
+1ea732309 feat(slash-commands): added /switch command to open temporary model selector
+fb8496fd2 feat(tiny/text): added code block stripping for session title generation
+d73393cf5 feat(cli): added shell completions for bash, zsh, and fish
+725539aee feat(read): conditioned inspect_image docs on feature flag
+1c968a7bf feat(scripts): added native leaf-package publish checks to install smoke tests
+6c43cd6df feat(scripts): added placeholder bootstrap flow for missing native leaf packages
+0eee5a401 feat(coding-agent): added todo-write strike-through completion animation
+f0b252449 feat(coding-agent): added tiny local model support for memory extraction and consolidation
+ccc727d1b feat(coding-agent): added internal URL completion with async handlers
+70202360f feat(coding-agent): added local model registry for title completion
+e32c639d2 feat(coding-agent): added hook-selector slider for persisted role models
+e22b31401 feat(packages/coding-agent): added orchestrate notices for session output
+34e099148 feat(natives): added per-platform leaf package publishing for native addons
+bfd043b3e feat(packages/natives): added leafPackageDir to loader addon lookup
+b89034580 feat: added tiny-title worker to CLI/release entrypoints plus cleanup
+4544db344 feat: added tiny-title generation core with worker flow and model specs
+6d5aba839 feat: implemented Mnemosyne memory state typing for prompt generation
+6b4accd05 feat(memory): added memory_edit tool and stats/diagnose commands
+318d55304 feat(tools): added memory inline renderers for retain/recall/reflect
+99365385a feat(mnemosyne): added mnemosyne parent-state sync in delegated sessions
+095ac6833 feat(mnemosyne): added mnemosyne parent-session alias-of state support
+baafa3c02 feat(render): added task renderContext propagation to hide preview rows
+5cd88b7ab feat(mnemosyne): added session-scoped visibility, graph tools, and safety hardening
+b4466b027 feat(anthropic): disabled parallel tool use for Claude Opus 4.8
+395dddbc6 feat(mnemosyne): added fallback recall query for shared bank in per-project-tagged mode
+9d29fc971 feat(mnemosyne): added configurable memory scoping with per-project-tagged mode
+89b33823f feat(memory): wired Mnemosyne backend into recall/retain/reflect tools
+3ecc48fdf feat(memory): added Mnemosyne local SQLite memory backend
+32f07833f feat(hashline): made snapshot tag mandatory and added head/tail drift warning
+311ecb4fb feat(coding-agent): added bracket-stripped model ID resolution for proxy wrappers
+ae905fb3c feat(agent): added agent tool-call cap enforcement to stream loop
+b7ee6bf65 feat(ai): added PI_REQ_DEBUG request/response recording for transports
+375d10055 feat(model-registry): added proxy discovery type for mixed Anthropic/OpenAI proxies
+9eea27619 feat(tui): added inline color swatches for markdown hex color mentions
+2f13f6d4f feat(coding-agent): added context usage percentage to keep-context option
+8715ed207 feat(coding-agent-eval): added oneshot llm helper and __llm__ bridge
+f755a8aa1 perf(tui): deferred Windows viewport probe
+01e046bbe Merge pull request #1517 from ForeverYoungPp/feat/cache-hit-rate-segment
+674698546 feat: support DeepSeek prompt cache format and add cache hit rate segment
+01c34db45 feat(hashline): added full-file hash snapshots with 4-hex tags
+2d7cd6d2d feat(hashline)!: migrated to verb-based v4 syntax for edits
+15f5d4899 Merge pull request #1501 from oldschoola/feat/sticky-todo-live-window
+c5e74952b feat(ai): added antml changelog note and removed antml healing logic
+ea9a33a04 feat(hashline): implemented InMemorySnapshotStore snapshot tag merging
+98fdcdcf6 feat(coding-agent): live cube, fuzzier matcher, auto-checkmark, close animation
+cea3ac53b feat(coding-agent): advance the sticky todo panel as tasks close
+bdce9cf06 feat(discovery): scan installed plugin packages for sub-discovery

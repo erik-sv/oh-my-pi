@@ -1,0 +1,7 @@
+396a9bd7a|2026-05-31 01:43:39 +0000|perf(session): store SQL transcripts as append-only chunk rows (O(1) per write)
+09638b673|2026-05-30 10:33:25 +0000|fix(ai): drop historical thinking on resume; only latest assistant turn keeps it
+51cb670ac|2026-05-30 10:07:03 +0000|Merge remote-tracking branch 'origin/main'
+ec17e694d|2026-05-30 09:59:34 +0000|fix(ai): prevent 'thinking blocks cannot be modified' 400 on Anthropic resume
+c8bf9df9d|2026-05-29 09:48:21 +0000|fix(coding-agent): backport canonical#1503 extension-flag parsing fixes
+7e5a59033|2026-05-29 08:00:32 +0000|feat(coding-agent): add peer-coms agents
+71e5311d3|2026-05-25 12:15:55 +0200|feat(coding-agent): add peer-coms agents

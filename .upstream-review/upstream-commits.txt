@@ -1,0 +1,280 @@
+7bb6fb20e|2026-05-31 13:49:55 +0200|fix: fixed idle-timeout retries, darwin-x64 ORT preload, and prefill support
+e7580d8f9|2026-05-31 13:27:52 +0200|test(coding-agent): normalized options handling in ACP lazy startup test setup
+a8d50879d|2026-05-31 13:22:50 +0200|chore: reformat
+d016150d0|2026-05-31 13:21:15 +0200|fix(ai): prevented provider retry after streaming unsafe content
+4e6f04220|2026-05-31 13:04:25 +0200|chore: reformat
+6cee7a666|2026-05-31 13:02:32 +0200|test(tests): added deterministic yield tests and viewport mutation regression coverage
+87b4f08e3|2026-05-31 12:44:26 +0200|fix(coding-agent/modes): allowed unknown viewport mutation during tool expansion
+e45b0a202|2026-05-31 12:42:16 +0200|fix(mnemopi): updated optional embeddings tests to use MNEMOPI env vars
+a04382672|2026-05-31 12:30:20 +0200|chore: bump version to 15.7.3
+339ba5ee7|2026-05-31 11:32:41 +0200|fix(coding-agent/modes): enabled eager native scrollback rebuild during tool execution
+5f543b957|2026-05-31 11:32:37 +0200|feat(tui): enabled eager native scrollback rebuild for unknown POSIX viewports
+47b7c27ed|2026-05-31 11:13:55 +0200|fix(tui): adjusted TUI render logic to force a native
+25e5ea6e1|2026-05-31 10:53:16 +0200|docs(coding-agent/prompts): added rule against re-auditing edits and routine diff checks
+84cf063b0|2026-05-31 10:53:05 +0200|fix(coding-agent): fixed streaming edit preview to keep a full trailing diff window
+39c4762b7|2026-05-31 10:16:26 +0200|fix(tui): corrected tmux overlay rendering to preserve native scrollback
+2003d7382|2026-05-31 10:11:59 +0200|feat(eval): added per-cell inactivity timeout budgets in eval executors
+d7a5fe1ce|2026-05-31 09:57:39 +0200|fix(tui): fixed viewport snap and height-grow displacement bugs
+21259aac5|2026-05-31 09:52:48 +0200|fix(tui): repainted overfull height growth to preserve scrolled-up anchors
+8175a1b8e|2026-05-31 09:47:43 +0200|refactor(packages/tui): reorganized native scrollback live rebuild checks
+3edd46f67|2026-05-31 09:47:35 +0200|fix(packages/tui): resolved PI_DUMP_OP frame dump to append JSONL cursor
+a5c71bb77|2026-05-31 09:47:24 +0200|test(coding-agent/test): added markdown-aware keyword tests in prose mode
+bfdbb3ff2|2026-05-31 09:47:24 +0200|refactor(coding-agent/src): migrated keyword decorators to shared helper
+c637db974|2026-05-31 09:47:24 +0200|feat(coding-agent): added markdown-aware magic-keyword flow for 3 modes
+a6c5d3fb8|2026-05-31 09:47:24 +0200|fix(tui): resolved rebuild prep to preserve forced state and clear scrollback
+730e59878|2026-05-31 08:45:12 +0200|fix(tui): corrected TUI scrollback preservation during rerenders
+9fabd5e4d|2026-05-31 08:45:12 +0200|feat(coding-agent): added onStatus in eval backends for status streams
+68430dee5|2026-05-31 08:45:12 +0200|chore: renamed mnemosyne package to mnemopi
+aa7bbe32f|2026-05-31 08:19:29 +0200|fix(tui): fixed scrollback replay on forced renders and overflow growth
+43027c649|2026-05-31 08:13:01 +0200|fix(tui): updated shrink-path logic in `tui.ts` to choose
+957b6b753|2026-05-31 08:03:55 +0200|fix(tui): expanded offscreen edit handling in `TUI` to
+2ddc9c5bc|2026-05-31 08:03:45 +0200|feat(coding-agent): added turn-budget parsing, multipliers and hard caps
+ac7b8ac14|2026-05-31 07:55:07 +0200|test(tui): added scrollback growth assertion to stress driver
+4ab40764d|2026-05-31 07:54:52 +0200|refactor(coding-agent): removed `args` global from eval runtimes
+59c8749ad|2026-05-31 07:54:23 +0200|fix(tui): resolved tui status footer truncation using VT stripping
+42b79bc69|2026-05-31 07:45:22 +0200|feat(coding-agent): added fuzzy token matching in coding-agent components
+ae5139358|2026-05-31 07:40:31 +0200|feat(coding-agent): integrated shake commands and lifecycle
+7613c2a91|2026-05-31 07:40:18 +0200|feat(coding-agent): expanded eval execution and bridge paths with workflow helpers
+5fae08d2b|2026-05-31 07:40:02 +0200|feat(coding-agent): added workflow keyword detection and notice plumbing
+19be67921|2026-05-31 07:39:51 +0200|feat(coding-agent): added shake configuration and type modeling
+417a1a1d3|2026-05-31 07:39:38 +0200|feat(agent): added shake compaction strategy primitives
+0bb04ba52|2026-05-31 07:27:31 +0200|fix(tui): fixed native scrollback corruption on same-frame offscreen edits
+05ed86556|2026-05-31 07:27:22 +0200|test(tui): added randomized render stress test suite
+ff9a6826d|2026-05-31 07:12:27 +0200|fix(compaction): made `read` tool-results prunable except for `skill://` paths
+cf621d0ab|2026-05-31 06:57:02 +0200|feat(coding-agent-eval): added runEvalAgent bridge for agent plan checks
+d1bd14f02|2026-05-31 06:49:20 +0200|feat(coding-agent): propagated mcpManager and localProtocolOptions to subagents
+d767bd2b7|2026-05-31 06:48:30 +0200|fix(coding-agent): defaulted approval slider to `default` tier
+1f82d0eed|2026-05-31 06:45:56 +0200|fix(session): excluded aborted/error messages from last usage lookup
+1fbc2cbd7|2026-05-31 06:36:33 +0200|fix(coding-agent): let extension flags shadow same-named built-ins in parseArgs
+db485325d|2026-05-31 06:27:51 +0200|refactor(mnemosyne): standardized embedding provider output to async batch streams
+7ad52b25f|2026-05-31 07:25:03 +0300|Merge pull request #1503 from erik-sv/upstream-pr/extension-flag-initial-message
+dcf482c4c|2026-05-31 06:23:27 +0200|fix(editor): removed `?` shortcut that opened hotkeys when input was empty
+b48b82534|2026-05-31 06:23:15 +0200|fix(coding-agent): process @file before session creation; drop built-in flag-name list
+346ae48b0|2026-05-31 06:21:29 +0200|fix(session): prevented runtime model switches from persisting default role
+3fe5d98ea|2026-05-31 06:20:32 +0200|docs(hashline): added rule prohibiting formatter-style edits via tool
+47c70f648|2026-05-31 06:15:31 +0200|refactor(autoresearch): migrated executeProcess to use executeBash
+0037c45b8|2026-05-31 06:14:13 +0200|refactor(mnemosyne): removed sync iterable from EmbeddingOutput contract
+a243f74f0|2026-05-31 06:13:58 +0200|fix(tui): tightened append-tail guard to reject mis-located tail scrolls
+47890d384|2026-05-31 06:06:32 +0200|fix(mnemosyne/core): tightened embedding output validation to matrix batches
+650c4e0b6|2026-05-31 06:46:44 +0300|Merge pull request #1507 from oldschoola/audit/fix-top5-plus-honorable-mentions
+ea9231fae|2026-05-31 05:46:04 +0200|refactor(coding-agent): removed async model registry factory and migration warmup path
+0a099af4a|2026-05-31 05:37:52 +0200|fix(ai): persist final tool-call args on output_item.done finalization
+9f547d8e4|2026-05-31 05:32:28 +0200|refactor(mnemosyne/core): typed embedding provider outputs and tightened normalization
+ad15d8003|2026-05-31 05:24:52 +0200|fix(mnemosyne): corrected vector-math cosineSimilarity for bad values
+570b439b3|2026-05-31 05:24:51 +0200|chore: enabled parallel Bun test runs across package scripts
+342a1927c|2026-05-31 05:24:51 +0200|test(coding-agent): fixed flaky tests from fs.watch and assertion scope
+9fc93b0e3|2026-05-31 06:24:45 +0300|Merge pull request #1527 from oldschoola/feat/plugin-install-github-urls
+bc7afc143|2026-05-31 04:49:23 +0200|fix(ai): drop streaming parse internals before persistence
+e1d2dfeff|2026-05-31 04:49:20 +0200|fix(ai): parse first streaming tool args
+5db3bcaba|2026-05-31 04:49:17 +0200|fix(agent): snapshot initial mutable state
+495c570ed|2026-05-31 04:47:39 +0200|fix(coding-agent): normalize hosted plugin git shorthands
+84a50e892|2026-05-31 04:46:08 +0200|fix(coding-agent): classify git+ and unprefixed scp specs as git
+1452aecbe|2026-05-31 04:46:08 +0200|fixup(coding-agent): use generic example for github plugin install help
+22e564a85|2026-05-31 04:46:08 +0200|feat(coding-agent): accept GitHub/git URLs in `plugin install`
+21d152c70|2026-05-31 04:46:06 +0200|feat(coding-agent): async ConfigFile + ModelRegistry.create() factory; fix MemorySessionStorage O(N^2) appends
+3a733c480|2026-05-31 04:46:06 +0200|perf(agent,ai,coding-agent): in-place state mutation + per-delta json-parse throttle + drop hot-path structuredClone
+cd578a86d|2026-05-31 04:45:57 +0200|fix(coding-agent,ai): file-lock race + render-utils sanitization + google named-tool routing
+38d234130|2026-05-31 04:45:51 +0200|fix(coding-agent): preserve built-in-colliding extension flags instead of rejecting
+d6f887d15|2026-05-31 04:45:51 +0200|fix(coding-agent): close remaining extension-flag edge cases (GPT-5.5 review)
+295c52a30|2026-05-31 04:45:51 +0200|fix(coding-agent): drop unconsumed --flag=value values for non-consuming flags
+b674e3a66|2026-05-31 04:45:51 +0200|fix(coding-agent): unify extension-flag parsing through parseArgs
+15f6f52e0|2026-05-31 04:45:51 +0200|fix(coding-agent): make parseArgs non-mutating to fix double-splice on reparse
+c3f3f9163|2026-05-31 04:45:50 +0200|fix(coding-agent): strip extension flags from the initial prompt
+4ab0360f6|2026-05-31 04:41:36 +0200|test(coding-agent/tools): updated internal URL resolution test fixture wording
+1dba122c5|2026-05-31 04:36:14 +0200|chore: updated docs
+c1a70f726|2026-05-31 04:34:45 +0200|feat(coding-agent): migrated keybindings config to YAML with JSON migration
+756f32f68|2026-05-31 04:32:35 +0200|feat(coding-agent-tools): added virtual multi-file search scope expansion
+f21c23277|2026-05-31 04:28:39 +0200|feat(coding-agent/tools): implemented internal URL routing in SearchTool
+1e227293b|2026-05-31 04:28:24 +0200|fix(coding-agent/modes): handled streamed text input for tool argument previews
+2eb39bae3|2026-05-31 04:25:14 +0200|test(coding-agent): stabilized coding-agent tests with safer teardown and timing tweaks
+ce2e8ce7c|2026-05-31 04:24:40 +0200|fix(coding-agent): added raw partialJson preview support for hashline and apply_patch tools
+605555917|2026-05-31 04:19:47 +0200|feat(coding-agent/modes): added rule amendment flow before saving generated TTSR rules
+9a5caba3a|2026-05-31 04:15:25 +0200|feat(modes): added OMFG mode with live draft panel and stream handling
+5344bcbc6|2026-05-31 04:10:52 +0200|fix(coding-agent): persisted resolved auto thinking level on session resume
+b777fe34f|2026-05-31 04:03:05 +0200|test: hardened test isolation and reliability across test suites
+453e21973|2026-05-31 03:48:19 +0200|fix(edit): fixed hashline preview matching for live and recovered file snapshots
+f9f213e53|2026-05-31 03:46:17 +0200|chore: bump version to 15.7.2
+83b60f48a|2026-05-31 04:45:02 +0300|Merge pull request #1561 from segmentationf4u1t/fix/windows-segfault-minimal
+f8dfc6d9f|2026-05-31 04:44:55 +0300|Merge branch 'main' into fix/windows-segfault-minimal
+3e0d93acc|2026-05-31 03:43:15 +0200|fix(coding-agent): skipped hash validation during streaming previews to avoid stale errors
+2cc4f8159|2026-05-31 03:41:52 +0200|fix(coding-agent/modes): updated auto thinking labels to show resolved level only
+6cd166ca8|2026-05-31 03:40:40 +0200|fix: prevent Windows ORT preload crash
+4d3d181d8|2026-05-31 03:39:38 +0200|fix(coding-agent): changed local tiny-model default to CPU inference
+5653888c9|2026-05-31 03:37:24 +0200|fix(coding-agent/modes): added fallback retrieval for configured thinking level
+a7933c6c7|2026-05-31 03:34:19 +0200|fix(mnemosyne/core): deferred fastembed loading to prevent startup segfaults
+7f866a48a|2026-05-31 03:32:21 +0200|feat(coding-agent): added per-turn AUTO_THINKING in coding-agent session
+3f2e4b2fe|2026-05-31 03:17:47 +0200|fix(eval): link cyclic local module graphs in one pass
+3540336fb|2026-05-31 03:13:33 +0200|fix(streaming): fixed blank hashline preview during streaming edits
+73de3bf92|2026-05-31 02:50:54 +0200|chore: bump version to 15.7.1
+71fe25832|2026-05-31 02:33:19 +0200|ci: migrated release trigger from tag-push to branch-push
+1d930a527|2026-05-31 02:26:29 +0200|test: fixed flaky tests by using relative timestamps and palette-agnostic regex
+e72fe367e|2026-05-31 02:17:33 +0200|chore: bump version to 15.7.0
+668faabfd|2026-05-31 02:14:58 +0200|feat(tiny): added providers.tinyModelDevice and tinyModelDtype settings
+caeaf4e4d|2026-05-31 02:09:55 +0200|feat(coding-agent): added builtin default rules and disable controls
+06dc3976f|2026-05-31 02:00:18 +0200|fix(coding-agent): probed all Python runtimes to bypass broken managed env
+5d3adfab7|2026-05-31 01:57:59 +0200|feat(tiny): added GPU-first device selection with CPU fallback for local models
+ebb927639|2026-05-31 01:43:00 +0200|feat(coding-agent): added animated pending border for bash/eval blocks
+dfa6007f3|2026-05-31 01:42:47 +0200|feat(coding-agent): removed recipe tool and all runner implementations
+a1ba50b4d|2026-05-31 01:14:52 +0200|feat(benchmark): added median, p1, and p99 token distribution stats
+d0d5a6d60|2026-05-31 01:14:52 +0200|config: disabled GITHUB_ACTIONS marker for TypeScript test script
+edcc8ab30|2026-05-31 01:04:56 +0200|test(coding-agent): added segment-track coverage and removed obsolete OAuth selector spec
+7e2971b1f|2026-05-31 00:53:19 +0200|ux(coding-agent/modes): introduced shared segment track renderer for model and role views
+cb00a0720|2026-05-31 00:46:03 +0200|feat: added block replace syntax with block edits in hashline parser
+e7b7c3cc3|2026-05-31 00:29:48 +0200|feat(coding-agent): added setup providers tabs for sign-in/web-search
+5f6316563|2026-05-31 00:07:14 +0200|feat(setup-wizard): added interactive onboarding wizard on first launch
+39ab89b64|2026-05-31 00:05:56 +0200|docs(hashline): added tight-range rule to prompt guidelines
+e799e0bc1|2026-05-30 23:29:03 +0200|refactor(oauth): reorganized provider list into logical categories
+1ea732309|2026-05-30 23:15:10 +0200|feat(slash-commands): added /switch command to open temporary model selector
+fb8496fd2|2026-05-30 23:13:11 +0200|feat(tiny/text): added code block stripping for session title generation
+1803e2540|2026-05-30 22:27:46 +0200|Merge branch 'farm/cb0ecfc0/slash-autocomplete-wsl-freeze'
+0986a9e60|2026-05-30 22:26:52 +0200|refactor(dirs): moved malloc env scrubbing into dirs module import
+d73393cf5|2026-05-30 21:32:03 +0200|feat(cli): added shell completions for bash, zsh, and fish
+725539aee|2026-05-30 21:24:14 +0200|feat(read): conditioned inspect_image docs on feature flag
+4ee35bec7|2026-05-30 20:55:55 +0200|fix: corrected child-session behavior to DetachSession for non-term stdin
+e8fadfe5f|2026-05-30 17:58:31 +0000|fix(tui): kept autocomplete bypass when coalesced with offscreen mutations
+1c968a7bf|2026-05-30 19:52:45 +0200|feat(scripts): added native leaf-package publish checks to install smoke tests
+7786f1e9c|2026-05-30 17:52:20 +0000|fix(tui): scoped viewport bypass to live rows
+119bb0009|2026-05-30 17:46:04 +0000|fix(tui): kept slash autocomplete repainting
+c7c627f0c|2026-05-30 19:22:36 +0200|ci(ci): published native leaf packages per target in the release flow
+6c43cd6df|2026-05-30 19:18:48 +0200|feat(scripts): added placeholder bootstrap flow for missing native leaf packages
+464314e3a|2026-05-30 19:06:44 +0200|fix(ci): scope fetch-tags to main pushes to unbreak tag-triggered checkout
+474eb9204|2026-05-30 19:01:54 +0200|chore: bump version to 15.6.0
+c32460b2c|2026-05-30 19:00:26 +0200|fix(mnemosyne): corrected mnemosyne to await pending fact extractions
+0eee5a401|2026-05-30 18:58:48 +0200|feat(coding-agent): added todo-write strike-through completion animation
+f0b252449|2026-05-30 18:48:47 +0200|feat(coding-agent): added tiny local model support for memory extraction and consolidation
+ccc727d1b|2026-05-30 18:43:00 +0200|feat(coding-agent): added internal URL completion with async handlers
+70202360f|2026-05-30 18:41:48 +0200|feat(coding-agent): added local model registry for title completion
+91513cdbf|2026-05-30 18:35:01 +0200|fix(coding-agent/eval): fixed TypeScript type-only import rewriting
+617c74d9a|2026-05-30 18:32:13 +0200|fix(coding-agent): applied selected plan execution model after exiting plan mode
+e1a0d235e|2026-05-30 18:28:50 +0200|ci(scripts): skipped duplicate release CI runs and enabled OIDC npm publishes
+e32c639d2|2026-05-30 18:21:34 +0200|feat(coding-agent): added hook-selector slider for persisted role models
+996584f15|2026-05-30 18:11:25 +0200|deps(deps): updated dependency catalogs and refreshed lockfile package versions
+e831c2c75|2026-05-30 18:08:51 +0200|chore: reformat
+a53acf143|2026-05-30 17:51:11 +0200|test(coding-agent): updated hashline preview tests to use snapshot-tagged headers
+826c3b932|2026-05-30 17:40:18 +0200|refactor(packages/coding-agent): reorganized tiny-title runtime stack
+e22b31401|2026-05-30 17:34:38 +0200|feat(packages/coding-agent): added orchestrate notices for session output
+34e099148|2026-05-30 17:08:23 +0200|feat(natives): added per-platform leaf package publishing for native addons
+a48e16037|2026-05-30 17:01:40 +0200|refactor(welcome): extracted tip rendering with word-wrap support
+bfd043b3e|2026-05-30 16:56:15 +0200|feat(packages/natives): added leafPackageDir to loader addon lookup
+b89034580|2026-05-30 16:55:54 +0200|feat: added tiny-title worker to CLI/release entrypoints plus cleanup
+f08e6397d|2026-05-30 16:55:54 +0200|test: added tiny-model role-propagation and title routing tests
+4544db344|2026-05-30 16:55:54 +0200|feat: added tiny-title generation core with worker flow and model specs
+c8ddb62a3|2026-05-30 16:55:53 +0200|build: configured package.json and bun.lock for transformers dependency
+6d5aba839|2026-05-30 16:55:53 +0200|feat: implemented Mnemosyne memory state typing for prompt generation
+6b4accd05|2026-05-30 16:48:02 +0200|feat(memory): added memory_edit tool and stats/diagnose commands
+7ba28ada5|2026-05-30 16:42:58 +0200|ci(mnemosyne): published pi-mnemosyne to npm via monorepo CI pipeline
+98de6510f|2026-05-30 16:35:34 +0200|fix(coding-agent/tools): renamed exit status label from "Status: exit N" to "Exit: N"
+435629818|2026-05-30 16:31:48 +0200|fix(coding-agent/tools): handled non-zero bash exits as error results
+318d55304|2026-05-30 16:28:55 +0200|feat(tools): added memory inline renderers for retain/recall/reflect
+515887fc3|2026-05-30 16:22:12 +0200|test(testing): added Mnemosyne lifecycle and render-call suppression tests
+99365385a|2026-05-30 16:22:12 +0200|feat(mnemosyne): added mnemosyne parent-state sync in delegated sessions
+095ac6833|2026-05-30 16:22:12 +0200|feat(mnemosyne): added mnemosyne parent-session alias-of state support
+baafa3c02|2026-05-30 16:22:12 +0200|feat(render): added task renderContext propagation to hide preview rows
+2d49cfbfa|2026-05-30 16:11:24 +0200|fix(coding-agent): fixed hashline edit preview deduping for final stream completion
+55e146fa3|2026-05-30 15:59:58 +0200|fix: synchronized snapshot-tag checks and fixed ANSI width emoji handling
+5cd88b7ab|2026-05-30 15:58:26 +0200|feat(mnemosyne): added session-scoped visibility, graph tools, and safety hardening
+f559f6b10|2026-05-30 15:30:05 +0200|ux(coding-agent): added ? fallback for %/window context in status/task
+9bf25e300|2026-05-30 15:00:28 +0200|test(coding-agent): updated hashline and subagent tests for new behavior
+6d410fcc8|2026-05-30 14:49:02 +0200|Merge pull request #1521 from can1357/farm/05952468/fix-wsl-streaming-refresh
+a03611e00|2026-05-30 14:48:49 +0200|Merge pull request #1520 from can1357/farm/a99664f4/respect-select-keybindings
+086ba8d0f|2026-05-30 14:48:39 +0200|Merge pull request #1519 from can1357/farm/6b0044b9/fix-copilot-context-window
+7b3ed1123|2026-05-30 14:48:23 +0200|Merge pull request #1518 from can1357/farm/cf70473e/preserve-latest-thinking-signatures
+b4466b027|2026-05-30 14:48:01 +0200|feat(anthropic): disabled parallel tool use for Claude Opus 4.8
+395dddbc6|2026-05-30 14:47:54 +0200|feat(mnemosyne): added fallback recall query for shared bank in per-project-tagged mode
+6618bfb4f|2026-05-30 14:47:54 +0200|refactor(tools): renamed Hindsight tools to Memory and fixed per-bank db paths
+9d29fc971|2026-05-30 14:47:53 +0200|feat(mnemosyne): added configurable memory scoping with per-project-tagged mode
+89b33823f|2026-05-30 14:47:46 +0200|feat(memory): wired Mnemosyne backend into recall/retain/reflect tools
+3ecc48fdf|2026-05-30 14:47:45 +0200|feat(memory): added Mnemosyne local SQLite memory backend
+32f07833f|2026-05-30 12:37:17 +0200|feat(hashline): made snapshot tag mandatory and added head/tail drift warning
+25b68332e|2026-05-30 09:09:26 +0000|fix(ai): used copilot context window limit
+8178c9d5d|2026-05-30 08:37:53 +0000|fix(tui): respected selector navigation keybindings
+d0e3a4c36|2026-05-30 08:35:06 +0000|style: bun run fix
+ac0cf1bfb|2026-05-30 08:34:57 +0000|test(tui): restored mocked platform after WSL regression
+a1e2054b9|2026-05-30 08:32:11 +0000|style: bun run fix
+191c84498|2026-05-30 08:31:26 +0000|fix(tui): rendered WSL streaming output without resize trigger
+80a7def19|2026-05-30 06:43:36 +0000|fix(ai): preserved latest anthropic thinking signatures
+311ecb4fb|2026-05-30 07:22:07 +0200|feat(coding-agent): added bracket-stripped model ID resolution for proxy wrappers
+377ed34e0|2026-05-30 06:38:09 +0200|refactor(coding-agent): replaced ctx/Σ labels with icon and cleaner cost separator
+304a9346e|2026-05-30 06:17:49 +0200|fix(tui): updated structural diff handling to detect
+b7d3fe8c5|2026-05-30 05:55:37 +0200|docs(coding-agent/prompts): documented task batching for max-width groups
+138b78436|2026-05-30 05:07:24 +0200|test(coding-agent): added paired stale assistant and tool-result turns in replay tests
+5f3856ee7|2026-05-30 04:49:01 +0200|chore: bump version to 15.5.15
+ae905fb3c|2026-05-30 04:47:58 +0200|feat(agent): added agent tool-call cap enforcement to stream loop
+04f940269|2026-05-30 04:34:55 +0200|refactor(coding-agent): split registry refresh from in-memory model load
+b7ee6bf65|2026-05-30 04:34:44 +0200|feat(ai): added PI_REQ_DEBUG request/response recording for transports
+9ce250eb9|2026-05-30 04:05:26 +0200|chore: remove deprecated calc tool as it is completely useless with eval
+b5b7f7f89|2026-05-30 03:59:36 +0200|fix(ai): preserved Anthropic routing for OpenCode qwen3.7-max after refresh
+06aafb93f|2026-05-30 03:58:20 +0200|fix(coding-agent): debounced provider refresh on tab switch
+375d10055|2026-05-30 03:53:36 +0200|feat(model-registry): added proxy discovery type for mixed Anthropic/OpenAI proxies
+420429df9|2026-05-30 03:52:55 +0200|fix(session): extended dangling tool_use stripping to all mid-path assistant turns
+f6bf17d8c|2026-05-30 02:06:29 +0200|fix(session): neutralized signed thinking blocks on dangling tool-use cleanup
+de90713c7|2026-05-30 02:06:17 +0200|fix(coding-agent): reverted todo glyphs and patched thinking block stripping
+e004585f3|2026-05-30 01:25:28 +0200|chore: bump version to 15.5.14
+3b75597aa|2026-05-30 01:24:58 +0200|fix(coding-agent): removed todo spinner and validated dangling tool_use stripping
+02a0de70f|2026-05-30 01:19:46 +0200|fix(ai): reserved z.ai thinking format for native Kimi hosts
+684af3321|2026-05-30 01:16:33 +0200|fix(coding-agent/session): patched session dangling tool-call cleanup
+9eea27619|2026-05-30 01:04:46 +0200|feat(tui): added inline color swatches for markdown hex color mentions
+41796589a|2026-05-30 01:02:53 +0200|fix(ai): stop rewriting thinking
+a21d95c60|2026-05-30 00:54:40 +0200|fix(coding-agent): corrected cache hit rate denominator to include all tokens
+0c0cd7de4|2026-05-30 00:39:48 +0200|fix(tui): fixed Ghostty caret fallback by honoring requested hardware cursor
+2f13f6d4f|2026-05-30 00:32:54 +0200|feat(coding-agent): added context usage percentage to keep-context option
+8715ed207|2026-05-30 00:27:04 +0200|feat(coding-agent-eval): added oneshot llm helper and __llm__ bridge
+06fc0aa8c|2026-05-30 00:27:04 +0200|fix(tui): deferred scrolled preview height changes
+779ac06ac|2026-05-30 00:27:04 +0200|fix(tui): deferred scrolled output expansion
+f755a8aa1|2026-05-30 00:27:04 +0200|perf(tui): deferred Windows viewport probe
+7a3d02727|2026-05-30 00:27:04 +0200|fix(tui): replayed scrollback on prompt submit
+fd346358c|2026-05-30 00:27:04 +0200|fix(tui): treated WSL scrollback replay as unsafe
+03000423c|2026-05-30 00:27:03 +0200|fix(tui): guarded Windows scrollback replay
+04d6e831d|2026-05-30 00:27:03 +0200|refactor(eval): replaced inline JSON tree renderer with shared renderJsonTreeLines
+445fe99fb|2026-05-30 00:27:03 +0200|fix(agent): executed tool calls emitted under end_turn stop reason
+63c2b9f9f|2026-05-30 01:26:04 +0300|Merge pull request #1477 from hanbinnoh/fix/xiaomi-openai-descriptor
+3eb170386|2026-05-30 01:25:47 +0300|Merge pull request #1479 from hanbinnoh/fix/kimi-thinking-format
+9d6058154|2026-05-30 01:25:15 +0300|Merge pull request #1491 from hezhiyang2000/fix/session-keepalive-main
+923dafcf6|2026-05-30 01:21:55 +0300|Merge pull request #1502 from ZergRocks/fix-tui-native-visible-width
+01e046bbe|2026-05-30 01:20:41 +0300|Merge pull request #1517 from ForeverYoungPp/feat/cache-hit-rate-segment
+0ff4596b7|2026-05-30 00:20:19 +0200|chore: remove cache_hit from defaults
+11589aabe|2026-05-30 01:19:26 +0300|Merge pull request #1515 from can1357/farm/87d3856e/fix-windows-pi-extension-imports
+674698546|2026-05-30 06:12:18 +0800|feat: support DeepSeek prompt cache format and add cache hit rate segment
+2780f5dec|2026-05-29 19:44:36 +0000|fix(coding-agent): kept legacy-pi paths under compiled bunfs root
+9e35b784d|2026-05-29 19:39:50 +0000|fix(coding-agent): derived legacy-pi compat bunfs root from import.meta.dir for windows
+62e1dabf4|2026-05-29 18:36:25 +0200|fix(pi-natives): updated alt key handling for kitty mode and alt+enter decoding
+1422afd54|2026-05-29 18:21:43 +0200|chore: bump version to 15.5.13
+64daece63|2026-05-29 18:21:30 +0200|fix(pi-natives): handled legacy Alt+letter pairs in mixed enhanced-keyboard mode
+01c34db45|2026-05-29 18:12:08 +0200|feat(hashline): added full-file hash snapshots with 4-hex tags
+2d7cd6d2d|2026-05-29 17:36:17 +0200|feat(hashline)!: migrated to verb-based v4 syntax for edits
+0bc83f04f|2026-05-29 16:20:57 +0200|fix(hashline): restored balance-validated boundary repair in applyEdits
+b8538faaa|2026-05-29 14:11:36 +0200|fix: lockfile
+15f5d4899|2026-05-29 15:08:13 +0300|Merge pull request #1501 from oldschoola/feat/sticky-todo-live-window
+9598b75c2|2026-05-29 15:07:44 +0300|Merge branch 'main' into feat/sticky-todo-live-window
+14c366b04|2026-05-29 14:06:38 +0200|chore: bump version to 15.5.12
+7d3476216|2026-05-29 13:45:40 +0200|fix(ai): dropped nanogpt :tools route on deepseek
+1fe843de2|2026-05-29 13:31:37 +0200|fix(agent): handled skipped tool calls for non-toolUse assistant turns
+c5e74952b|2026-05-29 12:55:28 +0200|feat(ai): added antml changelog note and removed antml healing logic
+729836f22|2026-05-29 12:42:43 +0200|fix(tui): added a `historyRebuild` render intent to clear
+7b1bcfd13|2026-05-29 12:31:22 +0200|fix(ai): preserved indexed parallel tool-call deltas
+91ce2ac4a|2026-05-29 19:25:48 +0900|Suppress Ghostty input cursor glyph trails
+5f58979d1|2026-05-29 12:24:54 +0200|fix(ai): healed nanogpt deepseek dsml tool-call leaks
+6a68b12f4|2026-05-29 12:21:50 +0200|Merge remote-tracking branch 'origin/farm/951a0583/extension-package-discovery'
+bb1cb72fe|2026-05-29 12:21:24 +0200|Merge remote-tracking branch 'origin/farm/48457ba2/fix-zai-glm-plan-stream-stall'
+f852d8763|2026-05-29 12:21:11 +0200|Merge remote-tracking branch 'H4vC/main'
+ea9a33a04|2026-05-29 12:20:16 +0200|feat(hashline): implemented InMemorySnapshotStore snapshot tag merging
+98fdcdcf6|2026-05-29 02:49:18 -0700|feat(coding-agent): live cube, fuzzier matcher, auto-checkmark, close animation
+ce04cc485|2026-05-29 18:46:13 +0900|Avoid Ghostty hardware cursor trails
+7eb0d31eb|2026-05-29 17:36:50 +0900|Hide hardware cursor before TUI repaints
+b83ad00c4|2026-05-29 17:23:40 +0900|Disable autowrap during TUI paint writes
+c6e5d46e0|2026-05-29 17:09:59 +0900|Keep programmatic editor inserts line-safe
+b9437a427|2026-05-29 16:44:31 +0900|Use native width for non-ASCII TUI text
+cea3ac53b|2026-05-29 00:16:36 -0700|feat(coding-agent): advance the sticky todo panel as tasks close
+4d108c195|2026-05-29 06:34:10 +0000|fix(plugins): enumerate linked plugins for sub-discovery
+bdce9cf06|2026-05-29 06:28:33 +0000|feat(discovery): scan installed plugin packages for sub-discovery
+db525316a|2026-05-29 06:16:32 +0000|fix(discovery): wire extension package sub-dirs into discovery + add top-level `install` command
+7a1b164a9|2026-05-29 06:06:58 +0000|fix(ai): used zhipu coding plan endpoint
+b7f466aa3|2026-05-29 05:57:25 +0000|docs(ai): moved glm changelog entry to unreleased
+8b19a9c29|2026-05-29 05:54:22 +0000|fix(ai): widened glm coding-plan stream watchdog
+945ba8cbe|2026-05-29 10:32:54 +0800|fix: add EventLoopKeepalive to session prompt call sites
+74a3b748f|2026-05-28 23:27:37 +0900|fix(ai): detect Kimi thinking format across all providers, not just native hosts
+5eb7b29d6|2026-05-28 23:20:04 +0900|Revert "fix(ai): detect Kimi thinking format across all providers, not just native hosts"
+5c3d62d44|2026-05-28 23:19:11 +0900|fix(ai): detect Kimi thinking format across all providers, not just native hosts
+9cae7b823|2026-05-28 15:57:04 +0200|fix(tui): refreshed scrollback synchronously
+a8dabe2cf|2026-05-28 15:45:33 +0200|fix(tui): deferred native scrollback rebuilds
+125a7fba5|2026-05-28 22:12:51 +0900|fix(xiaomi): map models.dev descriptor to OpenAI API, not Anthropic
