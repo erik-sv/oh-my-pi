@@ -58,12 +58,6 @@ function enoent(p: string): NodeJS.ErrnoException {
 	return err;
 }
 
-function matchesGlob(name: string, pattern: string): boolean {
-	if (pattern === "*") return true;
-	if (pattern.startsWith("*.")) return name.endsWith(pattern.slice(1));
-	return name === pattern;
-}
-
 function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
 }
@@ -185,13 +179,15 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
-		const prefix = dir.endsWith("/") ? dir : `${dir}/`;
+		const normalizedDir = dir.replaceAll("\\", "/");
+		const prefix = normalizedDir.endsWith("/") ? normalizedDir : `${normalizedDir}/`;
+		const glob = new Bun.Glob(pattern);
 		const out: string[] = [];
 		for (const path of this.#index.keys()) {
-			if (!path.startsWith(prefix)) continue;
-			const name = path.slice(prefix.length);
-			if (name.includes("/") || name.includes("\\")) continue;
-			if (!matchesGlob(name, pattern)) continue;
+			const normalizedPath = path.replaceAll("\\", "/");
+			if (!normalizedPath.startsWith(prefix)) continue;
+			const relativePath = normalizedPath.slice(prefix.length);
+			if (!glob.match(relativePath)) continue;
 			out.push(path);
 		}
 		return out;
