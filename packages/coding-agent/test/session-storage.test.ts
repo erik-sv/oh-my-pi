@@ -87,6 +87,54 @@ class ControlledTitleUpdateBackend implements SessionStorageBackend {
 		this.#firstUpdate.reject(error);
 	}
 }
+
+class StaticIndexBackend implements SessionStorageBackend {
+	readonly #entries: readonly SessionStorageIndexEntry[];
+
+	constructor(entries: readonly SessionStorageIndexEntry[]) {
+		this.#entries = entries;
+	}
+
+	init(): Promise<void> {
+		return Promise.resolve();
+	}
+
+	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
+		return Promise.resolve(this.#entries);
+	}
+
+	readFull(): Promise<string | null> {
+		throw new Error("Unexpected readFull call");
+	}
+
+	readSlices(): Promise<[string, string]> {
+		throw new Error("Unexpected readSlices call");
+	}
+
+	writeFull(): Promise<void> {
+		throw new Error("Unexpected writeFull call");
+	}
+
+	append(): Promise<void> {
+		throw new Error("Unexpected append call");
+	}
+
+	updateSessionTitle(): Promise<void> {
+		throw new Error("Unexpected updateSessionTitle call");
+	}
+
+	truncate(): Promise<void> {
+		throw new Error("Unexpected truncate call");
+	}
+
+	remove(): Promise<void> {
+		throw new Error("Unexpected remove call");
+	}
+
+	move(): Promise<void> {
+		throw new Error("Unexpected move call");
+	}
+}
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
 	let storage: FileSessionStorage;
@@ -229,6 +277,26 @@ describe("IndexedSessionStorage.updateSessionTitle", () => {
 
 		const [slotLine] = (await storage.readText(sessionPath)).split("\n");
 		expect(JSON.parse(slotLine)).toMatchObject({ type: "title", title: "Second", source: "user", updatedAt: "t2" });
+	});
+});
+
+describe("IndexedSessionStorage.listFilesSync", () => {
+	it("matches backslash-form Windows keys for direct and nested globs on every host OS", async () => {
+		const sessionsRoot = String.raw`C:\Users\Ada\.omp\agent\sessions`;
+		const directSession = String.raw`C:\Users\Ada\.omp\agent\sessions\local.jsonl`;
+		const nestedSession = String.raw`C:\Users\Ada\.omp\agent\sessions\project\nested.jsonl`;
+		const storage = new IndexedSessionStorage(
+			new StaticIndexBackend([
+				{ path: directSession, size: 1, mtimeMs: 1 },
+				{ path: nestedSession, size: 1, mtimeMs: 2 },
+				{ path: String.raw`C:\Users\Ada\.omp\agent\sessions\project\deeper\ignored.jsonl`, size: 1, mtimeMs: 3 },
+				{ path: String.raw`C:\Users\Ada\.omp\agent\sessions\notes.bak`, size: 1, mtimeMs: 4 },
+			]),
+		);
+		await storage.initialize();
+
+		expect(storage.listFilesSync(sessionsRoot, "*.jsonl")).toEqual([directSession]);
+		expect(storage.listFilesSync(sessionsRoot, "*/*.jsonl")).toEqual([nestedSession]);
 	});
 });
 

@@ -559,9 +559,7 @@ export function listSessionsReadOnly(sessionDir: string, storage: SessionStorage
 export async function listAllSessions(storage: SessionStorage = getDefaultSessionStorage()): Promise<SessionInfo[]> {
 	const sessionsRoot = path.join(getDefaultAgentDir(), "sessions");
 	try {
-		const files = await Array.fromAsync(new Bun.Glob("*/*.jsonl").scan(sessionsRoot), name =>
-			path.join(sessionsRoot, name),
-		);
+		const files = storage.listFilesSync(sessionsRoot, "*/*.jsonl");
 		return await collectSessionsFromFiles(files, storage, true);
 	} catch {
 		return [];

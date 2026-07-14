@@ -344,6 +344,10 @@
 ### Changed
 
 - Enhanced Anthropic credential and usage management to support organization-scoped accounts, including displaying organization names in /usage, /logout, omp token --list, and OAuth login success messages, resolving active-account matching for shared organizations, and deduplicating identities during migration.
+### Fixed
+
+- Fixed SQL-backed session upgrades and lifecycle handling: legacy default and custom single-row tables migrate into append-only chunks without data loss, MySQL conversion uses a pinned advisory lock plus owned shadow-table recovery instead of transactional-DDL assumptions, all-project listing discovers SQL-only sessions on POSIX and Windows, artifact deletion removes physical sibling data, and multi-step mutations commit atomically.
+- Fixed the fork source updater accepting a stale same-version native addon that exposes the package sentinel but lacks newer bindings such as `snapcompactSupportedChars`; native freshness now includes a source fingerprint and fresh-process required-export probe.
 
 ## [16.5.0] - 2026-07-13
 
