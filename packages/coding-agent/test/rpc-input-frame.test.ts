@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	dispatchRpcInputFrame,
+	disposeRpcSessionBeforeExit,
 	type PendingExtensionRequest,
 	type RpcInputFrameDeps,
 	RpcShutdownCoordinator,
@@ -358,5 +359,51 @@ describe("RpcShutdownCoordinator", () => {
 		gateB.resolve();
 		await drain;
 		expect(drained).toBe(true);
+	});
+});
+
+describe("disposeRpcSessionBeforeExit", () => {
+	const makeShutdownHarness = () => {
+		const disposeGate = Promise.withResolvers<void>();
+		const events: string[] = [];
+		const session = {
+			dispose: async () => {
+				events.push("dispose:start");
+				await disposeGate.promise;
+				events.push("dispose:done");
+			},
+		};
+		const exit = (code: number) => {
+			events.push(`exit:${code}`);
+		};
+		return { disposeGate, events, session, exit };
+	};
+
+	test("stdin EOF waits for active-session disposal before exiting", async () => {
+		const { disposeGate, events, session, exit } = makeShutdownHarness();
+
+		const shutdown = disposeRpcSessionBeforeExit(session, exit);
+		await flushMicrotasks();
+
+		expect(events).toEqual(["dispose:start"]);
+		disposeGate.resolve();
+		await shutdown;
+		expect(events).toEqual(["dispose:start", "dispose:done", "exit:0"]);
+	});
+
+	test("explicit extension shutdown waits for active-session disposal before exiting", async () => {
+		const { disposeGate, events, session, exit } = makeShutdownHarness();
+		const coordinator = new RpcShutdownCoordinator({
+			isShutdownRequested: () => true,
+			performShutdown: () => disposeRpcSessionBeforeExit(session, exit),
+		});
+
+		const shutdown = coordinator.checkShutdownRequested();
+		await flushMicrotasks();
+
+		expect(events).toEqual(["dispose:start"]);
+		disposeGate.resolve();
+		await shutdown;
+		expect(events).toEqual(["dispose:start", "dispose:done", "exit:0"]);
 	});
 });

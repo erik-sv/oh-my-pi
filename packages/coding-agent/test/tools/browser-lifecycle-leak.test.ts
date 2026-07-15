@@ -17,9 +17,17 @@
  */
 
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as attach from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
 import type { CmuxKind } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/rpc";
 import { CmuxSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/socket-client";
-import { acquireBrowser, getBrowsersMapForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
+import * as launch from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import {
+	acquireBrowser,
+	disposeAllBrowsers,
+	getBrowsersMapForTest,
+	holdBrowser,
+	releaseBrowser,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import {
 	acquireTab,
 	getTabsMapForTest,
@@ -27,6 +35,9 @@ import {
 	releaseTabsForOwner,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
+import { Process } from "@oh-my-pi/pi-natives";
+import type { Subprocess } from "bun";
+import type { Browser } from "puppeteer-core";
 
 function makeKind(socketSuffix: string): CmuxKind {
 	return { kind: "cmux", socketPath: `/tmp/omp-test-${socketSuffix}.sock`, surface: `surface-${socketSuffix}` };
@@ -171,5 +182,195 @@ describe("browser lifecycle — session-scoped teardown reaps owned tabs", () =>
 		const releasedA = await releaseTabsForOwner("session-A", { kill: false });
 		expect(releasedA).toBe(1);
 		expect(getTabsMapForTest().has("reuse-tab")).toBe(false);
+	});
+});
+
+describe("browser lifecycle — spawned app ownership controls process cleanup", () => {
+	afterEach(async () => {
+		await drainAllTabs();
+	});
+
+	it("kills a tool-spawned app exactly once while its final registry handle still exists", async () => {
+		const executablePath = "/Applications/OMP Ownership Test.app/Contents/MacOS/OMP Ownership Test";
+		const pid = 44_123;
+		let connected = true;
+		let disconnectCount = 0;
+		let terminationCount = 0;
+		let registeredDuringCleanup: boolean | undefined;
+		let handleKey = "";
+		const browser = {
+			get connected() {
+				return connected;
+			},
+			disconnect() {
+				disconnectCount++;
+				connected = false;
+			},
+		} as unknown as Browser;
+		const child = { pid, unref() {} } as unknown as Subprocess;
+
+		const reusableSpy = spyOn(attach, "findReusableCdp").mockResolvedValue(null);
+		const killExistingSpy = spyOn(attach, "killExistingByPath").mockResolvedValue(0);
+		const portSpy = spyOn(attach, "findFreeCdpPort").mockResolvedValue(9_333);
+		const waitSpy = spyOn(attach, "waitForCdp").mockResolvedValue(undefined);
+		const loadSpy = spyOn(launch, "loadPuppeteer").mockResolvedValue({ connect: async () => browser } as never);
+		const spawnSpy = spyOn(Bun, "spawn").mockReturnValue(child as never);
+		const fromPidSpy = spyOn(Process, "fromPid").mockImplementation(() => {
+			registeredDuringCleanup = getBrowsersMapForTest().has(handleKey);
+			return {
+				terminate: async () => {
+					terminationCount++;
+					return true;
+				},
+			} as never;
+		});
+
+		try {
+			const handle = await acquireBrowser({ kind: "spawned", path: executablePath }, { cwd: "/tmp" });
+			handleKey = handle.key;
+			holdBrowser(handle);
+
+			// Normal browser close releases with kill:false. Ownership of a child
+			// spawned by this tool must still force process-tree cleanup.
+			await releaseBrowser(handle, { kill: false });
+
+			expect(disconnectCount).toBe(1);
+			expect(fromPidSpy).toHaveBeenCalledTimes(1);
+			expect(fromPidSpy).toHaveBeenCalledWith(pid);
+			expect(terminationCount).toBe(1);
+			expect(registeredDuringCleanup).toBe(true);
+			expect(getBrowsersMapForTest().has(handleKey)).toBe(false);
+		} finally {
+			fromPidSpy.mockRestore();
+			spawnSpy.mockRestore();
+			loadSpy.mockRestore();
+			waitSpy.mockRestore();
+			portSpy.mockRestore();
+			killExistingSpy.mockRestore();
+			reusableSpy.mockRestore();
+		}
+	});
+
+	it("disconnects a reused CDP app without killing its pre-existing process", async () => {
+		const executablePath = "/Applications/OMP Reused Test.app/Contents/MacOS/OMP Reused Test";
+		const pid = 55_321;
+		let connected = true;
+		let disconnectCount = 0;
+		let terminationCount = 0;
+		const browser = {
+			get connected() {
+				return connected;
+			},
+			disconnect() {
+				disconnectCount++;
+				connected = false;
+			},
+		} as unknown as Browser;
+
+		const reusableSpy = spyOn(attach, "findReusableCdp").mockResolvedValue({
+			cdpUrl: "http://127.0.0.1:9_444",
+			pid,
+		});
+		const loadSpy = spyOn(launch, "loadPuppeteer").mockResolvedValue({ connect: async () => browser } as never);
+		const spawnSpy = spyOn(Bun, "spawn").mockImplementation(() => {
+			throw new Error("A reused CDP app must not be spawned again");
+		});
+		const fromPidSpy = spyOn(Process, "fromPid").mockImplementation(() => {
+			return {
+				terminate: async () => {
+					terminationCount++;
+					return true;
+				},
+			} as never;
+		});
+
+		try {
+			const handle = await acquireBrowser({ kind: "spawned", path: executablePath }, { cwd: "/tmp" });
+			holdBrowser(handle);
+
+			await releaseBrowser(handle, { kill: false });
+
+			expect(disconnectCount).toBe(1);
+			expect(spawnSpy).not.toHaveBeenCalled();
+			expect(fromPidSpy).not.toHaveBeenCalled();
+			expect(terminationCount).toBe(0);
+			expect(getBrowsersMapForTest().has(handle.key)).toBe(false);
+		} finally {
+			fromPidSpy.mockRestore();
+			spawnSpy.mockRestore();
+			loadSpy.mockRestore();
+			reusableSpy.mockRestore();
+		}
+	});
+});
+
+describe("browser lifecycle — shutdown sweep reaps bare handles", () => {
+	afterEach(async () => {
+		await drainAllTabs();
+		for (const handle of [...getBrowsersMapForTest().values()]) {
+			holdBrowser(handle);
+			await releaseBrowser(handle, { kill: true }).catch(() => undefined);
+		}
+	});
+
+	it("closes a bare headless browser that was acquired without a tab", async () => {
+		let connected = true;
+		let closeCount = 0;
+		const browser = {
+			get connected() {
+				return connected;
+			},
+			async close() {
+				closeCount++;
+				connected = false;
+			},
+		} as unknown as Browser;
+		const launchSpy = spyOn(launch, "launchHeadlessBrowser").mockResolvedValue(browser);
+
+		try {
+			const handle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: "/tmp" });
+			expect(getBrowsersMapForTest().has(handle.key)).toBe(true);
+
+			await disposeAllBrowsers({ kill: true });
+
+			expect(closeCount).toBe(1);
+			expect(getBrowsersMapForTest().has(handle.key)).toBe(false);
+		} finally {
+			launchSpy.mockRestore();
+		}
+	});
+
+	it("disconnects from a connected external browser without closing it", async () => {
+		let connected = true;
+		let disconnectCount = 0;
+		let closeCount = 0;
+		const browser = {
+			get connected() {
+				return connected;
+			},
+			disconnect() {
+				disconnectCount++;
+				connected = false;
+			},
+			async close() {
+				closeCount++;
+				connected = false;
+			},
+		} as unknown as Browser;
+		const waitSpy = spyOn(attach, "waitForCdp").mockResolvedValue(undefined);
+		const loadSpy = spyOn(launch, "loadPuppeteer").mockResolvedValue({ connect: async () => browser } as never);
+
+		try {
+			const handle = await acquireBrowser({ kind: "connected", cdpUrl: "http://127.0.0.1:9222" }, { cwd: "/tmp" });
+
+			await disposeAllBrowsers({ kill: true });
+
+			expect(disconnectCount).toBe(1);
+			expect(closeCount).toBe(0);
+			expect(getBrowsersMapForTest().has(handle.key)).toBe(false);
+		} finally {
+			loadSpy.mockRestore();
+			waitSpy.mockRestore();
+		}
 	});
 });

@@ -408,6 +408,25 @@ export class RpcShutdownCoordinator {
 	}
 }
 
+export type DisposableRpcSession = Pick<AgentSession, "dispose">;
+
+const rpcSessionDisposals = new WeakMap<DisposableRpcSession, Promise<void>>();
+
+/** Dispose an RPC session before terminating, sharing work across converging exit paths. */
+export function disposeRpcSessionBeforeExit(
+	session: DisposableRpcSession,
+	exit: (code: number) => unknown,
+): Promise<void> {
+	const existing = rpcSessionDisposals.get(session);
+	if (existing) return existing;
+	const disposal = (async () => {
+		await session.dispose();
+		exit(0);
+	})();
+	rpcSessionDisposals.set(session, disposal);
+	return disposal;
+}
+
 export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
 
 export async function handleRpcSessionChange(
@@ -585,7 +604,7 @@ export async function runRpcMode(
 	session: AgentSession,
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
-): Promise<never> {
+): Promise<void> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
 	// process.stdout with no newline, which the reader merges with the next JSON line and
@@ -1353,12 +1372,7 @@ export async function runRpcMode(
 	// re-checks the request as each task settles.
 	const shutdownCoordinator = new RpcShutdownCoordinator({
 		isShutdownRequested: () => shutdownState.requested,
-		performShutdown: async () => {
-			if (session.extensionRunner?.hasHandlers("session_shutdown")) {
-				await session.extensionRunner.emit({ type: "session_shutdown" });
-			}
-			process.exit(0);
-		},
+		performShutdown: () => disposeRpcSessionBeforeExit(session, process.exit),
 	});
 
 	const dispatchFrameDeps: RpcInputFrameDeps = {
@@ -1402,5 +1416,5 @@ export async function runRpcMode(
 	hostToolBridge.rejectAllPending("RPC client disconnected before host tool execution completed");
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	subagentRegistry?.dispose();
-	process.exit(0);
+	await disposeRpcSessionBeforeExit(session, process.exit);
 }

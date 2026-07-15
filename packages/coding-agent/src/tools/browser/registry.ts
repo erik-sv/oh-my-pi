@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
+import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
 import { ToolAbortError, ToolError } from "../tool-errors";
@@ -7,6 +7,7 @@ import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, killExistingByP
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
 import { BROWSER_PROTOCOL_TIMEOUT_MS, launchHeadlessBrowser, loadPuppeteer, type UserAgentOverride } from "./launch";
+import { releaseAllTabs } from "./tab-supervisor";
 
 export type PuppeteerBrowserKind =
 	| { kind: "headless"; headless: boolean }
@@ -68,8 +69,11 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 	if (existing) {
 		if ("client" in existing) return existing;
 		if (existing.browser.connected) return existing;
-		browsers.delete(key);
-		await disposeBrowserHandle(existing, { kill: false });
+		try {
+			await disposeBrowserHandle(existing, { kill: false });
+		} finally {
+			if (browsers.get(key) === existing) browsers.delete(key);
+		}
 	}
 	// Short-circuit before launching: the tool wrapper's `untilAborted` only
 	// rejects its outer promise on abort; without this check `openBrowserHandle`
@@ -217,11 +221,13 @@ export function holdBrowser(handle: BrowserHandle): void {
 export async function releaseBrowser(handle: BrowserHandle, opts: { kill: boolean }): Promise<void> {
 	handle.refCount = Math.max(0, handle.refCount - 1);
 	if (handle.refCount === 0) {
-		// Only evict if the registry still points at THIS handle. After a disconnect,
-		// `acquireBrowser` may have already replaced the entry with a fresh live handle
-		// under the same key; deleting blindly would orphan that new browser.
-		if (browsers.get(handle.key) === handle) browsers.delete(handle.key);
-		await disposeBrowserHandle(handle, opts);
+		try {
+			await disposeBrowserHandle(handle, opts);
+		} finally {
+			// Keep owned processes reachable until disposal completes. A concurrent
+			// acquire may replace this key; never delete that newer handle.
+			if (browsers.get(handle.key) === handle) browsers.delete(handle.key);
+		}
 	}
 }
 
@@ -257,8 +263,39 @@ async function disposeBrowserHandle(handle: BrowserHandle, opts: { kill: boolean
 			logger.debug("Failed to disconnect from spawned browser", { error: (err as Error).message });
 		}
 	}
-	if (opts.kill && handle.pid !== undefined) await gracefulKillTreeOnce(handle.pid);
+	if ((handle.subprocess !== undefined || opts.kill) && handle.pid !== undefined) {
+		await gracefulKillTreeOnce(handle.pid);
+	}
 }
+
+let browserCleanup: Promise<void> | undefined;
+
+/**
+ * Release every supervised tab before disposing handles that have no tab hold.
+ * Concurrent shutdown paths share one sweep; a later, independent sweep can
+ * still reap handles acquired after the previous one completed.
+ */
+export function disposeAllBrowsers(opts: { kill: boolean }): Promise<void> {
+	if (browserCleanup) return browserCleanup;
+	const cleanup = (async () => {
+		await releaseAllTabs(opts);
+		for (const handle of [...browsers.values()]) {
+			try {
+				await disposeBrowserHandle(handle, opts);
+			} finally {
+				if (browsers.get(handle.key) === handle) browsers.delete(handle.key);
+			}
+		}
+	})();
+	browserCleanup = cleanup;
+	const reset = () => {
+		if (browserCleanup === cleanup) browserCleanup = undefined;
+	};
+	void cleanup.then(reset, reset);
+	return cleanup;
+}
+
+postmortem.register("browser-cleanup", () => disposeAllBrowsers({ kill: true }));
 
 /** Test-only accessor for the module-global browsers map. */
 export function getBrowsersMapForTest(): ReadonlyMap<string, BrowserHandle> {
