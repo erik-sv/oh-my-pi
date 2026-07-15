@@ -37,7 +37,6 @@ cp permission-gate.ts ~/.omp/agent/extensions/
 | Extension        | Description                                                                    |
 | ---------------- | ------------------------------------------------------------------------------ |
 | `plan-mode.ts`   | Claude Code-style plan mode for read-only exploration with `/plan` command     |
-| `peer-coms.ts`   | Spawnable flat Pi-to-Pi agent communication; see [how-to](../../../../docs/peer-coms.md) |
 | `tools.ts`       | Interactive `/tools` command to enable/disable tools with session persistence  |
 | `handoff.ts`     | Transfer context to a new focused session via `/handoff <goal>`                |
 | `qna.ts`         | Extracts questions from last response into editor via `ctx.ui.setEditorText()` |

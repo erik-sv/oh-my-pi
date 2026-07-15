@@ -106,12 +106,6 @@ agent), recreate them from this skill's contract or fall back to `task` with an
 explicit role plus the eval bridge's `agent(prompt, model=...)` model roles.
 Do not silently proceed single-model: two families or escalate.
 
-Peer-coms (`peer_spawn`/`peer_send`/`peer_await`) is NOT the default: a peer is
-a full second OMP process (hundreds of MiB RSS; orphaned peers are a known OOM
-pattern under AgentDesk). Reserve it - via the peer-debate skill - for the one
-case it earns the cost: two reviewers deadlocked on a high-severity finding,
-where a converging adversarial back-and-forth needs a peer that holds its own
-thread. Shut peers down when the debate ends.
 
 ## Scoring dimensions and aggregation (fail-closed)
 
@@ -308,8 +302,7 @@ Bar: 9.5  Max cycles: 5  Worktree/branch: <path|n/a>  Resumed at: <phase>
   and conflict resolution. Never two writers in the tree at once.
 - Rubric-anchored scores only; a bare number with no findings is rejected and
   re-reviewed. Never average reviewers; both must clear each dimension.
-- In-process `task` subagents only; peer-coms solely for deadlock debates and
-  always shut down after. Never the legacy AgentDesk `/subagent` route.
+- In-process `task` subagents only. Never the legacy AgentDesk `/subagent` route.
 - Do not broaden the feature. Out-of-scope findings become follow-ups.
 - A clean pass must say what was inspected and why nothing blocked.
 - UI changes need puppeteer at desktop AND mobile viewports; local CI must be

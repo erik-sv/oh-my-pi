@@ -775,10 +775,9 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			cfg: { mode: string };
 		};
 
-		// Asset modules are excluded from the rewrite graph, so the `.md` text
-		// import and the native JSON import load through Bun's own loaders rather
-		// than being force-parsed as JS — regression for the peer-coms
-		// `import … "./peer-coms-spawn.md" with { type: "text" }` Syntax Error.
+		// Asset modules are excluded from the rewrite graph, so Markdown text and
+		// native JSON imports load through Bun's own loaders rather than being
+		// force-parsed as JavaScript.
 		expect(mod.prompt).toBe("# Spawn Prompt\n\nbody");
 		expect(mod.cfg).toEqual({ mode: "peer" });
 	});

@@ -40,7 +40,7 @@ Use `${CLAUDE_SKILL_DIR}/report-schema.json` and `${CLAUDE_SKILL_DIR}/validate-f
 4. Validate with a different agent than the one that found the issue. The validation agent tries to kill the finding.
 5. Independently verify every final confirmed finding against file paths and line numbers.
 6. Keep audit and remediation separate unless the user explicitly asks for fixes. Audit agents do not edit target code.
-7. Use native OMP delegation: `task`, `explore`, `reviewer`, peer-coms only for independent second opinions. Never use legacy AgentDesk `/subagent` routes.
+7. Use native OMP delegation through `task`, `explore`, and `reviewer`. Never use legacy AgentDesk `/subagent` routes.
 8. Subagent assignments must say: no edits, no writes to target code, no formatters, no project-wide build/test/lint gates. They may read, search, and return evidence.
 9. Do not use shell for file reads, directory listings, content search, or line ranges. Use OMP `read`, `find`, `search`, `lsp`, and AST tools.
 10. Do not pad reports with checklist findings. A short report with three real bugs beats a long report with thirty theories.

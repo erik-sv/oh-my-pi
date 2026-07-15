@@ -22,12 +22,6 @@ Helper: `${CLAUDE_SKILL_DIR}/scripts/spawn-detached.sh` (parameterized, tested).
   asynchronously. Each job is a full separate OMP process (`omp -p`).
 - **Native `task` subagents** — bounded, in-process parallel work the current agent
   waits on. Cheaper (no extra process), but dies with the parent.
-- **Peer-coms** (`peer_spawn`/`peer_send`) — IS available in this runtime (extension
-  at `packages/coding-agent/examples/extensions/peer-coms.ts`, opt-in per launch via
-  `-e`). Use for *live* flat collaboration between concurrently-running sessions
-  (model diversity, adversarial review). NOT for offline-host scenarios: spawned
-  peers hold a parent-process lease and self-exit when the spawner dies. For
-  "dispatch and walk away," use this skill, not peers.
 
 ## Process
 

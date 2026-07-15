@@ -1,5 +1,4 @@
 {
-	"extensions": ["./packages/coding-agent/examples/extensions/peer-coms.ts"],
 	"theme": { "dark": "dark-one" },
 	"symbolPreset": "unicode",
 	"startup": { "quiet": true },

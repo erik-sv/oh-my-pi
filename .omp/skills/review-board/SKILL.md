@@ -20,8 +20,7 @@ Run an independent review board before accepting load-bearing work. Prefer nativ
    - **GPT-5.5 Reviewer**: adversarial correctness, hidden failure modes, test adequacy, and operational risk.
    - **Opus 4.7 Reviewer**: architecture, long-term maintainability, API boundaries, and product/user impact.
    - **Opus 4.6 Reviewer**: implementation detail, security, data integrity, and edge cases.
-   - When running inside an OMP-backed AgentDesk session, use OMP peer-coms or native OMP task delegation with peer names, purposes, and model hints matching the board. This keeps peer progress and results visible in AgentDesk.
-   - When OMP peer-coms are unavailable, use read-only delegated reviewer tasks. Do not claim those delegates ran on a specific model unless the tool output proves it.
+   - Use read-only delegated reviewer tasks with roles and model hints matching the board. Do not claim those delegates ran on a specific model unless the tool output proves it.
 
 3. Keep reviewers independent.
    - Give each reviewer the same factual packet: target, constraints, acceptance criteria, changed files, and relevant observed test results.
