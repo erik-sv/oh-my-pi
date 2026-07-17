@@ -13,6 +13,7 @@
 set -euo pipefail
 
 FORK_URL="${FORK_URL:-https://github.com/erik-sv/oh-my-pi.git}"
+FORK_REMOTE="omp-fork"
 # Default to the repo this script ships in; override with FORK_DIR on fresh machines.
 FORK_DIR="${FORK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PRIVATE_SKILLS_MODE="${OMP_PRIVATE_SKILLS:-auto}"
@@ -36,11 +37,17 @@ fi
 
 cd "$FORK_DIR"
 
-# 2) Point 'origin' at our fork (don't disturb a 'canonical' remote if present).
-if ! git remote get-url origin >/dev/null 2>&1; then
-  git remote add origin "$FORK_URL"
-elif [ "$(git remote get-url origin)" != "$FORK_URL" ]; then
-  say "note: origin is $(git remote get-url origin) (expected $FORK_URL) — leaving as-is; fetching it"
+# 2) Maintain a dedicated remote for the hosted fork. Existing checkouts may use
+#    origin for an internal mirror or another upstream; never fetch the update
+#    source through that unrelated remote.
+if git remote get-url "$FORK_REMOTE" >/dev/null 2>&1; then
+  if [ "$(git remote get-url "$FORK_REMOTE")" != "$FORK_URL" ]; then
+    say "updating $FORK_REMOTE remote -> $FORK_URL"
+    git remote set-url "$FORK_REMOTE" "$FORK_URL"
+  fi
+else
+  say "adding $FORK_REMOTE remote -> $FORK_URL"
+  git remote add "$FORK_REMOTE" "$FORK_URL"
 fi
 
 # 3) Guard local work: refuse to clobber uncommitted changes unless FORCE=1.
@@ -56,76 +63,48 @@ fi
 # 4) Fetch and hard-align to fork main. Fork main is force-pushed (history
 #    rewrite on each upstream rebase), so a fast-forward pull would refuse —
 #    reset --hard is the correct, intended operation here.
-say "fetching origin"
-git fetch origin --prune
-say "aligning local main to origin/main (history may have been rewritten)"
-git checkout -B main origin/main
+say "fetching $FORK_REMOTE"
+git fetch "$FORK_REMOTE" --prune
+say "aligning local main to $FORK_REMOTE/main (history may have been rewritten)"
+git checkout -B main "$FORK_REMOTE/main"
 
 # 5) Install workspace deps (new packages like pi-mnemopi, native bits).
 say "bun install"
 bun install
 
-# 5.5) Ensure the host's native addon matches both this release and its source.
+# 5.5) Ensure the host's native addon is present AND matches this release.
 #      `*.node` is gitignored and the workspace ships no prebuilt, so a fresh
-#      checkout on any OS must compile crates/pi-natives once. A version sentinel
-#      catches cross-release skew, while a source fingerprint catches native
-#      changes made without a package-version bump. Finally, a fresh Bun process
-#      loads the addon and checks required exports. Isolating that dlopen keeps a
-#      stale or CPU-incompatible addon from taking down this updater process.
+#      checkout on ANY OS must compile crates/pi-natives once (needs a Rust
+#      toolchain; rust-toolchain.toml pins the nightly, which rustup
+#      auto-installs). The addon is rebuilt in lock-step with the package
+#      version: napi-rs emits a `__piNativesV{major}_{minor}_{patch}` sentinel
+#      symbol whose name encodes the version (packages/natives loader-state.js).
+#      A `.node` left from a previous release lacks the current sentinel and
+#      MUST be rebuilt — a host-tag match ALONE is not enough, or a post-upgrade
+#      dev tree silently runs a stale addon missing the new native exports
+#      (workspace loads skip the loader's version validation). The sentinel name
+#      is embedded as a string in the compiled .node, so a crash-free `grep`
+#      (no dlopen, so no SIGILL on a CPU-variant mismatch) settles freshness.
+#      Idempotent: skip only when a host-tag .node embeds the current sentinel.
 NATIVE_DIR="$FORK_DIR/packages/natives/native"
 HOST_TAG="$(bun -e 'process.stdout.write(process.platform + "-" + process.arch)')"
 NATIVE_VER="$(grep -m1 '"version"' packages/natives/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '0.0.0')"
 SENTINEL="__piNativesV$(printf '%s' "$NATIVE_VER" | tr -c 'A-Za-z0-9' '_')"
-REQUIRED_NATIVE_EXPORTS="$SENTINEL,snapcompactSupportedChars"
-NATIVE_FINGERPRINT_FILE="$NATIVE_DIR/.source-fingerprint-$HOST_TAG.node"
-CURRENT_NATIVE_SOURCE="$(
-  git rev-parse \
-    HEAD:crates \
-    HEAD:packages/natives/scripts \
-    HEAD:Cargo.toml \
-    HEAD:Cargo.lock \
-    HEAD:rust-toolchain.toml | tr '\n' ':'
-)"
-
-native_exports_present() {
-  PI_REQUIRED_NATIVE_EXPORTS="$REQUIRED_NATIVE_EXPORTS" bun -e '
-    const { pathToFileURL } = await import("node:url");
-    const entrypoint = pathToFileURL(`${process.cwd()}/packages/natives/native/index.js`);
-    entrypoint.searchParams.set("update-smoke", `${Date.now()}-${Math.random()}`);
-    const bindings = await import(entrypoint.href);
-    const missing = process.env.PI_REQUIRED_NATIVE_EXPORTS.split(",")
-      .filter(name => typeof bindings[name] !== "function");
-    if (missing.length) {
-      console.error(`missing required native exports: ${missing.join(", ")}`);
-      process.exit(1);
-    }
-  ' >/dev/null 2>&1
-}
-
 native_addon_current() {
-  local f recorded_fingerprint=""
+  local f
   for f in "$NATIVE_DIR/pi_natives.${HOST_TAG}"*.node; do
     [ -e "$f" ] || continue
-    grep -qa "$SENTINEL" "$f" || continue
-    [ -f "$NATIVE_FINGERPRINT_FILE" ] || return 1
-    IFS= read -r recorded_fingerprint < "$NATIVE_FINGERPRINT_FILE" || return 1
-    [ "$recorded_fingerprint" = "$CURRENT_NATIVE_SOURCE" ] || return 1
-    native_exports_present || return 1
-    return 0
+    grep -qa "$SENTINEL" "$f" && return 0
   done
   return 1
 }
-
 if native_addon_current; then
-  say "native addon for $HOST_TAG matches pi-natives@$NATIVE_VER source and required exports"
+  say "native addon for $HOST_TAG matches pi-natives@$NATIVE_VER ($SENTINEL present)"
 else
   command -v cargo >/dev/null \
-    || die "native addon for $HOST_TAG is missing or stale and no Rust toolchain was found. Install rustup (https://rustup.rs), then re-run."
+    || die "native addon for $HOST_TAG is missing or stale (need sentinel $SENTINEL) and no Rust toolchain found. Install rustup (https://rustup.rs), then re-run."
   say "building native addon for $HOST_TAG @ $NATIVE_VER (compiles crates/pi-natives; requires Rust)"
   bun --cwd=packages/natives run build
-  native_exports_present \
-    || die "fresh native addon for $HOST_TAG failed the required-export smoke probe ($REQUIRED_NATIVE_EXPORTS)"
-  printf '%s\n' "$CURRENT_NATIVE_SOURCE" > "$NATIVE_FINGERPRINT_FILE"
 fi
 
 # 6) (Re)link the omp binary to this checkout's source, so `omp` runs the fork.

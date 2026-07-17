@@ -81,6 +81,8 @@ OMP_PRIVATE_SKILLS=1 FORK_DIR="$HOME/code/oh-my-pi" FORK_CLONE=1 \
 
 The first run requires Git credentials that can read the private `erik-sv/omp-skills` repository. It clones the library to `$XDG_DATA_HOME/omp/omp-skills` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/omp/omp-skills`. It then validates the library and links skills into OMP's native `~/.omp/agent/skills` root. Later fork updates detect that checkout and fast-forward the skill library automatically. Set `OMP_PRIVATE_SKILLS=0` to skip it, or run `scripts/sync-private-skills.sh --offline` to validate and relink the existing checkout without network access.
 
+The updater fetches `FORK_URL` through a dedicated `omp-fork` remote. It leaves an existing `origin` unchanged, so checkouts whose origin points to an internal mirror still update from the hosted fork.
+
 Ensure bun's global bin (`~/.bun/bin`) is on your `PATH`, then run `omp --version`.
 
 **Windows:** use WSL2 and follow the steps above, or run the script under Git Bash after installing bun, rustup, and the MSVC C++ Build Tools. A standalone, no-Rust binary can be produced per-OS with `bun run build` (output: `packages/coding-agent/dist/omp`).
@@ -317,7 +319,7 @@ Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google A
 
 Subscription-routed. `/login` attaches the session.
 
-Cursor `oauth` · GitHub Copilot `oauth` · GitLab Duo · Kimi Code `plan` · Moonshot · MiniMax Coding Plan `plan` · MiniMax Coding Plan CN `plan` · Alibaba Coding Plan `plan` · Qwen Portal · Z.AI / GLM Coding Plan `plan` · Xiaomi MiMo · Qianfan · NanoGPT · Novita · Venice · Kilo · ZenMux · OpenCode Go · OpenCode Zen
+Cursor `oauth` · GitHub Copilot `oauth` · GitLab Duo · Kimi Code `plan` · Moonshot · MiniMax Coding Plan `plan` · MiniMax Coding Plan CN `plan` · Alibaba Coding Plan `plan` · Qwen Portal · Z.AI / GLM Coding Plan `plan` · Xiaomi MiMo · Qianfan · NanoGPT · Venice · Kilo · ZenMux · OpenCode Go · OpenCode Zen
 
 ### Run it yourself
 
@@ -328,19 +330,19 @@ Ollama `local` · Ollama Cloud · LM Studio `local` · llama.cpp `local` · vLLM
 ### Four knobs that make routing useful
 
 - **Custom providers** — Declare anything that speaks `openai-completions`, `openai-responses`, `openai-codex-responses`, `azure-openai-responses`, `anthropic-messages`, `google-generative-ai`, or `google-vertex` in `~/.omp/agent/models.yml`.
-- **Fallback chains** — Per-role or per-model chains under `retry.fallbackChains`. When the primary throws 429s or hits a quota wall, the next entry takes the rest of the turn — restored on cooldown.
+- **Fallback chains** — Per-role chains under `retry.fallbackChains`. When the primary throws 429s or hits a quota wall, the next entry takes the rest of the turn — restored on cooldown.
 - **Path-scoped models** — Scope `enabledModels` and `disabledProviders` entries to a `path:` prefix to pin a different model set on one repo without touching the global config. Scoped entries cover the path and everything under it.
 - **Round-robin credentials** — Stack API keys per provider and the runtime rotates with session affinity and per-credential backoff. Useful when one key would burn its quota by lunch.
 
 Full provider & routing reference at [omp.sh/docs/providers](https://omp.sh/docs/providers).
 
-## Twenty-five backends. _One tool the agent already knows_.
+## Eighteen backends. _One tool the agent already knows_.
 
-`web_search` is built in, not bolted on. `auto` walks a twenty-five-provider chain; pin one by name if you already pay for it. Behind every hit, site-aware extraction turns GitHub, registries, arXiv, Stack Overflow, and docs into structured markdown — anchors and link targets survive.
+`web_search` is built in, not bolted on. `auto` walks an eighteen-provider chain; pin one by name if you already pay for it. Behind every hit, site-aware extraction turns GitHub, registries, arXiv, Stack Overflow, and docs into structured markdown — anchors and link targets survive.
 
 ### Search providers
 
-Twenty-five backends. Pin one, or let `auto` walk the chain in order.
+Eighteen backends. Pin one, or let `auto` walk the chain in order.
 
 | provider     | auth                   |
 | ------------ | ---------------------- |
@@ -363,13 +365,6 @@ Twenty-five backends. Pin one, or let `auto` walk the chain in order.
 | `synthetic`  | `SYNTHETIC_API_KEY`    |
 | `searxng`    | self-hosted            |
 | `duckduckgo` | no key                 |
-| `bing`       | no key                 |
-| `yahoo`      | no key                 |
-| `startpage`  | no key                 |
-| `google`     | no key (browser)       |
-| `ecosia`     | no key (browser)       |
-| `mojeek`     | no key (browser)       |
-| `public`     | no key (all of the above, consolidated) |
 
 ### Specialised handlers
 
