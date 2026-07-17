@@ -76,6 +76,6 @@ SYNC_SCRIPT="$CHECKOUT/scripts/sync-skills.sh"
 [ -x "$SYNC_SCRIPT" ] || die "private checkout lacks executable scripts/sync-skills.sh"
 
 if [ "$OFFLINE" = true ]; then
-  exec "$SYNC_SCRIPT" --target "$TARGET" --prune --no-pull
+  exec "$SYNC_SCRIPT" --target "$TARGET" --prune --adopt-identical --no-pull
 fi
-exec "$SYNC_SCRIPT" --target "$TARGET" --prune
+exec "$SYNC_SCRIPT" --target "$TARGET" --prune --adopt-identical

@@ -107,6 +107,7 @@ function expectTargetDelegation(args: string[], target: string) {
 	expect(targetFlag).toBeGreaterThanOrEqual(0);
 	expect(args[targetFlag + 1]).toBe(target);
 	expect(args.filter((arg) => arg === "--target")).toHaveLength(1);
+	expect(args.filter((arg) => arg === "--adopt-identical")).toHaveLength(1);
 }
 
 beforeAll(() => {
