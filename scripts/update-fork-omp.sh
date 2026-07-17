@@ -6,14 +6,17 @@
 # (re)links the `omp` binary to the source checkout.
 #
 # Usage:
-#   scripts/update-fork-omp.sh                 # update the checkout this script lives in
-#   FORK_DIR=/path/to/oh-my-pi update-fork-omp.sh   # update a specific checkout
-#   FORK_DIR=/path/to/clone FORK_CLONE=1 update-fork-omp.sh   # clone fresh if missing
+#   scripts/update-fork-omp.sh                          # update this checkout
+#   FORK_DIR=/path/to/oh-my-pi update-fork-omp.sh      # update another checkout
+#   FORK_DIR=/path/to/clone FORK_CLONE=1 update-fork-omp.sh
+#   OMP_PRIVATE_SKILLS=1 update-fork-omp.sh             # bootstrap private skills too
 set -euo pipefail
 
 FORK_URL="${FORK_URL:-https://github.com/erik-sv/oh-my-pi.git}"
 # Default to the repo this script ships in; override with FORK_DIR on fresh machines.
 FORK_DIR="${FORK_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+PRIVATE_SKILLS_MODE="${OMP_PRIVATE_SKILLS:-auto}"
+PRIVATE_SKILLS_DIR="${OMP_SKILLS_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/omp/omp-skills}"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mupdate-fork-omp: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -145,6 +148,35 @@ if command -v omp >/dev/null; then
     || omp plugin marketplace add mvanhorn/last30days-skill || true
   omp plugin list 2>/dev/null | grep -q 'last30days@last30days-skill' \
     || omp plugin install last30days@last30days-skill || true
+fi
+
+# 6.6) Sync Encypher's private skill library when explicitly enabled on a new
+#      machine, or automatically after the checkout has been bootstrapped once.
+#      Private skills remain outside this public fork. The helper refuses dirty
+#      or divergent skill checkouts, validates frontmatter before linking, and
+#      installs into OMP's native user skill root.
+case "$PRIVATE_SKILLS_MODE" in
+  1|true|yes)
+    SYNC_PRIVATE_SKILLS=true
+    ;;
+  0|false|no)
+    SYNC_PRIVATE_SKILLS=false
+    ;;
+  auto)
+    if [ -d "$PRIVATE_SKILLS_DIR/.git" ]; then
+      SYNC_PRIVATE_SKILLS=true
+    else
+      SYNC_PRIVATE_SKILLS=false
+    fi
+    ;;
+  *)
+    die "OMP_PRIVATE_SKILLS must be auto, 1, or 0"
+    ;;
+esac
+
+if [ "$SYNC_PRIVATE_SKILLS" = true ]; then
+  say "syncing private OMP skills"
+  OMP_SKILLS_DIR="$PRIVATE_SKILLS_DIR" "$FORK_DIR/scripts/sync-private-skills.sh"
 fi
 
 # 7) Report.

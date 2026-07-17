@@ -72,6 +72,15 @@ FORK_DIR="$HOME/code/oh-my-pi" FORK_CLONE=1 \
   bash <(curl -fsSL https://raw.githubusercontent.com/erik-sv/oh-my-pi/main/scripts/update-fork-omp.sh)
 ```
 
+On a new Encypher-authorized machine, bootstrap the private skill library in the same run:
+
+```sh
+OMP_PRIVATE_SKILLS=1 FORK_DIR="$HOME/code/oh-my-pi" FORK_CLONE=1 \
+  bash <(curl -fsSL https://raw.githubusercontent.com/erik-sv/oh-my-pi/main/scripts/update-fork-omp.sh)
+```
+
+The first run requires Git credentials that can read the private `erik-sv/omp-skills` repository. It clones the library to `$XDG_DATA_HOME/omp/omp-skills` when `XDG_DATA_HOME` is set, otherwise `~/.local/share/omp/omp-skills`. It then validates the library and links skills into OMP's native `~/.omp/agent/skills` root. Later fork updates detect that checkout and fast-forward the skill library automatically. Set `OMP_PRIVATE_SKILLS=0` to skip it, or run `scripts/sync-private-skills.sh --offline` to validate and relink the existing checkout without network access.
+
 Ensure bun's global bin (`~/.bun/bin`) is on your `PATH`, then run `omp --version`.
 
 **Windows:** use WSL2 and follow the steps above, or run the script under Git Bash after installing bun, rustup, and the MSVC C++ Build Tools. A standalone, no-Rust binary can be produced per-OS with `bun run build` (output: `packages/coding-agent/dist/omp`).
