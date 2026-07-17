@@ -9,6 +9,78 @@ const updateScript = path.join(repoRoot, "scripts", "update-fork-omp.sh");
 const gitExecutable = Bun.which("git");
 const tempDirs: string[] = [];
 
+function makeExecutable(file: string, body: string) {
+	fs.writeFileSync(file, `#!/bin/sh\n${body}`);
+	fs.chmodSync(file, 0o755);
+}
+
+function makeFixture(fingerprint = "native-source-tree:") {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-update-"));
+	tempDirs.push(dir);
+	const checkout = path.join(dir, "checkout");
+	const shimDir = path.join(dir, "bin");
+	const nativeDir = path.join(checkout, "packages", "natives", "native");
+	fs.mkdirSync(path.join(checkout, ".git"), { recursive: true });
+	fs.mkdirSync(nativeDir, { recursive: true });
+	fs.mkdirSync(path.join(checkout, "packages", "coding-agent"), { recursive: true });
+	fs.mkdirSync(shimDir, { recursive: true });
+	fs.writeFileSync(path.join(checkout, "packages", "natives", "package.json"), '{"version":"16.5.0"}\n');
+	fs.writeFileSync(path.join(checkout, "packages", "coding-agent", "package.json"), '{"version":"16.5.0"}\n');
+	const addon = path.join(nativeDir, `pi_natives.${process.platform}-${process.arch}.node`);
+	fs.writeFileSync(addon, "binary payload __piNativesV16_5_0 without the new runtime export");
+	const buildLog = path.join(dir, "build.log");
+	fs.writeFileSync(path.join(nativeDir, `.source-fingerprint-${process.platform}-${process.arch}.node`), `${fingerprint}\n`);
+
+	makeExecutable(
+		path.join(shimDir, "git"),
+		[
+			'case "$1 $2 $3" in',
+			'  "remote get-url origin") echo "$FORK_URL" ;;',
+			'  "rev-parse --short HEAD") echo abc1234 ;;',
+			'  "rev-parse HEAD:crates"*) echo native-source-tree ;;',
+			'  *) exit 0 ;;',
+			'esac',
+			"",
+		].join("\n"),
+	);
+	makeExecutable(
+		path.join(shimDir, "bun"),
+		[
+			'if [ "$1" = "-e" ]; then',
+			'  case "$2" in',
+			'    *process.platform*) printf "%s" "$TEST_HOST_TAG"; exit 0 ;;',
+			'    *) [ "$PI_REQUIRED_NATIVE_EXPORTS" = "__piNativesV16_5_0,snapcompactSupportedChars" ] || exit 91',
+			'       [ "$TEST_EXPORTS_OK" = "1" ] || [ -f "$TEST_BUILD_LOG" ]; exit $? ;;',
+			'  esac',
+			'fi',
+			'if [ "$1" = "--cwd=packages/natives" ] && [ "$2" = "run" ] && [ "$3" = "build" ]; then',
+			'  echo built >> "$TEST_BUILD_LOG"',
+			'  exit 0',
+			'fi',
+			'exit 0',
+			"",
+		].join("\n"),
+	);
+	makeExecutable(path.join(shimDir, "cargo"), "exit 0\n");
+
+	return { checkout, shimDir, buildLog };
+}
+
+function runUpdater(fixture: { checkout: string; shimDir: string; buildLog: string }, exportsAvailable = false) {
+	return spawnSync("bash", [updateScript], {
+		env: {
+			...process.env,
+			FORK_DIR: fixture.checkout,
+			FORK_URL: "https://example.invalid/fork.git",
+			PATH: `${fixture.shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
+			TEST_BUILD_LOG: fixture.buildLog,
+			TEST_EXPORTS_OK: exportsAvailable ? "1" : "0",
+			TEST_HOST_TAG: `${process.platform}-${process.arch}`,
+		},
+		encoding: "utf8",
+	});
+}
+
 function makeTempDir(): string {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-update-fork-"));
 	tempDirs.push(dir);
@@ -51,9 +123,16 @@ function gitRemoteUrl(cwd: string, remote: string): string | null {
 function createBareFork(root: string, name: string, release: string): { bare: string; commit: string } {
 	const work = path.join(root, `${name}-work`);
 	const bare = path.join(root, `${name}.git`);
+	fs.mkdirSync(path.join(work, "crates"), { recursive: true });
 	fs.mkdirSync(path.join(work, "packages", "natives", "native"), { recursive: true });
+	fs.mkdirSync(path.join(work, "packages", "natives", "scripts"), { recursive: true });
 	fs.mkdirSync(path.join(work, "packages", "coding-agent"), { recursive: true });
 	fs.writeFileSync(path.join(work, "release.txt"), `${release}\n`);
+	fs.writeFileSync(path.join(work, "Cargo.toml"), "[workspace]\n");
+	fs.writeFileSync(path.join(work, "Cargo.lock"), "# updater test fixture\n");
+	fs.writeFileSync(path.join(work, "rust-toolchain.toml"), '[toolchain]\nchannel = "stable"\n');
+	fs.writeFileSync(path.join(work, "crates", "fixture.txt"), `${release}\n`);
+	fs.writeFileSync(path.join(work, "packages", "natives", "scripts", "fixture.ts"), `export default ${JSON.stringify(release)};\n`);
 	fs.writeFileSync(path.join(work, "packages", "natives", "package.json"), '{"version":"1.2.3"}\n');
 	fs.writeFileSync(
 		path.join(work, "packages", "natives", "native", "pi_natives.test-platform-test-arch.node"),
@@ -74,11 +153,9 @@ function createBareFork(root: string, name: string, release: string): { bare: st
 function writeToolStubs(root: string): string {
 	const bin = path.join(root, "bin");
 	fs.mkdirSync(bin);
-	const bun = path.join(bin, "bun");
-	fs.writeFileSync(
-		bun,
+	makeExecutable(
+		path.join(bin, "bun"),
 		[
-			"#!/bin/sh",
 			'if [ "$1" = "-e" ]; then',
 			"  printf 'test-platform-test-arch'",
 			"fi",
@@ -86,10 +163,8 @@ function writeToolStubs(root: string): string {
 			"",
 		].join("\n"),
 	);
-	fs.chmodSync(bun, 0o755);
-	const omp = path.join(bin, "omp");
-	fs.writeFileSync(omp, "#!/bin/sh\nexit 0\n");
-	fs.chmodSync(omp, 0o755);
+	makeExecutable(path.join(bin, "cargo"), "exit 0\n");
+	makeExecutable(path.join(bin, "omp"), "exit 0\n");
 	return bin;
 }
 
@@ -98,6 +173,34 @@ afterEach(() => {
 		const dir = tempDirs.pop();
 		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+describe("scripts/update-fork-omp.sh native freshness", () => {
+	it("rebuilds a same-version addon that is missing a required runtime export", () => {
+		const fixture = makeFixture();
+		const result = runUpdater(fixture);
+
+		expect(result.status, result.stderr).toBe(0);
+		expect(fs.readFileSync(fixture.buildLog, "utf8")).toBe("built\n");
+		expect(result.stdout).toContain("building native addon");
+	});
+
+	it("rebuilds when native build inputs change without a version bump", () => {
+		const fixture = makeFixture("previous-source-tree:");
+		const result = runUpdater(fixture, true);
+
+		expect(result.status, result.stderr).toBe(0);
+		expect(fs.readFileSync(fixture.buildLog, "utf8")).toBe("built\n");
+	});
+
+	it("skips a current addon only after the fresh-process export probe succeeds", () => {
+		const fixture = makeFixture();
+		const result = runUpdater(fixture, true);
+
+		expect(result.status, result.stderr).toBe(0);
+		expect(fs.existsSync(fixture.buildLog)).toBe(false);
+		expect(result.stdout).toContain("matches pi-natives@16.5.0 source and required exports");
+	});
 });
 
 describe("scripts/update-fork-omp.sh", () => {

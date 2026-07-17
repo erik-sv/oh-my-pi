@@ -72,39 +72,67 @@ git checkout -B main "$FORK_REMOTE/main"
 say "bun install"
 bun install
 
-# 5.5) Ensure the host's native addon is present AND matches this release.
+# 5.5) Ensure the host's native addon matches both this release and its source.
 #      `*.node` is gitignored and the workspace ships no prebuilt, so a fresh
-#      checkout on ANY OS must compile crates/pi-natives once (needs a Rust
-#      toolchain; rust-toolchain.toml pins the nightly, which rustup
-#      auto-installs). The addon is rebuilt in lock-step with the package
-#      version: napi-rs emits a `__piNativesV{major}_{minor}_{patch}` sentinel
-#      symbol whose name encodes the version (packages/natives loader-state.js).
-#      A `.node` left from a previous release lacks the current sentinel and
-#      MUST be rebuilt — a host-tag match ALONE is not enough, or a post-upgrade
-#      dev tree silently runs a stale addon missing the new native exports
-#      (workspace loads skip the loader's version validation). The sentinel name
-#      is embedded as a string in the compiled .node, so a crash-free `grep`
-#      (no dlopen, so no SIGILL on a CPU-variant mismatch) settles freshness.
-#      Idempotent: skip only when a host-tag .node embeds the current sentinel.
+#      checkout on any OS must compile crates/pi-natives once. A version sentinel
+#      catches cross-release skew, while a source fingerprint catches native
+#      changes made without a package-version bump. Finally, a fresh Bun process
+#      loads the addon and checks required exports. Isolating that dlopen keeps a
+#      stale or CPU-incompatible addon from taking down this updater process.
 NATIVE_DIR="$FORK_DIR/packages/natives/native"
 HOST_TAG="$(bun -e 'process.stdout.write(process.platform + "-" + process.arch)')"
 NATIVE_VER="$(grep -m1 '"version"' packages/natives/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '0.0.0')"
 SENTINEL="__piNativesV$(printf '%s' "$NATIVE_VER" | tr -c 'A-Za-z0-9' '_')"
+REQUIRED_NATIVE_EXPORTS="$SENTINEL,snapcompactSupportedChars"
+NATIVE_FINGERPRINT_FILE="$NATIVE_DIR/.source-fingerprint-$HOST_TAG.node"
+CURRENT_NATIVE_SOURCE="$(
+  git rev-parse \
+    HEAD:crates \
+    HEAD:packages/natives/scripts \
+    HEAD:Cargo.toml \
+    HEAD:Cargo.lock \
+    HEAD:rust-toolchain.toml | tr '\n' ':'
+)"
+
+native_exports_present() {
+  PI_REQUIRED_NATIVE_EXPORTS="$REQUIRED_NATIVE_EXPORTS" bun -e '
+    const { pathToFileURL } = await import("node:url");
+    const entrypoint = pathToFileURL(`${process.cwd()}/packages/natives/native/index.js`);
+    entrypoint.searchParams.set("update-smoke", `${Date.now()}-${Math.random()}`);
+    const bindings = await import(entrypoint.href);
+    const missing = process.env.PI_REQUIRED_NATIVE_EXPORTS.split(",")
+      .filter(name => typeof bindings[name] !== "function");
+    if (missing.length) {
+      console.error(`missing required native exports: ${missing.join(", ")}`);
+      process.exit(1);
+    }
+  ' >/dev/null 2>&1
+}
+
 native_addon_current() {
-  local f
+  local f recorded_fingerprint=""
   for f in "$NATIVE_DIR/pi_natives.${HOST_TAG}"*.node; do
     [ -e "$f" ] || continue
-    grep -qa "$SENTINEL" "$f" && return 0
+    grep -qa "$SENTINEL" "$f" || continue
+    [ -f "$NATIVE_FINGERPRINT_FILE" ] || return 1
+    IFS= read -r recorded_fingerprint < "$NATIVE_FINGERPRINT_FILE" || return 1
+    [ "$recorded_fingerprint" = "$CURRENT_NATIVE_SOURCE" ] || return 1
+    native_exports_present || return 1
+    return 0
   done
   return 1
 }
+
 if native_addon_current; then
-  say "native addon for $HOST_TAG matches pi-natives@$NATIVE_VER ($SENTINEL present)"
+  say "native addon for $HOST_TAG matches pi-natives@$NATIVE_VER source and required exports"
 else
   command -v cargo >/dev/null \
-    || die "native addon for $HOST_TAG is missing or stale (need sentinel $SENTINEL) and no Rust toolchain found. Install rustup (https://rustup.rs), then re-run."
+    || die "native addon for $HOST_TAG is missing or stale and no Rust toolchain was found. Install rustup (https://rustup.rs), then re-run."
   say "building native addon for $HOST_TAG @ $NATIVE_VER (compiles crates/pi-natives; requires Rust)"
   bun --cwd=packages/natives run build
+  native_exports_present \
+    || die "fresh native addon for $HOST_TAG failed the required-export smoke probe ($REQUIRED_NATIVE_EXPORTS)"
+  printf '%s\n' "$CURRENT_NATIVE_SOURCE" > "$NATIVE_FINGERPRINT_FILE"
 fi
 
 # 6) (Re)link the omp binary to this checkout's source, so `omp` runs the fork.
