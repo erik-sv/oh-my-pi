@@ -1,6 +1,7 @@
 import { getPuppeteerDir, logger, postmortem, Snowflake, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
 import type { Page, Target } from "puppeteer-core";
 import { callSessionTool } from "../../eval/js/tool-bridge";
+import { buildChildEnv, hasSecretBearingEnv } from "../../exec/child-env";
 import { webpExclusionForModel } from "../../utils/image-loading";
 import type { ToolSession } from "../index";
 import { expandPath } from "../path-utils";
@@ -268,6 +269,10 @@ async function acquireTabImpl(
 		if (worker.mode === "inline") {
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
 			throw error;
+		}
+		if (hasSecretBearingEnv(process.env)) {
+			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
+			throw inlineFallbackBlockedError("Browser tab Worker initialization failed", error);
 		}
 		logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
 			error: error instanceof Error ? error.message : String(error),
@@ -800,6 +805,9 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		worker.onMessage(msg => handleTabMessage(tab, msg));
 	} catch (error) {
 		await worker.terminate().catch(() => undefined);
+		if (hasSecretBearingEnv(process.env)) {
+			throw inlineFallbackBlockedError("Timed-out browser tab Worker recycling failed", error);
+		}
 		worker = await spawnInlineWorker();
 		try {
 			const info = await initializeTabWorker(worker, payload, timeoutMs);
@@ -922,16 +930,24 @@ async function raceWithTimeout<T>(
 async function spawnTabWorker(): Promise<WorkerHandle> {
 	try {
 		const hostEntry = workerHostEntry();
+		const env = buildChildEnv("untrusted-js", { parentEnv: process.env });
 		const worker = hostEntry
-			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_tab"] })
-			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module" });
+			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_tab"], env })
+			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module", env });
 		return wrapBunWorker(worker);
 	} catch (err) {
+		if (hasSecretBearingEnv(process.env)) throw inlineFallbackBlockedError("Bun Worker spawn failed", err);
 		logger.warn("Bun Worker spawn failed; using inline tab worker (no sync-loop guard)", {
 			error: err instanceof Error ? err.message : String(err),
 		});
 		return spawnInlineWorker();
 	}
+}
+
+function inlineFallbackBlockedError(context: string, cause: unknown): ToolError {
+	const error = new ToolError(`${context}; inline fallback is disabled while the parent environment contains secrets`);
+	Object.defineProperty(error, "cause", { value: cause, configurable: true });
+	return error;
 }
 
 function wrapBunWorker(worker: Worker): WorkerHandle {

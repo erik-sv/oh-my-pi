@@ -28,7 +28,10 @@ function makeFixture(fingerprint = "native-source-tree:") {
 	const addon = path.join(nativeDir, `pi_natives.${process.platform}-${process.arch}.node`);
 	fs.writeFileSync(addon, "binary payload __piNativesV16_5_0 without the new runtime export");
 	const buildLog = path.join(dir, "build.log");
-	fs.writeFileSync(path.join(nativeDir, `.source-fingerprint-${process.platform}-${process.arch}.node`), `${fingerprint}\n`);
+	fs.writeFileSync(
+		path.join(nativeDir, `.source-fingerprint-${process.platform}-${process.arch}.node`),
+		`${fingerprint}\n`,
+	);
 
 	makeExecutable(
 		path.join(shimDir, "git"),
@@ -37,8 +40,8 @@ function makeFixture(fingerprint = "native-source-tree:") {
 			'  "remote get-url origin") echo "$FORK_URL" ;;',
 			'  "rev-parse --short HEAD") echo abc1234 ;;',
 			'  "rev-parse HEAD:crates"*) echo native-source-tree ;;',
-			'  *) exit 0 ;;',
-			'esac',
+			"  *) exit 0 ;;",
+			"esac",
 			"",
 		].join("\n"),
 	);
@@ -50,13 +53,13 @@ function makeFixture(fingerprint = "native-source-tree:") {
 			'    *process.platform*) printf "%s" "$TEST_HOST_TAG"; exit 0 ;;',
 			'    *) [ "$PI_REQUIRED_NATIVE_EXPORTS" = "__piNativesV16_5_0,snapcompactSupportedChars" ] || exit 91',
 			'       [ "$TEST_EXPORTS_OK" = "1" ] || [ -f "$TEST_BUILD_LOG" ]; exit $? ;;',
-			'  esac',
-			'fi',
+			"  esac",
+			"fi",
 			'if [ "$1" = "--cwd=packages/natives" ] && [ "$2" = "run" ] && [ "$3" = "build" ]; then',
 			'  echo built >> "$TEST_BUILD_LOG"',
-			'  exit 0',
-			'fi',
-			'exit 0',
+			"  exit 0",
+			"fi",
+			"exit 0",
 			"",
 		].join("\n"),
 	);

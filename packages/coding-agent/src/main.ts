@@ -666,6 +666,27 @@ export function normalizeContinueSessionArgs(parsed: Args, rawArgs?: readonly st
 	parsed.messages.splice(messageIndex, 1);
 }
 
+export function parseSqlSessionDbOptions(optionsJson: string): {
+	connectionOptions: Record<string, unknown>;
+	createTable: boolean;
+} {
+	let options: unknown;
+	try {
+		options = JSON.parse(optionsJson);
+	} catch (err) {
+		throw new Error(`OMP_SESSION_DB_OPTIONS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	if (options === null || typeof options !== "object" || Array.isArray(options)) {
+		throw new Error("OMP_SESSION_DB_OPTIONS must be a JSON object.");
+	}
+
+	const { createTable = true, ...connectionOptions } = options as Record<string, unknown>;
+	if (typeof createTable !== "boolean") {
+		throw new Error("OMP_SESSION_DB_OPTIONS createTable must be a boolean.");
+	}
+	return { connectionOptions, createTable };
+}
+
 /**
  * When `--session-storage sql` is requested, build a SQL-backed
  * {@link SqlSessionStorage} from the connection in OMP_SESSION_DB_URL (a
@@ -690,21 +711,16 @@ async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 	}
 
 	let client: SQL;
+	let createTable = true;
 	if (url) {
 		client = new SQL(url);
 	} else {
-		let options: Record<string, unknown>;
-		try {
-			options = JSON.parse(optionsJson as string) as Record<string, unknown>;
-		} catch (err) {
-			throw new Error(
-				`OMP_SESSION_DB_OPTIONS is not valid JSON: ${err instanceof Error ? err.message : String(err)}`,
-			);
-		}
-		client = new SQL(options);
+		const parsedOptions = parseSqlSessionDbOptions(optionsJson as string);
+		client = new SQL(parsedOptions.connectionOptions);
+		createTable = parsedOptions.createTable;
 	}
 
-	const storage = await SqlSessionStorage.create({ client });
+	const storage = await SqlSessionStorage.create({ client, createTable });
 	setDefaultSessionStorage(storage);
 	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
 }

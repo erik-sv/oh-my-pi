@@ -1,10 +1,15 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getOrCreateSnapshot, sanitizeSnapshotForBrush } from "@oh-my-pi/pi-coding-agent/utils/shell-snapshot";
+import type { Subprocess } from "bun";
 import fnEnvHelper from "../src/utils/shell-snapshot-fn-env.sh" with { type: "text" };
+
+interface SpawnOptions {
+	env?: Record<string, string | undefined>;
+}
 
 // macOS ships bash at `/bin/bash`, not `/usr/bin/bash`; resolve a real bash the
 // same way `bash-executor.test.ts` does so these e2e tests stay portable. The
@@ -392,4 +397,49 @@ describe("getOrCreateSnapshot", () => {
 			await fs.rm(testRoot, { recursive: true, force: true });
 		}
 	}, 5000); // increase test timeout to 5s to accommodate the 2s snapshot timeout
+
+	it("sanitizes the snapshot generator environment while preserving PATH and HOME", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "omp-snap-env-"));
+		const shell = path.join(home, "bash-snapshot-env");
+		let childEnv: Record<string, string | undefined> | undefined;
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[], options?: SpawnOptions) => {
+			childEnv = { ...(options?.env ?? Bun.env) } as Record<string, string | undefined>;
+			return {
+				cmd,
+				exitCode: 0,
+				exited: Promise.resolve(0),
+			} as unknown as Subprocess;
+		}) as typeof Bun.spawn);
+
+		let snapshotPath: string | null = null;
+		try {
+			snapshotPath = await getOrCreateSnapshot(shell, {
+				PATH: "/opt/omp-test/bin:/usr/bin",
+				HOME: home,
+				OPENAI_API_KEY: "ambient-openai-secret",
+				ANTHROPIC_API_KEY: "ambient-anthropic-secret",
+				DATABASE_URL: "postgres://ambient-database-secret",
+				OMP_SESSION_DB_URL: "postgres://ambient-session-secret",
+				JWT_SECRET: "ambient-jwt-secret",
+				AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			});
+
+			expect(childEnv?.PATH).toBe("/opt/omp-test/bin:/usr/bin");
+			expect(childEnv?.HOME).toBe(home);
+			for (const key of [
+				"OPENAI_API_KEY",
+				"ANTHROPIC_API_KEY",
+				"DATABASE_URL",
+				"OMP_SESSION_DB_URL",
+				"JWT_SECRET",
+				"AGENTDESK_CONTROL_TOKEN",
+			]) {
+				expect(childEnv?.[key], `${key} must not cross the snapshot generator boundary`).toBeUndefined();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			if (snapshotPath) await fs.rm(snapshotPath, { force: true });
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
 });

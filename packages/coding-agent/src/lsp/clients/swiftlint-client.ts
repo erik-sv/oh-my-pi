@@ -2,6 +2,7 @@
  * SwiftLint CLI-based linter client.
  * Parses SwiftLint's JSON reporter output into LSP Diagnostic format.
  */
+import { buildChildEnv } from "../../exec/child-env";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 /** Shape of a single violation from `swiftlint lint --reporter json`. */
@@ -35,6 +36,7 @@ async function runSwiftLint(
 
 	try {
 		const proc = Bun.spawn([command, ...args], {
+			env: buildChildEnv("model-child", { parentEnv: Bun.env }),
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",

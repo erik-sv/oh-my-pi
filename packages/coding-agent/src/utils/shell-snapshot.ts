@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import fnEnvHelper from "./shell-snapshot-fn-env.sh" with { type: "text" };
 
 const cachedSnapshotPaths = new Map<string, string>();
@@ -73,13 +74,6 @@ function scrubSnapshotInPlace(snapshotPath: string): void {
 	} catch (err) {
 		logger.debug("shell-snapshot: scrub failed", { err: String(err) });
 	}
-}
-
-function sanitizeSnapshotEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
-	const sanitized = { ...env };
-	delete sanitized.BASH_ENV;
-	delete sanitized.ENV;
-	return sanitized;
 }
 
 /**
@@ -262,13 +256,7 @@ export async function getOrCreateSnapshot(
 
 	let succeeded = false;
 	try {
-		const snapshotEnv = sanitizeSnapshotEnv(env);
-		const spawnEnv: Record<string, string> = {};
-		for (const [key, value] of Object.entries(snapshotEnv)) {
-			if (value !== undefined) {
-				spawnEnv[key] = value;
-			}
-		}
+		const spawnEnv = buildChildEnv("shell-snapshot", { parentEnv: env });
 		const child = Bun.spawn([shell, "-c", script], {
 			env: spawnEnv,
 			stdin: "ignore",

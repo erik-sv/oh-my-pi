@@ -7,6 +7,7 @@
  * and final newlines are preserved.
  */
 import { ptree } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import { buildRemoteCommand, ensureConnection, ensureHostInfo, type SSHConnectionTarget } from "./connection-manager";
 import { quotePosixPath, wrapInPosixShell } from "./utils";
 
@@ -76,6 +77,7 @@ export async function readRemoteFile(
 	const command = `head -c ${opts.maxBytes + 1} ${quotePosixPath(remotePath)}`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
 	using child = ptree.spawn(["ssh", ...args], {
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	// Drain stdout before awaiting exit so a full pipe can't deadlock the child.
@@ -142,6 +144,7 @@ export async function writeRemoteFile(
 		`}`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command), { allowStdin: true });
 	using child = ptree.spawn(["ssh", ...args], {
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		stdin: content,
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
@@ -165,6 +168,7 @@ export async function statRemotePath(
 	const command = `if [ -d ${p} ]; then echo directory; elif [ -f ${p} ]; then echo file; elif [ -e ${p} ]; then echo other; else echo missing; fi`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
 	using child = ptree.spawn(["ssh", ...args], {
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	const out = new TextDecoder().decode(await child.bytes()).trim();
@@ -197,6 +201,7 @@ export async function listRemoteDir(
 	const command = `LC_ALL=C ls -1Ap -- ${quotePosixPath(remotePath)}`;
 	const args = await buildRemoteCommand(target, wrapInPosixShell(shell, command));
 	using child = ptree.spawn(["ssh", ...args], {
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		signal: ptree.combineSignals(opts.signal, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS),
 	});
 	const text = new TextDecoder().decode(await child.bytes());

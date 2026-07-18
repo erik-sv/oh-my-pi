@@ -212,6 +212,51 @@ describe("tiny title subprocess", () => {
 		expect(calls[0]?.options.stderr).not.toBe("pipe");
 		await worker.proc.exited;
 	});
+	it("passes the local-model worker cache and network env without ambient credentials", async () => {
+		const inherited = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			OPENAI_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			HF_TOKEN: "ambient-huggingface-secret",
+			HF_HOME: "/models/huggingface",
+			HF_HUB_CACHE: "/models/huggingface/hub",
+			TRANSFORMERS_CACHE: "/models/transformers",
+			XDG_CACHE_HOME: "/cache/xdg",
+			HTTPS_PROXY: "http://proxy.internal:8443",
+			SSL_CERT_FILE: "/etc/ssl/custom-ca.pem",
+		};
+		const previous = Object.fromEntries(Object.keys(inherited).map(key => [key, Bun.env[key]]));
+		for (const [key, value] of Object.entries(inherited)) Bun.env[key] = value;
+		const calls: TinyWorkerSpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createTinyWorkerSpawnMock(calls));
+
+		try {
+			const worker = createTinyTitleSubprocess();
+			expect(calls).toHaveLength(1);
+			const env = calls[0]?.options.env as Record<string, string | undefined> | undefined;
+			expect(env).toBeDefined();
+			expect(env?.HF_HOME).toBe("/models/huggingface");
+			expect(env?.HF_HUB_CACHE).toBe("/models/huggingface/hub");
+			expect(env?.TRANSFORMERS_CACHE).toBe("/models/transformers");
+			expect(env?.XDG_CACHE_HOME).toBe("/cache/xdg");
+			expect(env?.HTTPS_PROXY).toBe("http://proxy.internal:8443");
+			expect(env?.SSL_CERT_FILE).toBe("/etc/ssl/custom-ca.pem");
+			expect(env?.ANTHROPIC_API_KEY).toBeUndefined();
+			expect(env?.OPENAI_API_KEY).toBeUndefined();
+			expect(env?.DATABASE_URL).toBeUndefined();
+			expect(env?.AGENTDESK_CONTROL_TOKEN).toBeUndefined();
+			expect(env?.JWT_SECRET).toBeUndefined();
+			expect(env?.HF_TOKEN).toBeUndefined();
+			await worker.proc.exited;
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+		}
+	});
 });
 
 describe("providers.tinyModel schema", () => {

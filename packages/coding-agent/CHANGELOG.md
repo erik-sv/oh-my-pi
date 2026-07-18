@@ -12,6 +12,12 @@
 - Added support for id-prefixed targets and keys in `retry.fallbackChains` wildcards (e.g., `"openrouter/google/*"`).
 - Added support for `Shift+Enter` in the session tree selector (`/tree`, `/branch`) to summarize and switch branches in a single step.
 - Added the `PI_CONFIG_FILES` environment variable to load settings overlays before `--config` overlays.
+### Changed
+
+- Hardened OMP-spawned subprocesses with contract-specific, default-deny environment allowlists so model-driven descendants retain required runtime values without inheriting AgentDesk control-plane or storage credentials.
+- Serialized PostgreSQL SQL-session writers with per-session advisory locks and added no-DDL `createTable: false` support for dedicated least-privilege storage roles.
+
+## [17.0.3] - 2026-07-17
 
 ### Changed
 

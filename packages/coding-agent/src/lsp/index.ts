@@ -9,6 +9,7 @@ import type {
 } from "@oh-my-pi/pi-agent-core";
 import { logger, once, prompt, untilAborted } from "@oh-my-pi/pi-utils";
 import type { BunFile } from "bun";
+import { buildChildEnv } from "../exec/child-env";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
@@ -670,6 +671,7 @@ async function resolveGoWorkspaceDiagnosticsCommand(cwd: string, signal?: AbortS
 	const fallback = ["go", "build", "./..."];
 	try {
 		const proc = Bun.spawn(["go", "work", "edit", "-json"], {
+			env: buildChildEnv("model-child", { parentEnv: Bun.env }),
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",
@@ -749,6 +751,7 @@ async function runWorkspaceDiagnostics(
 	}
 	try {
 		const proc = Bun.spawn(projectType.command, {
+			env: buildChildEnv("model-child", { parentEnv: Bun.env }),
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",

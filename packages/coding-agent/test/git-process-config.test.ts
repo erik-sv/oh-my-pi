@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
+import * as piUtils from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 
 type SpawnOptions = Bun.SpawnOptions.SpawnOptions<
@@ -147,5 +148,82 @@ describe("git subprocess config", () => {
 
 		expect(spawnCalls).toHaveLength(1);
 		expect(spawnCalls[0]?.options.env).not.toHaveProperty("GPG_TTY");
+	});
+
+	it("keeps GitHub auth but strips unrelated ambient secrets from git", async () => {
+		const poisoned = {
+			GH_TOKEN: "explicit-github-auth",
+			GITHUB_TOKEN: "explicit-github-token",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		try {
+			await git.status.summary("/work/pi");
+			const childEnv = spawnCalls[0]?.options.env;
+			expect(childEnv).toEqual(
+				expect.objectContaining({
+					GH_TOKEN: "explicit-github-auth",
+					GITHUB_TOKEN: "explicit-github-token",
+					GIT_TERMINAL_PROMPT: "0",
+				}),
+			);
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("DATABASE_URL");
+			expect(childEnv).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(childEnv).not.toHaveProperty("JWT_SECRET");
+			expect(childEnv).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
+	it("keeps GitHub auth but strips unrelated ambient secrets from gh", async () => {
+		const poisoned = {
+			GH_TOKEN: "explicit-github-auth",
+			GITHUB_TOKEN: "explicit-github-token",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(piUtils, "$which").mockReturnValue("/usr/bin/gh");
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		try {
+			expect((await git.github.run("/work/pi", ["repo", "view"])).exitCode).toBe(0);
+			const childEnv = spawnCalls[0]?.options.env;
+			expect(childEnv).toEqual(
+				expect.objectContaining({
+					GH_TOKEN: "explicit-github-auth",
+					GITHUB_TOKEN: "explicit-github-token",
+					GH_PROMPT_DISABLED: "1",
+				}),
+			);
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("DATABASE_URL");
+			expect(childEnv).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(childEnv).not.toHaveProperty("JWT_SECRET");
+			expect(childEnv).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 });

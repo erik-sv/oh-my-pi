@@ -10,6 +10,7 @@ import {
 	workerHostEntry,
 } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
+import { buildChildEnv } from "../exec/child-env";
 
 /**
  * Shared lifecycle scaffolding for the ONNX inference subprocess clients
@@ -130,16 +131,19 @@ export function resolveWorkerSpawnCmd(workerArg: string): WorkerSpawnCommand {
  * `overlay` (e.g. the tiny-model device/dtype vars) wins over inherited keys.
  */
 export function workerEnvFromParent(overlay?: Record<string, string>): Record<string, string> {
-	const base = $env as Record<string, string | undefined>;
-	const merged: Record<string, string> = {};
-	for (const key in base) {
-		const value = base[key];
-		if (typeof value === "string") merged[key] = value;
-	}
-	if (overlay) {
-		for (const key in overlay) merged[key] = overlay[key];
-	}
-	return merged;
+	return buildChildEnv("local-model-worker", {
+		parentEnv: { ...$env, ...process.env, ...Bun.env },
+		patches: {
+			HTTPS_PROXY: Bun.env.HTTPS_PROXY,
+			HTTP_PROXY: Bun.env.HTTP_PROXY,
+			ALL_PROXY: Bun.env.ALL_PROXY,
+			NO_PROXY: Bun.env.NO_PROXY,
+			SSL_CERT_FILE: Bun.env.SSL_CERT_FILE,
+			SSL_CERT_DIR: Bun.env.SSL_CERT_DIR,
+			NODE_EXTRA_CA_CERTS: Bun.env.NODE_EXTRA_CA_CERTS,
+		},
+		explicitEnv: overlay,
+	});
 }
 
 /**

@@ -13,6 +13,7 @@ import { findConfigFile } from "./config";
 import type { Personality, SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import { expandAtImports } from "./discovery/at-imports";
+import { buildChildEnv } from "./exec/child-env";
 import { loadSkills, type Skill } from "./extensibility/skills";
 import { hasObsidian } from "./internal-urls/vault-protocol";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
@@ -123,6 +124,7 @@ async function runGpuProbe(cmd: string[]): Promise<string | null> {
 	try {
 		const proc = Bun.spawn({
 			cmd,
+			env: buildChildEnv("desktop-helper", { parentEnv: Bun.env }),
 			stdout: "pipe",
 			stderr: "ignore",
 			stdin: "ignore",

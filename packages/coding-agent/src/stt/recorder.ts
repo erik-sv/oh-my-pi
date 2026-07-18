@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $which, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { $, type Subprocess } from "bun";
+import { buildChildEnv } from "../exec/child-env";
 import { ensureTool, getToolPath } from "../utils/tools-manager";
 import { decodePcmS16LE } from "./wav";
 
@@ -24,7 +25,10 @@ export function detectRecordingTools(): string[] {
 // ── ffmpeg dshow device detection ──────────────────────────────────
 
 async function detectWindowsAudioDevice(bin: string): Promise<string> {
-	const result = await $`${bin} -f dshow -list_devices true -i dummy`.quiet().nothrow();
+	const result = await $`${bin} -f dshow -list_devices true -i dummy`
+		.quiet()
+		.nothrow()
+		.env(buildChildEnv("audio-helper", { parentEnv: Bun.env }));
 	const output = result.stderr.toString();
 	const audioDevices: string[] = [];
 	const re = /"([^"]+)"\s*\(audio\)/gi;
@@ -75,6 +79,7 @@ async function startSoxRecording(bin: string, outputPath: string): Promise<Recor
 	const inputArgs = isWindows ? ["-t", "waveaudio", "0"] : ["-d"];
 
 	const proc = Bun.spawn([bin, ...inputArgs, "-r", "16000", "-c", "1", "-b", "16", "-t", "wav", outputPath], {
+		env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -103,6 +108,7 @@ async function startFFmpegRecording(bin: string, outputPath: string): Promise<Re
 	];
 
 	const proc = Bun.spawn(args, {
+		env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -126,6 +132,7 @@ async function startFFmpegRecording(bin: string, outputPath: string): Promise<Re
 
 async function startArecordRecording(bin: string, outputPath: string): Promise<RecordingHandle> {
 	const proc = Bun.spawn([bin, "-f", "S16_LE", "-r", "16000", "-c", "1", outputPath], {
+		env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -209,6 +216,7 @@ async function startPowerShellRecording(outputPath: string): Promise<RecordingHa
 	await Bun.write(scriptPath, PS_RECORD_SCRIPT);
 
 	const proc = Bun.spawn(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", scriptPath, outputPath], {
+		env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "ignore",
@@ -275,11 +283,13 @@ async function verifyProcessAlive(proc: RecorderProcess, tool: string): Promise<
 
 	const exited = await Promise.race([proc.exited.then(code => code), Bun.sleep(0).then(() => "running" as const)]);
 	if (exited === "running") {
-		void proc.stderr.pipeTo(new WritableStream<Uint8Array>()).catch(() => {});
+		if (proc.stderr && typeof proc.stderr !== "number") {
+			void proc.stderr.pipeTo(new WritableStream<Uint8Array>()).catch(() => {});
+		}
 		return;
 	}
 
-	const stderr = await new Response(proc.stderr).text();
+	const stderr = proc.stderr && typeof proc.stderr !== "number" ? await new Response(proc.stderr).text() : "";
 	throw new Error(`${tool} exited immediately (code ${exited}): ${stderr.trim() || "(no output)"}`);
 }
 
@@ -452,7 +462,12 @@ async function startStreamingRecordingWithRecorder(
 ): Promise<StreamingRecordingHandle> {
 	const args = await streamingRecorderArgs(recorder);
 	logger.debug("Starting streaming audio recording", { tool: recorder.tool, bin: recorder.bin });
-	const proc = Bun.spawn(args, { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+	const proc = Bun.spawn(args, {
+		env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
+		stdin: "pipe",
+		stdout: "pipe",
+		stderr: "pipe",
+	});
 
 	// Read s16le bytes off stdout, carrying any trailing odd byte across chunk
 	// boundaries so a sample is never split. Runs until the process closes stdout.

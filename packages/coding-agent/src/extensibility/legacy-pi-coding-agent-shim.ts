@@ -29,6 +29,7 @@ import { getPackageDir as getOmpPackageDir } from "../config";
 import type { PromptTemplate } from "../config/prompt-templates";
 import { type SettingPath, Settings } from "../config/settings";
 import { EditTool } from "../edit";
+import { buildChildEnv } from "../exec/child-env";
 import type { CreateAgentSessionOptions, CreateAgentSessionResult, LoadExtensionsResult } from "../sdk";
 import {
 	discoverContextFiles,
@@ -450,11 +451,13 @@ export function createBashToolDefinition(cwd: string, options?: BashToolOptions)
 			const rawCommand = stringField(params, "command") ?? "";
 			const command = options?.commandPrefix ? `${options.commandPrefix}\n${rawCommand}` : rawCommand;
 			const timeout = numberField(params, "timeout");
-			const spawn = options?.spawnHook?.({ command, cwd, env: process.env });
+			const hookEnv = buildChildEnv("direct-user-shell", { parentEnv: process.env });
+			const spawn = options?.spawnHook?.({ command, cwd, env: hookEnv });
+			const operationEnv = spawn?.env ? buildChildEnv("direct-user-shell", { parentEnv: spawn.env }) : hookEnv;
 			if (options?.operations) {
 				return executeLegacyBashOperations(
 					options.operations,
-					{ command: spawn?.command ?? command, cwd: spawn?.cwd ?? cwd, env: spawn?.env ?? process.env },
+					{ command: spawn?.command ?? command, cwd: spawn?.cwd ?? cwd, env: operationEnv },
 					timeout,
 					signal,
 					onUpdate,
@@ -465,7 +468,7 @@ export function createBashToolDefinition(cwd: string, options?: BashToolOptions)
 				{
 					command: spawn?.command ?? command,
 					cwd: spawn?.cwd ?? cwd,
-					env: spawn?.env,
+					env: operationEnv,
 					timeout,
 				},
 				signal,

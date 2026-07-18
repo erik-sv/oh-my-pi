@@ -23,6 +23,50 @@ const KILL_POLL_SECONDS = "0.01"; // a survivor re-checks `release` every ~10ms
 const KILL_SETTLE_MS = 25; // let the kill signal land before we touch `release`
 const KILL_REACT_MS = 50; // > one poll interval: a survivor would write its marker
 
+const STANDARD_DENIED_ENV = {
+	OPENAI_API_KEY: "ambient-openai-secret",
+	ANTHROPIC_API_KEY: "ambient-anthropic-secret",
+	DATABASE_URL: "postgres://ambient-database-secret",
+	OMP_SESSION_DB_URL: "postgres://ambient-session-secret",
+	OMP_SESSION_DB_PASSWORD: "ambient-session-password",
+	JWT_SECRET: "ambient-jwt-secret",
+	JWT_SIGNING_KEY: "ambient-jwt-signing-key",
+	AGENTDESK_API_KEY: "ambient-agentdesk-secret",
+	AGENTDESK_CONTROL_TOKEN: "ambient-agentdesk-control-secret",
+	NPM_TOKEN: "ambient-npm-secret",
+	CUSTOM_CREDENTIAL: "ambient-custom-credential",
+	INTERNAL_SERVICE_SECRET: "ambient-service-secret",
+} as const;
+
+function envPresenceCommand(keys: readonly string[]): string {
+	return keys.map(key => `printf '%s=%s\\n' '${key}' "\${${key}+x}"`).join("; ");
+}
+
+function parseEnvPresence(output: string): Record<string, boolean> {
+	const presence: Record<string, boolean> = {};
+	for (const line of output.split("\n")) {
+		const match = /^([A-Z][A-Z0-9_]*)=(x?)$/.exec(line.trim());
+		if (match) presence[match[1]] = match[2] === "x";
+	}
+	return presence;
+}
+
+async function withProcessEnv<T>(env: Record<string, string | undefined>, run: () => Promise<T>): Promise<T> {
+	const saved = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
+	for (const [key, value] of Object.entries(env)) {
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	try {
+		return await run();
+	} finally {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
+}
+
 function makeTempDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "omp-bash-exec-"));
 }
@@ -172,6 +216,67 @@ describe("executeBash", () => {
 			env: { PI_TEST_ENV: "hello" },
 		});
 		expect(result.output.trim()).toBe("0:hello");
+	});
+
+	it("retains user runtime variables without exposing ambient service secrets", async () => {
+		const keys = ["PATH", "HOME", "OMP_TEST_SAFE_VARIABLE", ...Object.keys(STANDARD_DENIED_ENV)];
+
+		await withProcessEnv(
+			{
+				HOME: tempDir,
+				...STANDARD_DENIED_ENV,
+			},
+			async () => {
+				const result = await executeBash(envPresenceCommand(keys), {
+					cwd: tempDir,
+					timeout: 5000,
+					sessionKey: `ambient-env-${Date.now()}`,
+					env: { OMP_TEST_SAFE_VARIABLE: "explicit-safe-value" },
+				});
+				const presence = parseEnvPresence(result.output);
+
+				expect(result.exitCode).toBe(0);
+				expect(presence.PATH).toBe(true);
+				expect(presence.HOME).toBe(true);
+				expect(presence.OMP_TEST_SAFE_VARIABLE).toBe(true);
+				expect(
+					Object.keys(STANDARD_DENIED_ENV).filter(key => presence[key]),
+					"Bash children must not inherit provider, database, identity, or generic credential secrets",
+				).toEqual([]);
+			},
+		);
+	});
+
+	it("rejects denied per-command env without dropping an explicit safe variable", async () => {
+		const explicitlyDenied = {
+			ANTHROPIC_API_KEY: "explicit-provider-secret",
+			OMP_SESSION_DB_PASSWORD: "explicit-database-secret",
+			JWT_SIGNING_KEY: "explicit-jwt-secret",
+			AGENTDESK_CONTROL_TOKEN: "explicit-agentdesk-secret",
+			NPM_TOKEN: "explicit-npm-secret",
+			CUSTOM_CREDENTIAL: "explicit-custom-credential",
+			INTERNAL_SERVICE_SECRET: "explicit-service-secret",
+		};
+		const keys = ["PATH", "HOME", "OMP_EXPLICIT_SAFE_VARIABLE", ...Object.keys(explicitlyDenied)];
+
+		await withProcessEnv(Object.fromEntries(Object.keys(explicitlyDenied).map(key => [key, undefined])), async () => {
+			const result = await executeBash(envPresenceCommand(keys), {
+				cwd: tempDir,
+				timeout: 5000,
+				sessionKey: `explicit-env-${Date.now()}`,
+				env: { OMP_EXPLICIT_SAFE_VARIABLE: "explicit-safe-value", ...explicitlyDenied },
+			});
+			const presence = parseEnvPresence(result.output);
+
+			expect(result.exitCode).toBe(0);
+			expect(presence.PATH).toBe(true);
+			expect(presence.HOME).toBe(true);
+			expect(presence.OMP_EXPLICIT_SAFE_VARIABLE).toBe(true);
+			expect(
+				Object.keys(explicitlyDenied).filter(key => presence[key]),
+				"per-command env must not bypass the Bash child secret boundary",
+			).toEqual([]);
+		});
 	});
 
 	it("runs non-bash shellPath commands through the configured shell", async () => {

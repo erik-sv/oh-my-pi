@@ -112,6 +112,55 @@ describe("openPath", () => {
 		expect(spawnCalls.map(call => call.cmd)).toEqual([["wslview", windowsPath]]);
 	});
 
+	it("strips ambient secrets from the WSL path converter child", () => {
+		setPlatform("linux");
+		const poisoned = {
+			WSL_DISTRO_NAME: "Ubuntu",
+			WSL_INTEROP: "/run/WSL/1_interop",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		vi.spyOn(piUtils, "$which").mockImplementation(command => (command === "wslview" ? "/usr/bin/wslview" : null));
+		vi.spyOn(fs, "existsSync").mockImplementation(candidate => candidate === existingLinuxPath);
+		const spawnCalls: SpawnCall[] = [];
+		spySpawn(spawnCalls);
+		let converterOptions: SpawnSyncOptions | undefined;
+		vi.spyOn(Bun, "spawnSync").mockImplementation(((_cmd: string[], options?: SpawnSyncOptions) => {
+			converterOptions = options;
+			return {
+				stdout: Buffer.from(windowsPath),
+				stderr: null,
+				exitCode: 0,
+				success: true,
+				resourceUsage: {},
+				pid: 1,
+			} as unknown as Bun.SyncSubprocess<"pipe", "ignore">;
+		}) as typeof Bun.spawnSync);
+
+		try {
+			openPath(existingLinuxPath);
+			expect(spawnCalls.map(call => call.cmd)).toEqual([["wslview", windowsPath]]);
+			expect(converterOptions?.env).toEqual(
+				expect.objectContaining({ WSL_DISTRO_NAME: "Ubuntu", WSL_INTEROP: "/run/WSL/1_interop" }),
+			);
+			expect(converterOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(converterOptions?.env).not.toHaveProperty("DATABASE_URL");
+			expect(converterOptions?.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(converterOptions?.env).not.toHaveProperty("JWT_SECRET");
+			expect(converterOptions?.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	it("keeps WSL URL opening on xdg-open without path conversion", () => {
 		setPlatform("linux");
 		process.env.WSL_INTEROP = "/run/WSL/1_interop";
@@ -124,6 +173,48 @@ describe("openPath", () => {
 
 		expect(spawnSyncSpy).not.toHaveBeenCalled();
 		expect(spawnCalls.map(call => call.cmd)).toEqual([["xdg-open", "https://example.com"]]);
+	});
+
+	it("preserves desktop session env but strips ambient secrets from the opener", () => {
+		setPlatform("linux");
+		const poisoned = {
+			DISPLAY: ":89",
+			WAYLAND_DISPLAY: "wayland-89",
+			XDG_RUNTIME_DIR: "/tmp/omp-open-runtime",
+			DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/omp-open-bus",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const calls: SpawnCall[] = [];
+		spySpawn(calls);
+
+		try {
+			openPath("https://example.com/session-env");
+			const childEnv = calls[0]?.options.env;
+			expect(childEnv).toEqual(
+				expect.objectContaining({
+					DISPLAY: ":89",
+					WAYLAND_DISPLAY: "wayland-89",
+					XDG_RUNTIME_DIR: "/tmp/omp-open-runtime",
+					DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/omp-open-bus",
+				}),
+			);
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("DATABASE_URL");
+			expect(childEnv).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(childEnv).not.toHaveProperty("JWT_SECRET");
+			expect(childEnv).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 
 	it("falls back to xdg-open when wslview is unavailable", () => {

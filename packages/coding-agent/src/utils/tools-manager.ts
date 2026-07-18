@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which, APP_NAME, getToolsDir, logger, ptree, TempDir } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import { extractArchive } from "./zip";
 
 const TOOLS_DIR = getToolsDir();
@@ -318,7 +319,9 @@ async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<
 		// Try uv first (faster, better isolation)
 		const uv = $which("uv");
 		if (uv) {
+			const env = buildChildEnv("package-installer", { parentEnv: Bun.env });
 			const result = await ptree.exec([uv, "tool", "install", pkg], {
+				env,
 				signal,
 				allowNonZero: true,
 				allowAbort: true,
@@ -330,7 +333,9 @@ async function installPythonPackage(pkg: string, signal?: AbortSignal): Promise<
 		// Fall back to pip
 		const pip = $which("pip3") || $which("pip");
 		if (pip) {
+			const env = buildChildEnv("package-installer", { parentEnv: Bun.env });
 			const result = await ptree.exec([pip, "install", "--user", pkg], {
+				env,
 				signal,
 				allowNonZero: true,
 				allowAbort: true,

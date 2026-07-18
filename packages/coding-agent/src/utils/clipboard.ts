@@ -1,6 +1,7 @@
 import type { ClipboardImage } from "@oh-my-pi/pi-natives";
 import * as native from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 
 /**
  * Run a subprocess and capture its stdout without blocking the event loop.
@@ -20,6 +21,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 async function spawnCapture(cmd: string[], options: { input?: string; timeoutMs?: number } = {}): Promise<string> {
 	const timeoutMs = options.timeoutMs ?? 2000;
 	const proc = Bun.spawn(cmd, {
+		env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
 		stdout: "pipe",
 		stderr: "ignore",
 		stdin: options.input !== undefined ? Buffer.from(options.input) : "ignore",
@@ -195,6 +197,7 @@ async function readImageViaPowerShell(): Promise<ClipboardImage | null> {
 		const proc = Bun.spawn(
 			["powershell.exe", "-NoProfile", "-NonInteractive", "-Sta", "-Command", POWERSHELL_IMAGE_SCRIPT],
 			{
+				env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
 				stdout: "pipe",
 				stderr: "ignore",
 				stdin: "ignore",
@@ -253,6 +256,7 @@ $ErrorActionPreference = 'Stop'
 async function readTextViaPowerShell(): Promise<string | null> {
 	try {
 		const proc = Bun.spawn(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", POWERSHELL_TEXT_SCRIPT], {
+			env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
 			stdout: "pipe",
 			stderr: "ignore",
 			stdin: "ignore",

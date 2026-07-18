@@ -4,7 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { isEexist, isEisdir, isEnoent, postmortem } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
-import { resolveWorkerSpawnCmd, workerEnvFromParent } from "../subprocess/worker-client";
+import { buildChildEnv } from "../exec/child-env";
+import { resolveWorkerSpawnCmd } from "../subprocess/worker-client";
 import { daemonBrokerEndpoint, daemonRuntimeDir } from "./paths";
 import {
 	DAEMON_BROKER_WORKER_ARG,
@@ -230,7 +231,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		if (this.#idleGraceMs !== undefined) overlay[DAEMON_IDLE_GRACE_ENV] = String(this.#idleGraceMs);
 		const child = Bun.spawn(spawn.cmd, {
 			cwd: spawn.cwd,
-			env: workerEnvFromParent(overlay),
+			env: buildChildEnv("managed-daemon", { parentEnv: Bun.env, explicitEnv: overlay }),
 			stdin: "ignore",
 			stdout: "ignore",
 			stderr: "ignore",

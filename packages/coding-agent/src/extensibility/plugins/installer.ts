@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, getProjectDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../../exec/child-env";
 import { extractPackageName } from "./parser";
 import type { InstalledPlugin } from "./types";
 
@@ -46,6 +47,7 @@ export async function installPlugin(packageName: string): Promise<InstalledPlugi
 
 	// Run npm install in plugins directory
 	const proc = Bun.spawn(["bun", "install", packageName], {
+		env: buildChildEnv("extension-installer", { parentEnv: Bun.env }),
 		cwd: PLUGINS_DIR,
 		stdin: "ignore",
 		stdout: "pipe",
@@ -93,6 +95,7 @@ export async function uninstallPlugin(name: string): Promise<void> {
 	await ensurePluginsDir();
 
 	const proc = Bun.spawn(["bun", "uninstall", name], {
+		env: buildChildEnv("extension-installer", { parentEnv: Bun.env }),
 		cwd: PLUGINS_DIR,
 		stdin: "ignore",
 		stdout: "pipe",

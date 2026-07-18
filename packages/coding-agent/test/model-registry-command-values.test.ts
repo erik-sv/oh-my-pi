@@ -89,6 +89,85 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		expect(model?.headers?.Authorization).toBe("Bearer cmd-api-key");
 	});
 
+	test("provider commands retain provider credentials without inheriting storage, JWT, or control-plane secrets", async () => {
+		const poisoned = {
+			ANTHROPIC_API_KEY: "ambient-anthropic-key",
+			OPENAI_API_KEY: "ambient-openai-key",
+			DATABASE_URL: "postgres://ambient-database-secret",
+			OMP_SESSION_DB_URL: "postgres://ambient-session-secret",
+			OMP_SESSION_DB_OPTIONS: "ambient-session-options",
+			JWT_SECRET: "ambient-jwt-secret",
+			AGENTDESK_API_KEY: "ambient-agentdesk-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+		};
+		const innerScript = `process.stdout.write(JSON.stringify({ ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY, DATABASE_URL: process.env.DATABASE_URL, OMP_SESSION_DB_URL: process.env.OMP_SESSION_DB_URL, OMP_SESSION_DB_OPTIONS: process.env.OMP_SESSION_DB_OPTIONS, JWT_SECRET: process.env.JWT_SECRET, AGENTDESK_API_KEY: process.env.AGENTDESK_API_KEY, AGENTDESK_CONTROL_TOKEN: process.env.AGENTDESK_CONTROL_TOKEN }))`;
+		const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(innerScript)}`;
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					"provider-command-env": {
+						baseUrl: "https://provider-command.example.com/v1",
+						api: "openai-completions",
+						apiKey: `!${command}`,
+						models: [{ id: "env-probe", name: "Environment Probe" }],
+					},
+				},
+			}),
+		);
+
+		const probePath = path.join(tempDir, "provider-command-probe.ts");
+		const registryModule = path.join(import.meta.dir, "../src/config/model-registry.ts");
+		const authStorageModule = path.join(import.meta.dir, "../src/session/auth-storage.ts");
+		fs.writeFileSync(
+			probePath,
+			[
+				`import { ModelRegistry } from ${JSON.stringify(registryModule)};`,
+				`import { AuthStorage } from ${JSON.stringify(authStorageModule)};`,
+				`const storage = await AuthStorage.create(":memory:");`,
+				`try {`,
+				`  const registry = new ModelRegistry(storage, ${JSON.stringify(modelsPath)});`,
+				`  const model = registry.find("provider-command-env", "env-probe");`,
+				`  if (!model) throw new Error("env probe model missing");`,
+				`  const value = await registry.getApiKey(model);`,
+				`  if (!value) throw new Error("provider command returned no value");`,
+				`  process.stdout.write(value);`,
+				`} finally { storage.close(); }`,
+			].join("\n"),
+		);
+
+		const child = Bun.spawn([process.execPath, probePath], {
+			env: {
+				PATH: Bun.env.PATH ?? "/usr/bin:/bin",
+				HOME: Bun.env.HOME ?? tempDir,
+				TMPDIR: tempDir,
+				...poisoned,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+		const observed = JSON.parse(stdout) as Record<string, string | undefined>;
+
+		expect(observed.ANTHROPIC_API_KEY).toBe(poisoned.ANTHROPIC_API_KEY);
+		expect(observed.OPENAI_API_KEY).toBe(poisoned.OPENAI_API_KEY);
+		for (const key of [
+			"DATABASE_URL",
+			"OMP_SESSION_DB_URL",
+			"OMP_SESSION_DB_OPTIONS",
+			"JWT_SECRET",
+			"AGENTDESK_API_KEY",
+			"AGENTDESK_CONTROL_TOKEN",
+		]) {
+			expect(observed[key], `${key} must not cross the provider command boundary`).toBeUndefined();
+		}
+	});
+
 	test("resolveCommandConfig caches failed executions so they do not retry", async () => {
 		const counterFile = path.join(tempDir, "counter.txt");
 		fs.writeFileSync(counterFile, "0");

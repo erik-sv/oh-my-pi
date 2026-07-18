@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import type { Subprocess } from "bun";
 import type { SSHConnectionTarget } from "../connection-manager";
 import * as connectionManager from "../connection-manager";
 import { listRemoteDir, readRemoteFile, statRemotePath, writeRemoteFile } from "../file-transfer";
+
+interface SpawnOptions {
+	env?: Record<string, string | undefined>;
+}
 
 describe("ssh file-transfer POSIX guard", () => {
 	afterEach(() => {
@@ -101,5 +106,58 @@ describe("ssh file-transfer POSIX guard", () => {
 
 		await expect(readRemoteFile(target, "/etc/hosts", { maxBytes: 1024 })).rejects.toThrow(/stop-before-spawn/);
 		expect(buildSpy.mock.calls[0]?.[1]).toMatch(/^sh -c '.*head -c 1025/);
+	});
+
+	it("keeps the SSH agent socket but strips ambient secrets from file-transfer children", async () => {
+		vi.spyOn(connectionManager, "ensureConnection").mockResolvedValue(undefined);
+		vi.spyOn(connectionManager, "ensureHostInfo").mockResolvedValue({
+			version: 4,
+			os: "linux",
+			shell: "sh",
+			transferShell: "sh",
+			compatEnabled: false,
+		});
+		vi.spyOn(connectionManager, "buildRemoteCommand").mockResolvedValue(["test-host", "sh -c 'cat'"]);
+		const poisoned = {
+			SSH_AUTH_SOCK: "/tmp/omp-transfer-agent.sock",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		let spawnOptions: SpawnOptions | undefined;
+		const spawn = vi.spyOn(Bun, "spawn").mockImplementation(((_cmd: string[], options?: SpawnOptions) => {
+			spawnOptions = options;
+			return {
+				pid: 12345,
+				stdout: new Response("ok").body,
+				stderr: new Response("").body,
+				exitCode: 0,
+				exited: Promise.resolve(0),
+				kill: () => true,
+			} as unknown as Subprocess;
+		}) as typeof Bun.spawn);
+
+		try {
+			const result = await readRemoteFile({ name: "env-host", host: "env-host" }, "/tmp/value", {
+				maxBytes: 32,
+			});
+			expect(new TextDecoder().decode(result.bytes)).toBe("ok");
+			expect(spawnOptions?.env).toEqual(expect.objectContaining({ SSH_AUTH_SOCK: "/tmp/omp-transfer-agent.sock" }));
+			expect(spawnOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(spawnOptions?.env).not.toHaveProperty("DATABASE_URL");
+			expect(spawnOptions?.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(spawnOptions?.env).not.toHaveProperty("JWT_SECRET");
+			expect(spawnOptions?.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			spawn.mockRestore();
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 });

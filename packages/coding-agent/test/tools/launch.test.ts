@@ -1,10 +1,14 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
 import { registerDaemonProjectPresence } from "../../src/launch/presence";
 import type { DaemonSpec } from "../../src/launch/protocol";
+
+interface SpawnOptions {
+	env?: Record<string, string | undefined>;
+}
 
 const cleanupDirs: string[] = [];
 
@@ -51,6 +55,7 @@ async function startPtyDaemonWithShell(shell: string, initialMarker: string, exp
 		const projectDir = ${JSON.stringify(projectDir)};
 		const runtimeDir = ${JSON.stringify(runtimeDir)};
 		const expectedMarker = ${JSON.stringify(expectedMarker)};
+		const initialMarker = ${JSON.stringify(initialMarker)};
 		const client = await createDaemonBrokerClient(projectDir, {
 			runtimeDir,
 			idleGraceMs: 5_000,
@@ -63,9 +68,9 @@ async function startPtyDaemonWithShell(shell: string, initialMarker: string, exp
 					application: process.execPath,
 					args: [
 						"-e",
-						"process.stdout.write(process.env.OMP_TEST_SHELL_MARKER); process.stdout.write(String.fromCharCode(10)); process.stdin.resume();",
+						"process.stdout.write('OMP_TEST_ENV:' + JSON.stringify({ shellMarker: process.env.OMP_TEST_SHELL_MARKER, ambientSecret: process.env.OMP_TEST_AMBIENT_SECRET }) + String.fromCharCode(10)); process.stdin.resume();",
 					],
-					env: {},
+					env: { OMP_TEST_SHELL_MARKER: initialMarker },
 					cwd: projectDir,
 					pty: true,
 					ready: { log: expectedMarker, timeoutMs: 5_000 },
@@ -92,7 +97,27 @@ async function startPtyDaemonWithShell(shell: string, initialMarker: string, exp
 						(logs.op === "logs" ? logs.text : "unavailable"),
 				);
 			}
-			process.stdout.write(JSON.stringify({ state: started.daemon.state, readyTimedOut: started.readyTimedOut }));
+			const logs = await client.request({
+				op: "logs",
+				name: "shell",
+				lines: 20,
+				head: false,
+				follow: false,
+				timeoutMs: 1_000,
+			});
+			if (logs.op !== "logs") throw new Error("unexpected logs response");
+			const envLine = logs.text
+				.split(String.fromCharCode(10))
+				.find(line => line.includes("OMP_TEST_ENV:"));
+			const encodedEnv = envLine?.slice(envLine.indexOf("OMP_TEST_ENV:") + "OMP_TEST_ENV:".length).trim();
+			if (!encodedEnv) throw new Error("missing child environment output: " + logs.text);
+			process.stdout.write(
+				JSON.stringify({
+					state: started.daemon.state,
+					readyTimedOut: started.readyTimedOut,
+					childEnv: JSON.parse(encodedEnv),
+				}),
+			);
 			await client.request({ op: "stop", name: "shell", timeoutMs: 2_000 });
 		} finally {
 			try {
@@ -108,7 +133,7 @@ async function startPtyDaemonWithShell(shell: string, initialMarker: string, exp
 		env: {
 			...process.env,
 			SHELL: shell,
-			OMP_TEST_SHELL_MARKER: initialMarker,
+			OMP_TEST_AMBIENT_SECRET: "must-not-reach-managed-daemon",
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -119,7 +144,13 @@ async function startPtyDaemonWithShell(shell: string, initialMarker: string, exp
 		new Response(child.stderr).text(),
 	]);
 	expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
-	expect(JSON.parse(stdout)).toEqual({ state: "ready", readyTimedOut: false });
+	const result = JSON.parse(stdout);
+	expect({ state: result.state, readyTimedOut: result.readyTimedOut }).toEqual({
+		state: "ready",
+		readyTimedOut: false,
+	});
+	expect(result.childEnv.shellMarker).toBe(expectedMarker);
+	expect(result.childEnv).not.toHaveProperty("ambientSecret");
 }
 
 afterEach(async () => {
@@ -130,6 +161,172 @@ afterEach(async () => {
 });
 
 describe("daemon broker", () => {
+	it("starts the broker with only daemon control env and safe runtime values", async () => {
+		const projectDir = await tempDir("omp-daemon-broker-env-project-");
+		const runtimeDir = await tempDir("omp-daemon-broker-env-runtime-");
+		const poisoned = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 4_321 });
+		let brokerOptions: SpawnOptions | undefined;
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[], options?: SpawnOptions) => {
+			if (cmd.some(arg => arg === "__omp_worker_daemon_broker")) brokerOptions = options;
+			throw new Error("captured broker spawn");
+		}) as unknown as typeof Bun.spawn);
+
+		try {
+			await expect(client.request({ op: "ping" })).rejects.toThrow("captured broker spawn");
+			expect(brokerOptions?.env).toEqual(
+				expect.objectContaining({
+					OMP_DAEMON_PROJECT_DIR: client.projectDir,
+					OMP_DAEMON_RUNTIME_DIR: runtimeDir,
+					OMP_DAEMON_IDLE_GRACE_MS: "4321",
+				}),
+			);
+			expect(brokerOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(brokerOptions?.env).not.toHaveProperty("DATABASE_URL");
+			expect(brokerOptions?.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(brokerOptions?.env).not.toHaveProperty("JWT_SECRET");
+			expect(brokerOptions?.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			client.close();
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			vi.restoreAllMocks();
+		}
+	});
+
+	it("persists daemon specs with env as owner-only metadata", async () => {
+		const projectDir = await tempDir("omp-daemon-metadata-project-");
+		const runtimeDir = await tempDir("omp-daemon-metadata-runtime-");
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		let startedDaemon = false;
+		try {
+			const started = await client.request({
+				op: "start",
+				spec: {
+					name: "secret-metadata",
+					application: process.execPath,
+					args: ["--eval", "process.stdin.resume()"],
+					env: { PRIVATE_DAEMON_SECRET: "persisted-secret" },
+					cwd: projectDir,
+					pty: false,
+					restart: "no",
+					persist: false,
+					detached: false,
+				},
+			});
+			if (started.op !== "start") throw new Error("daemon did not start");
+			startedDaemon = true;
+
+			const metadataPath = path.join(runtimeDir, "daemons", "secret-metadata", "meta.json");
+			const metadata = await Bun.file(metadataPath).json();
+			expect(metadata).toEqual(
+				expect.objectContaining({
+					spec: expect.objectContaining({ env: { PRIVATE_DAEMON_SECRET: "persisted-secret" } }),
+				}),
+			);
+			if (process.platform !== "win32") {
+				const metadataStat = await fs.stat(metadataPath);
+				expect(metadataStat.mode & 0o777).toBe(0o600);
+			}
+		} finally {
+			try {
+				if (startedDaemon) await client.request({ op: "stop", name: "secret-metadata", timeoutMs: 2_000 });
+			} finally {
+				await shutdown(client);
+			}
+		}
+	}, 20_000);
+
+	it("keeps explicit daemon env but strips ambient secrets in PTY, pipe, and detached children", async () => {
+		const projectDir = await tempDir("omp-daemon-child-env-project-");
+		const runtimeDir = await tempDir("omp-daemon-child-env-runtime-");
+		const poisoned = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const observed: Array<{ mode: string; env: Record<string, string | undefined> }> = [];
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+
+		try {
+			for (const mode of [
+				{ name: "pty-env", pty: true, detached: false },
+				{ name: "pipe-env", pty: false, detached: false },
+				{ name: "detached-env", pty: false, detached: true },
+			]) {
+				const script = `process.stdout.write("OMP_ENV:" + JSON.stringify({
+					EXPLICIT_DAEMON_SECRET: process.env.EXPLICIT_DAEMON_SECRET,
+					SERVER_PORT: process.env.SERVER_PORT,
+					TERM: process.env.TERM,
+					ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+					DATABASE_URL: process.env.DATABASE_URL,
+					AGENTDESK_CONTROL_TOKEN: process.env.AGENTDESK_CONTROL_TOKEN,
+					JWT_SECRET: process.env.JWT_SECRET,
+					GENERIC_SERVICE_SECRET: process.env.GENERIC_SERVICE_SECRET,
+				}) + "\\n"); process.stdin.resume();`;
+				const started = await client.request({
+					op: "start",
+					spec: {
+						name: mode.name,
+						application: process.execPath,
+						args: ["--eval", script],
+						env: { EXPLICIT_DAEMON_SECRET: `configured-${mode.name}`, SERVER_PORT: "4141" },
+						cwd: projectDir,
+						pty: mode.pty,
+						ready: { log: "OMP_ENV:", timeoutMs: 5_000 },
+						restart: "no",
+						persist: false,
+						detached: mode.detached,
+					},
+				});
+				if (started.op !== "start") throw new Error(`unexpected start response for ${mode.name}`);
+				const logs = await client.request({
+					op: "logs",
+					name: mode.name,
+					lines: 20,
+					head: false,
+					follow: false,
+					timeoutMs: 1_000,
+				});
+				if (logs.op !== "logs") throw new Error(`unexpected logs response for ${mode.name}`);
+				const encoded = logs.text.match(/OMP_ENV:(\{[^\r\n]*\})/)?.[1];
+				if (!encoded) throw new Error(`missing env output for ${mode.name}: ${logs.text}`);
+				observed.push({ mode: mode.name, env: JSON.parse(encoded) });
+				await client.request({ op: "stop", name: mode.name, timeoutMs: 2_000 });
+			}
+
+			for (const { mode, env } of observed) {
+				expect(env.EXPLICIT_DAEMON_SECRET).toBe(`configured-${mode}`);
+				expect(env.SERVER_PORT).toBe("4141");
+				if (mode === "pty-env") expect(env.TERM).toBe("xterm-256color");
+				expect(env).not.toHaveProperty("ANTHROPIC_API_KEY");
+				expect(env).not.toHaveProperty("DATABASE_URL");
+				expect(env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+				expect(env).not.toHaveProperty("JWT_SECRET");
+				expect(env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+			}
+		} finally {
+			await shutdown(client);
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}, 30_000);
 	it("shares PTY output and input across project clients", async () => {
 		const projectDir = await tempDir("omp-daemon-project-");
 		const runtimeDir = await tempDir("omp-daemon-runtime-");

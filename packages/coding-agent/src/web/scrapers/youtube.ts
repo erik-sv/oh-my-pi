@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ptree, Snowflake } from "@oh-my-pi/pi-utils";
 import { settings } from "../../config/settings";
+import { buildChildEnv } from "../../exec/child-env";
 import type { AgentStorage } from "../../session/agent-storage";
 import { throwIfAborted } from "../../tools/tool-errors";
 import { ensureTool } from "../../utils/tools-manager";
@@ -166,6 +167,7 @@ export const handleYouTube: SpecialHandler = async (
 		allowNonZero: true,
 		allowAbort: true,
 		stderr: "full" as const,
+		env: buildChildEnv("network-helper", { parentEnv: Bun.env }),
 	};
 
 	// Fetch video metadata

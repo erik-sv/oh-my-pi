@@ -4,13 +4,15 @@
  * Note: command execution is async to avoid blocking the TUI.
  */
 
-import { executeShell } from "@oh-my-pi/pi-natives";
+import { buildChildEnv } from "../exec/child-env";
 
 /** Cache for successful shell command results (persists for process lifetime). */
 const commandResultCache = new Map<string, string>();
 
 /** De-duplicates concurrent executions for the same command. */
 const commandInFlight = new Map<string, Promise<string | undefined>>();
+
+const commandEnv = buildChildEnv("provider-agent-child", { parentEnv: Bun.env });
 
 /**
  * Resolve a config value (API key, header value, etc.) to an actual value.
@@ -54,16 +56,20 @@ async function executeCommand(commandConfig: string): Promise<string | undefined
 
 async function runShellCommand(command: string, timeoutMs: number): Promise<string | undefined> {
 	try {
-		let output = "";
-		const result = await executeShell({ command, timeoutMs }, (err, chunk) => {
-			if (!err) {
-				output += chunk;
-			}
+		const shell = process.platform === "win32" ? (Bun.env.COMSPEC ?? "cmd.exe") : (Bun.env.SHELL ?? "/bin/sh");
+		const shellArgs = process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-c", command];
+		const child = Bun.spawn([shell, ...shellArgs], {
+			env: commandEnv,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "ignore",
+			windowsHide: true,
 		});
-		if (result.timedOut || result.exitCode !== 0) {
-			return undefined;
-		}
-		const trimmed = output.trim();
+		const timeout = setTimeout(() => child.kill(), timeoutMs);
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		clearTimeout(timeout);
+		if (exitCode !== 0) return undefined;
+		const trimmed = stdout.trim();
 		return trimmed.length > 0 ? trimmed : undefined;
 	} catch {
 		return undefined;

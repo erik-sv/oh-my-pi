@@ -8,6 +8,7 @@ import { $which, APP_NAME, getProjectDir, getPythonEnvDir } from "@oh-my-pi/pi-u
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings, settings } from "../config/settings";
+import { buildChildEnv } from "../exec/child-env";
 import { theme } from "../modes/theme/theme";
 import { downloadSttModel, isSttModelCached } from "../stt/downloader";
 import { isSttModelKey, STT_MODEL_OPTIONS } from "../stt/models";
@@ -97,7 +98,8 @@ async function checkPythonSetup(): Promise<PythonCheckResult> {
 	if (!pythonPath) {
 		return result;
 	}
-	const probe = await $`${pythonPath} -c "import sys;sys.exit(0)"`.quiet().nothrow();
+	const probeEnv = buildChildEnv("package-installer", { parentEnv: Bun.env });
+	const probe = await $`${pythonPath} -c "import sys;sys.exit(0)"`.env(probeEnv).quiet().nothrow();
 	result.pythonPath = pythonPath;
 	result.available = probe.exitCode === 0;
 	result.usingManagedEnv = pythonPath === managedPath;

@@ -37,6 +37,7 @@ import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, isEnoent, logger, V
 import { setTransports as setLoggerTransports } from "@oh-my-pi/pi-utils/logger";
 import { $ } from "bun";
 import chalk from "chalk";
+import { buildChildEnv } from "../exec/child-env";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 
 export type AuthBrokerAction = "serve" | "token" | "login" | "logout" | "status" | "import" | "migrate" | "list";
@@ -360,6 +361,7 @@ async function runRemoteLogin(provider: string, via: string, dryRun: boolean): P
 	}
 	const proc = Bun.spawn({
 		cmd: [sshBin, ...sshArgs],
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",

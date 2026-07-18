@@ -6,6 +6,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, Snowflake } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 
 /**
  * Returns the user's preferred editor command, or a platform default.
@@ -54,7 +55,11 @@ export async function openInEditor(
 		const [editor, ...editorArgs] = editorCmd.split(" ");
 		const stdio = options?.stdio ?? ["inherit", "inherit", "inherit"];
 
-		const child = spawn(editor, [...editorArgs, tmpFile], { stdio, shell: process.platform === "win32" });
+		const child = spawn(editor, [...editorArgs, tmpFile], {
+			env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
+			stdio,
+			shell: process.platform === "win32",
+		});
 		const { promise, reject, resolve } = Promise.withResolvers<number>();
 		child.once("exit", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
 		child.once("error", error => reject(error));

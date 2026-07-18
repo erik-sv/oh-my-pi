@@ -2,6 +2,7 @@
  * Shared command execution utilities for hooks and custom tools.
  */
 import { ptree } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "./child-env";
 
 /**
  * Options for executing shell commands.
@@ -13,6 +14,8 @@ export interface ExecOptions {
 	timeout?: number;
 	/** Working directory */
 	cwd?: string;
+	/** Explicit environment additions. Forbidden secret values are discarded. */
+	env?: Record<string, string | undefined>;
 }
 
 /**
@@ -35,8 +38,16 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
+	const explicitEnv = options?.env
+		? {
+				...buildChildEnv("shell-snapshot", { parentEnv: options.env }),
+				...buildChildEnv("repo-tool", { parentEnv: options.env }),
+			}
+		: undefined;
+	const env = buildChildEnv("repo-tool", { parentEnv: Bun.env, explicitEnv });
 	const result = await ptree.exec([command, ...args], {
 		cwd,
+		env,
 		signal: options?.signal,
 		timeout: options?.timeout,
 		allowNonZero: true,

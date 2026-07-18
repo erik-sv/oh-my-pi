@@ -4,6 +4,7 @@
  */
 import path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../../exec/child-env";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 // =============================================================================
@@ -96,6 +97,7 @@ async function runBiome(
 
 	try {
 		const proc = Bun.spawn([command, ...args], {
+			env: buildChildEnv("model-child", { parentEnv: Bun.env }),
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",

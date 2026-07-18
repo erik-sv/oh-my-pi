@@ -12,6 +12,7 @@ import { APP_NAME, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
 import { buildMinimizerOptions } from "../exec/bash-executor";
+import { buildChildEnv, getDeniedChildEnvNames } from "../exec/child-env";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
 
 export interface ShellCommandArgs {
@@ -141,6 +142,10 @@ export function createShellCompleter(getCwd: () => string): ShellCompleter {
 	};
 }
 
+function quoteShellWord(value: string): string {
+	return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 export function parsePwdOutput(output: string): string | null {
 	const lines = output.split("\n");
 	for (let i = lines.length - 1; i >= 0; i -= 1) {
@@ -196,9 +201,13 @@ export async function runShellCommand(cmd: ShellCommandArgs): Promise<void> {
 	const cwd = cmd.cwd ? path.resolve(cmd.cwd) : getProjectDir();
 	const settings = await Settings.init({ cwd });
 	const { shell, env: shellEnv } = settings.getShellConfig();
-	const snapshotPath = cmd.noSnapshot || !shell.includes("bash") ? null : await getOrCreateSnapshot(shell, shellEnv);
+	const parentEnv = { ...process.env, ...shellEnv };
+	const sessionEnv = buildChildEnv("direct-user-shell", { parentEnv });
+	const deniedNames = getDeniedChildEnvNames("direct-user-shell", parentEnv);
+	const cleanupPrefix = deniedNames.length > 0 ? `unset ${deniedNames.map(quoteShellWord).join(" ")}; ` : "";
+	const snapshotPath = cmd.noSnapshot || !shell.includes("bash") ? null : await getOrCreateSnapshot(shell, sessionEnv);
 	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
-	const shellSession = new Shell({ sessionEnv: shellEnv, snapshotPath: snapshotPath ?? undefined, minimizer });
+	const shellSession = new Shell({ sessionEnv, snapshotPath: snapshotPath ?? undefined, minimizer });
 
 	let active = false;
 	let lastChar: string | null = null;
@@ -268,7 +277,7 @@ export async function runShellCommand(cmd: ShellCommandArgs): Promise<void> {
 			try {
 				const result = await shellSession.run(
 					{
-						command: line,
+						command: `${cleanupPrefix}${line}`,
 						cwd: shellCwd,
 						timeoutMs: cmd.timeoutMs,
 					},

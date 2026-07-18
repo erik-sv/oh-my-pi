@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { $which, getPuppeteerDir, logger } from "@oh-my-pi/pi-utils";
 import type * as BrowsersNs from "@puppeteer/browsers";
 import type { Browser, CDPSession, Page, default as Puppeteer, Target } from "puppeteer-core";
+import { buildChildEnv } from "../../exec/child-env";
 import stealthTamperingScript from "../puppeteer/00_stealth_tampering.txt" with { type: "text" };
 import stealthActivityScript from "../puppeteer/01_stealth_activity.txt" with { type: "text" };
 import stealthHairlineScript from "../puppeteer/02_stealth_hairline.txt" with { type: "text" };
@@ -313,6 +314,7 @@ export async function launchHeadlessBrowser(opts: LaunchHeadlessOptions): Promis
 		headless: opts.headless,
 		defaultViewport: opts.headless ? initialViewport : null,
 		executablePath,
+		env: buildChildEnv("browser-app", { parentEnv: Bun.env }),
 		args: launchArgs,
 		ignoreDefaultArgs: stealthIgnoreDefaultArgs(executablePath),
 		protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,

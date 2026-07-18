@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, untilAborted } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import { MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit } from "./edits";
@@ -718,7 +719,7 @@ export async function getOrCreateClient(
 		const proc = ptree.spawn([command, ...args], {
 			cwd,
 			stdin: "pipe",
-			env: env ? { ...Bun.env, ...env } : undefined,
+			env: buildChildEnv("model-child", { parentEnv: Bun.env, explicitEnv: env }),
 		});
 
 		let resolveProjectLoaded!: () => void;

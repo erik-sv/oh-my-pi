@@ -10,6 +10,7 @@ import {
 	parseNumstat,
 } from "../commit/git/diff";
 import type { FileDiff, FileHunks, NumstatEntry } from "../commit/types";
+import { buildChildEnv } from "../exec/child-env";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -372,14 +373,12 @@ function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
 	return new Uint8Array(input);
 }
 
-function buildGitEnv(overrides?: Record<string, string | undefined>): Record<string, string | undefined> {
-	return {
-		...process.env,
-		GIT_OPTIONAL_LOCKS: "0",
-		...AMBIENT_GIT_ENV,
-		...overrides,
-		...GIT_NON_INTERACTIVE_ENV,
-	};
+function buildGitEnv(overrides?: Record<string, string | undefined>): Record<string, string> {
+	return buildChildEnv("repo-tool", {
+		parentEnv: Bun.env,
+		patches: [AMBIENT_GIT_ENV, { GIT_OPTIONAL_LOCKS: "0" }, GIT_NON_INTERACTIVE_ENV],
+		explicitEnv: overrides,
+	});
 }
 
 function ensureAvailable(): void {
@@ -2366,10 +2365,10 @@ export const github = {
 		try {
 			const child = Bun.spawn(["gh", ...args], {
 				cwd,
-				env: {
-					...process.env,
-					...GH_NON_INTERACTIVE_ENV,
-				},
+				env: buildChildEnv("repo-tool", {
+					parentEnv: Bun.env,
+					patches: GH_NON_INTERACTIVE_ENV,
+				}),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",

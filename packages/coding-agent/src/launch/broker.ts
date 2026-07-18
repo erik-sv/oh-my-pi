@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText } from "@oh-my-pi/pi-utils";
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
+import { buildChildEnv } from "../exec/child-env";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
-import { workerEnvFromParent } from "../subprocess/worker-client";
 import { daemonBrokerEndpoint } from "./paths";
 import { hasLiveDaemonProjectPresence } from "./presence";
 import {
@@ -534,7 +534,11 @@ class DaemonBroker {
 		record.pty = session;
 		const options = {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent({ TERM: "xterm-256color", ...record.spec.env }),
+			env: buildChildEnv("managed-daemon", {
+				parentEnv: Bun.env,
+				patches: { TERM: "xterm-256color" },
+				explicitEnv: record.spec.env,
+			}),
 			cols: DAEMON_PTY_COLUMNS,
 			rows: DAEMON_PTY_ROWS,
 		};
@@ -590,7 +594,7 @@ class DaemonBroker {
 	#launchPipe(record: ManagedDaemon, generation: number): void {
 		const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 			cwd: record.spec.cwd,
-			env: workerEnvFromParent(record.spec.env),
+			env: buildChildEnv("managed-daemon", { parentEnv: Bun.env, explicitEnv: record.spec.env }),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -615,7 +619,7 @@ class DaemonBroker {
 		try {
 			const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 				cwd: record.spec.cwd,
-				env: workerEnvFromParent(record.spec.env),
+				env: buildChildEnv("managed-daemon", { parentEnv: Bun.env, explicitEnv: record.spec.env }),
 				stdio: ["ignore", output.fd, output.fd],
 				...DAEMON_SPAWN_OPTIONS,
 			});
@@ -913,7 +917,11 @@ class DaemonBroker {
 		const tempPath = `${metaPath}.${process.pid}.tmp`;
 		record.persistQueue = record.persistQueue
 			.then(async () => {
-				await Bun.write(tempPath, JSON.stringify({ daemon: record.snapshot, spec: record.spec }));
+				await fs.writeFile(tempPath, JSON.stringify({ daemon: record.snapshot, spec: record.spec }), {
+					encoding: "utf8",
+					mode: 0o600,
+				});
+				if (process.platform !== "win32") await fs.chmod(tempPath, 0o600);
 				await fs.rename(tempPath, metaPath);
 			})
 			.catch(error => {

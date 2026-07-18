@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $env, $which, getPythonEnvDir } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../../exec/child-env";
 
 const DEFAULT_ENV_ALLOWLIST = new Set([
 	"PATH",
@@ -130,10 +131,11 @@ export interface PythonRuntime {
  * Removes sensitive API keys and limits to known-safe variables.
  */
 export function filterEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
-	const filtered: Record<string, string | undefined> = {};
+	const filtered: Record<string, string | undefined> = buildChildEnv("model-child", { parentEnv: env });
 	for (const [key, value] of Object.entries(env)) {
 		if (value === undefined) continue;
 		const normalizedKey = normalizeEnvKey(key);
+		if (normalizedKey.includes("AGENTDESK")) continue;
 		if (NORMALIZED_DENYLIST.has(normalizedKey)) continue;
 		if (NORMALIZED_ALLOWLIST.has(normalizedKey)) {
 			const destKey = normalizedKey === "PATH" ? "PATH" : key;

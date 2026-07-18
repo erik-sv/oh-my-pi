@@ -227,6 +227,21 @@ export class AgentLifecycleManager {
 		return park.promise;
 	}
 
+	/** Park every adopted agent that is currently idle, preserving its reviver. */
+	async parkIdleNow(): Promise<number> {
+		const ids: string[] = [];
+		for (const id of this.#adopted.keys()) {
+			const ref = this.#registry.get(id);
+			if (ref?.status === "idle" && ref.session) ids.push(id);
+		}
+		await Promise.all(ids.map(id => this.park(id)));
+		let parked = 0;
+		for (const id of ids) {
+			if (this.#registry.get(id)?.status === "parked") parked++;
+		}
+		return parked;
+	}
+
 	/**
 	 * Return the live session, reviving from the sessionFile if parked.
 	 * Throws a plain Error if the id is unknown or parked without a reviver.

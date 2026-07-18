@@ -11,6 +11,7 @@ import {
 	isEnoent,
 	logger,
 } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../../exec/child-env";
 import { withHostGuard } from "../utils";
 import { refreshBunGitCache } from "./bun-git-cache";
 import { type GitSource, parseGitUrl } from "./git-url";
@@ -474,6 +475,7 @@ export class PluginManager {
 
 			// Step 1: write the spec into plugins/package.json + node_modules.
 			const installProc = Bun.spawn(["bun", "install", packageInstallSpec], {
+				env: buildChildEnv("extension-installer", { parentEnv: Bun.env }),
 				cwd: getPluginsDir(),
 				stdin: "ignore",
 				stdout: "pipe",
@@ -530,6 +532,7 @@ export class PluginManager {
 			if (gitSource && existingActualName) {
 				await refreshBunGitCache(gitSource, getPluginsDir());
 				const updateProc = Bun.spawn(["bun", "update", actualName], {
+					env: buildChildEnv("extension-installer", { parentEnv: Bun.env }),
 					cwd: getPluginsDir(),
 					stdin: "ignore",
 					stdout: "pipe",
@@ -633,6 +636,7 @@ export class PluginManager {
 		await this.#ensurePackageJson();
 
 		const proc = Bun.spawn(["bun", "uninstall", name], {
+			env: buildChildEnv("extension-installer", { parentEnv: Bun.env }),
 			cwd: getPluginsDir(),
 			stdin: "ignore",
 			stdout: "pipe",
@@ -1039,6 +1043,7 @@ export class PluginManager {
 	async #fixMissingPlugin(): Promise<boolean> {
 		try {
 			const proc = Bun.spawn(["bun", "install"], {
+				env: buildChildEnv("extension-installer", { parentEnv: Bun.env }),
 				cwd: getPluginsDir(),
 				stdin: "ignore",
 				stdout: "pipe",

@@ -1,10 +1,6 @@
 import { logger, postmortem, Snowflake, workerHostEntry } from "@oh-my-pi/pi-utils";
-import {
-	createWorkerHandle,
-	createWorkerSubprocess,
-	resolveWorkerSpawnCmd,
-	workerEnvFromParent,
-} from "../../subprocess/worker-client";
+import { buildChildEnv, hasSecretBearingEnv } from "../../exec/child-env";
+import { createWorkerHandle, createWorkerSubprocess, resolveWorkerSpawnCmd } from "../../subprocess/worker-client";
 import type { ToolSession } from "../../tools";
 import { ToolAbortError, ToolError } from "../../tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
@@ -275,10 +271,11 @@ async function acquireSession(sessionKey: string, snapshot: SessionSnapshot, tim
 			} catch (error) {
 				// Runtime crash/load failures surface asynchronously via the runtime's
 				// error callback, after the synchronous spawn try/catch has returned.
-				// Preserve the full process -> Worker -> inline ladder for those failures.
+				// Same-process fallbacks can read the parent's ambient environment.
+				// If it bears secrets, an isolated subprocess failure must fail closed.
 				const failed = session.worker;
 				await failed.terminate().catch(() => undefined);
-				if (failed.mode === "inline") throw error;
+				if (failed.mode === "inline" || hasSecretBearingEnv(process.env)) throw error;
 				if (failed.mode === "process") {
 					logger.warn("JS eval subprocess init failed; retrying with a Bun Worker", {
 						error: error instanceof Error ? error.message : String(error),
@@ -501,6 +498,7 @@ function spawnJsWorker(): WorkerHandle {
 		try {
 			return spawnJsProcess();
 		} catch (err) {
+			if (hasSecretBearingEnv(process.env)) throw err;
 			// Fall through to the Bun Worker rung: a worker thread still interrupts
 			// synchronous infinite loops via terminate(), which the inline fallback
 			// cannot.
@@ -530,7 +528,7 @@ function spawnBunWorker(): WorkerHandle {
 function spawnJsProcess(): WorkerHandle {
 	const spawned = createWorkerSubprocess<WorkerOutbound>({
 		spawnCommand: resolveWorkerSpawnCmd(JS_EVAL_PROCESS_ARG),
-		env: workerEnvFromParent(),
+		env: buildChildEnv("untrusted-js", { parentEnv: process.env }),
 		exitLabel: "JS eval worker",
 		detached: shouldDetachKernel(process.platform),
 		reportCleanExit: true,

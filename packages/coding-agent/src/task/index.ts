@@ -26,6 +26,7 @@ import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: 
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
 import { formatBytes, formatDuration } from "../tools/render-utils";
+import { TaskAdmission } from "./admission";
 import { resolveSpawnPolicy } from "./spawn-policy";
 import {
 	type AgentDefinition,
@@ -49,6 +50,8 @@ import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { repairTaskParams } from "./repair-args";
 import { resolveEffectiveSubagentPolicy, runStructuredSubagent, StructuredSubagentError } from "./structured-subagent";
+
+const NEVER_ABORTED_SIGNAL = new AbortController().signal;
 
 function renderSubagentUserPrompt(assignment: string): string {
 	return prompt.render(subagentUserPromptTemplate, {
@@ -574,6 +577,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return this.session.settings.get("task.batch");
 	}
 
+	#admit(signal?: AbortSignal): Promise<void> {
+		return TaskAdmission.global().admit(signal ?? NEVER_ABORTED_SIGNAL, {
+			waitMs: this.session.settings.get("task.admission.maxWaitMs"),
+		});
+	}
+
 	#getSpawnSemaphore(): Semaphore {
 		const max = this.session.settings.get("task.maxConcurrency");
 		if (this.#spawnSemaphore) {
@@ -1063,6 +1072,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					this.#releaseSpawnSemaphore();
 				};
 				try {
+					await this.#admit(runSignal);
 					await semaphore.acquire(runSignal);
 					semaphoreHeld = true;
 				} catch {
@@ -1198,6 +1208,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const spawn = spawns[0]!;
 			const semaphore = this.#getSpawnSemaphore();
 			const invokedAt = Date.now();
+			await this.#admit(signal);
 			await semaphore.acquire(signal);
 			const acquiredAt = Date.now();
 			try {
@@ -1284,6 +1295,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const invokedAt = Date.now();
 				let semaphoreHeld = false;
 				try {
+					await this.#admit(workerSignal);
 					await semaphore.acquire(workerSignal);
 					semaphoreHeld = true;
 				} catch (error) {

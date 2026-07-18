@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../config/settings";
+import { hasSecretBearingEnv } from "../../exec/child-env";
 import type { ToolSession } from "../../tools";
 import {
 	disposeAllVmContexts,
@@ -12,6 +13,22 @@ import {
 import { executeJs } from "../js/executor";
 
 const originalWorker = globalThis.Worker;
+
+function clearSecretBearingEnv(): Record<string, string> {
+	const removed: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined && hasSecretBearingEnv({ [key]: value })) {
+			removed[key] = value;
+			delete process.env[key];
+		}
+	}
+	return removed;
+}
+
+function restoreSecretBearingEnv(snapshot: Record<string, string>): void {
+	clearSecretBearingEnv();
+	Object.assign(process.env, snapshot);
+}
 
 interface FakeWorkerStats {
 	closeRequests: number;
@@ -188,7 +205,9 @@ function installFakeWorker(stats: FakeWorkerStats, behavior: FakeWorkerBehavior)
 describe("JavaScript eval worker lifecycle", () => {
 	let restoreCloseTimeoutMs = 0;
 	let restoreWorkerThread = false;
+	let secretEnvSnapshot: Record<string, string> = {};
 	beforeEach(() => {
+		secretEnvSnapshot = clearSecretBearingEnv();
 		restoreWorkerThread = setJsEvalWorkerThreadForTests(true);
 		// Shrink the graceful-close grace period so the "close acked but the worker
 		// never exits -> force terminate" contract is proven without a real 1s wait.
@@ -196,16 +215,20 @@ describe("JavaScript eval worker lifecycle", () => {
 	});
 
 	afterEach(async () => {
-		// Dispose while the shrunk timeout is still active so a hung worker's afterEach
-		// close also force-terminates instantly, then restore the production default.
-		await disposeAllVmContexts();
-		setWorkerCloseTimeoutMsForTests(restoreCloseTimeoutMs);
-		Object.defineProperty(globalThis, "Worker", {
-			configurable: true,
-			writable: true,
-			value: originalWorker,
-		});
-		setJsEvalWorkerThreadForTests(restoreWorkerThread);
+		try {
+			// Dispose while the shrunk timeout is still active so a hung worker's afterEach
+			// close also force-terminates instantly, then restore the production default.
+			await disposeAllVmContexts();
+		} finally {
+			setWorkerCloseTimeoutMsForTests(restoreCloseTimeoutMs);
+			Object.defineProperty(globalThis, "Worker", {
+				configurable: true,
+				writable: true,
+				value: originalWorker,
+			});
+			setJsEvalWorkerThreadForTests(restoreWorkerThread);
+			restoreSecretBearingEnv(secretEnvSnapshot);
+		}
 	});
 
 	it("exits a real worker on graceful close even with ref'ed user handles", async () => {
@@ -306,6 +329,43 @@ describe("JavaScript eval worker lifecycle", () => {
 			expect(spawnAttempts).toBe(1);
 		} finally {
 			Bun.spawn = originalSpawn;
+		}
+	});
+
+	it("refuses the same-process Worker fallback when ambient secrets make eval untrusted", async () => {
+		using tempDir = TempDir.createSync("@omp-js-secret-fallback-");
+		setJsEvalWorkerThreadForTests(false);
+		const originalSpawn = Bun.spawn;
+		let workerConstructions = 0;
+		delete (globalThis as Record<string, unknown>).__ompUntrustedEvalRan;
+		Object.assign(process.env, { ANTHROPIC_API_KEY: "ambient-provider-secret" });
+		Bun.spawn = ((): never => {
+			throw new Error("subprocess spawn unavailable");
+		}) as unknown as typeof Bun.spawn;
+		Object.defineProperty(globalThis, "Worker", {
+			configurable: true,
+			writable: true,
+			value: class RefusedWorker {
+				constructor() {
+					workerConstructions++;
+					throw new Error("Worker fallback must not be reached");
+				}
+			} as unknown as typeof Worker,
+		});
+
+		try {
+			const result = await executeJs("globalThis.__ompUntrustedEvalRan = true; return 'ambient secret exposed';", {
+				cwd: tempDir.path(),
+				sessionId: `js-secret-fallback:${crypto.randomUUID()}`,
+				session: makeSession(tempDir.path()),
+			});
+
+			expect(workerConstructions).toBe(0);
+			expect(result.exitCode).not.toBe(0);
+			expect((globalThis as Record<string, unknown>).__ompUntrustedEvalRan).toBeUndefined();
+		} finally {
+			Bun.spawn = originalSpawn;
+			delete (globalThis as Record<string, unknown>).__ompUntrustedEvalRan;
 		}
 	});
 
@@ -411,6 +471,51 @@ describe.skipIf(process.platform === "win32")("JavaScript eval process isolation
 		// process.chdir resolves symlinks (macOS tempdirs live under /var ->
 		// /private/var), so compare physical paths.
 		expect(result.output.trim()).toBe(fs.realpathSync(tempDir.path()));
+	});
+
+	it("sanitizes the real JS eval subprocess environment", async () => {
+		using tempDir = TempDir.createSync("@omp-js-process-env-");
+		const poisonedEnv = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisonedEnv).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisonedEnv);
+
+		try {
+			const result = await executeJs(
+				`return JSON.stringify({
+					PATH: process.env.PATH,
+					ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY,
+					DATABASE_URL: process.env.DATABASE_URL,
+					AGENTDESK_CONTROL_TOKEN: process.env.AGENTDESK_CONTROL_TOKEN,
+					JWT_SECRET: process.env.JWT_SECRET,
+					GENERIC_SERVICE_SECRET: process.env.GENERIC_SERVICE_SECRET,
+				});`,
+				{
+					cwd: tempDir.path(),
+					sessionId: `js-env:${crypto.randomUUID()}`,
+					session: makeSession(tempDir.path()),
+				},
+			);
+			const childEnv = JSON.parse(result.output) as Record<string, string | undefined>;
+
+			expect(result.exitCode).toBe(0);
+			expect(childEnv.PATH).toBe(process.env.PATH);
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("DATABASE_URL");
+			expect(childEnv).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(childEnv).not.toHaveProperty("JWT_SECRET");
+			expect(childEnv).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 
 	it("still runs cells when the session cwd does not exist", async () => {

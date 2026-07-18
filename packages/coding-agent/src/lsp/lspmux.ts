@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $flag, $which, logger } from "@oh-my-pi/pi-utils";
 import { TOML } from "bun";
+import { buildChildEnv } from "../exec/child-env";
 
 /**
  * lspmux integration for LSP server multiplexing.
@@ -102,6 +103,7 @@ async function parseConfig(): Promise<LspmuxConfig | null> {
 async function checkServerRunning(binaryPath: string): Promise<boolean> {
 	try {
 		const proc = Bun.spawn([binaryPath, "status"], {
+			env: buildChildEnv("model-child", { parentEnv: Bun.env }),
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
@@ -131,17 +133,22 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
  */
 export async function detectLspmux(): Promise<LspmuxState> {
 	const now = Date.now();
-	if (cachedState && now - cacheTimestamp < STATE_CACHE_TTL_MS) {
+	const disabled = $flag("PI_DISABLE_LSPMUX");
+	const binaryPath = disabled ? null : $which("lspmux");
+	if (
+		cachedState &&
+		now - cacheTimestamp < STATE_CACHE_TTL_MS &&
+		cachedState.available === (binaryPath !== null) &&
+		cachedState.binaryPath === binaryPath
+	) {
 		return cachedState;
 	}
 
-	if ($flag("PI_DISABLE_LSPMUX")) {
+	if (disabled) {
 		cachedState = { available: false, running: false, binaryPath: null, config: null };
 		cacheTimestamp = now;
 		return cachedState;
 	}
-
-	const binaryPath = $which("lspmux");
 	if (!binaryPath) {
 		cachedState = { available: false, running: false, binaryPath: null, config: null };
 		cacheTimestamp = now;

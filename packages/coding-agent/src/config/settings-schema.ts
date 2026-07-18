@@ -4178,6 +4178,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"task.admission.maxWaitMs": {
+		type: "number",
+		default: 60_000,
+		ui: {
+			tab: "tasks",
+			group: "Subagents",
+			label: "Admission Wait Timeout",
+			description: "Maximum time a task waits for the host admission policy to reopen before failing",
+		},
+	},
+
 	"task.enableLsp": {
 		type: "boolean",
 		default: false,

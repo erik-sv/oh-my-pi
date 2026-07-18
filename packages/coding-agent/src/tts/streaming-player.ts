@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $which, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { FileSink, Subprocess } from "bun";
+import { buildChildEnv } from "../exec/child-env";
 import { getToolPath } from "../utils/tools-manager";
 import { type PlayerCommand, playAudioFile } from "./player";
 import { encodeWav } from "./wav";
@@ -173,6 +174,7 @@ export class StreamingAudioPlayer {
 			const { cmd, args } = command;
 			try {
 				const proc = Bun.spawn([cmd, ...args], {
+					env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
 					stdin: "pipe",
 					stdout: "ignore",
 					stderr: "ignore",

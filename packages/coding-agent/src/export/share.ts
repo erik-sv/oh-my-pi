@@ -24,6 +24,7 @@ import type { AssistantMessage, ImageContent, TextContent } from "@oh-my-pi/pi-a
 import { $which, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
+import { buildChildEnv } from "../exec/child-env";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
 import type { SessionEntry, SessionHeader } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
@@ -406,7 +407,8 @@ function capLongStrings(value: unknown, cap: number): void {
 /** Create a secret gist holding base64 of the sealed blob; null when `gh` is unusable. */
 async function tryCreateGist(sealed: Uint8Array): Promise<{ id: string; url: string } | null> {
 	if (!$which("gh")) return null;
-	const auth = await $`gh auth status`.quiet().nothrow();
+	const env = buildChildEnv("repo-tool", { parentEnv: Bun.env });
+	const auth = await $`gh auth status`.env(env).quiet().nothrow();
 	if (auth.exitCode !== 0) {
 		logger.debug("share: gh present but not authenticated; falling back to share server");
 		return null;
@@ -416,7 +418,7 @@ async function tryCreateGist(sealed: Uint8Array): Promise<{ id: string; url: str
 	try {
 		const file = path.join(dir, GIST_FILENAME);
 		await Bun.write(file, Buffer.from(sealed).toString("base64"));
-		const result = await $`gh gist create --public=false ${file}`.quiet().nothrow();
+		const result = await $`gh gist create --public=false ${file}`.env(env).quiet().nothrow();
 		if (result.exitCode !== 0) {
 			logger.warn("share: gist creation failed; falling back to share server", {
 				stderr: result.stderr.toString("utf-8").trim().slice(0, 500),

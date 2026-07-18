@@ -8,6 +8,7 @@
  */
 import * as fs from "node:fs/promises";
 import { $which } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import { getToolPath } from "../utils/tools-manager";
 
 export interface PlayerCommand {
@@ -101,7 +102,11 @@ export async function playAudioFile(filePath: string, options: PlayAudioOptions 
 	for (const command of commands) {
 		if (signal?.aborted) throw playbackAbortError(signal);
 		try {
-			const proc = Bun.spawn([command.cmd, ...command.args], { stdout: "ignore", stderr: "pipe" });
+			const proc = Bun.spawn([command.cmd, ...command.args], {
+				env: buildChildEnv("audio-helper", { parentEnv: Bun.env }),
+				stdout: "ignore",
+				stderr: "pipe",
+			});
 			let killTimer: NodeJS.Timeout | undefined;
 			const abort = (): void => {
 				proc.kill("SIGTERM");

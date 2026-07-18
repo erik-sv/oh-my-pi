@@ -4,11 +4,25 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { buildSystemPrompt } from "./system-prompt";
 
+const GPU_SECRET_KEYS = [
+	"OPENAI_API_KEY",
+	"ANTHROPIC_API_KEY",
+	"DATABASE_URL",
+	"OMP_SESSION_DB_URL",
+	"JWT_SECRET",
+	"AGENTDESK_CONTROL_TOKEN",
+] as const;
+
 interface ProbeRunResult {
 	elapsedMs: number;
 	childElapsedMs: number;
 	cached: unknown;
 	count: number;
+	expectedPath: string;
+	parentEnv: Record<string, string | undefined>;
+	probeEnv: Record<string, string>;
+	spawnHasEnv: boolean;
+	spawnEnv?: Record<string, string | undefined>;
 }
 
 async function runProbeScenario(options: {
@@ -17,19 +31,31 @@ async function runProbeScenario(options: {
 	holdStdoutOpen?: boolean;
 	descendantHoldsStdout?: boolean;
 	validOutput?: string;
+	ambientEnv?: Record<string, string>;
 }): Promise<ProbeRunResult> {
 	const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-gpu-probe-"));
 	try {
 		const binDir = path.join(tempRoot, "bin");
 		const cacheRoot = path.join(tempRoot, "cache");
 		const probeCountPath = path.join(tempRoot, "probe-count");
+		const probeEnvPath = path.join(tempRoot, "probe-env");
 		await fs.mkdir(binDir, { recursive: true });
 		await fs.mkdir(path.join(cacheRoot, "omp"), { recursive: true });
 		const lspciPath = path.join(binDir, "lspci");
-		await Bun.write(
-			lspciPath,
-			'#!/usr/bin/env sh\nprintf x >> "$OMP_GPU_PROBE_COUNT"\nif [ -n "$OMP_GPU_PROBE_VALID_OUTPUT" ]; then printf "%s\\n" "$OMP_GPU_PROBE_VALID_OUTPUT"; fi\nif [ "$OMP_GPU_PROBE_DESCENDANT_HOLDS_STDOUT" = "true" ]; then sleep "$OMP_GPU_PROBE_SLEEP" & exit 0; fi\nif [ "$OMP_GPU_PROBE_HOLD_STDOUT_OPEN" = "true" ]; then sleep "$OMP_GPU_PROBE_SLEEP" & wait "$!"; fi\nif [ -n "$OMP_GPU_PROBE_SLEEP" ]; then exec sleep "$OMP_GPU_PROBE_SLEEP"; fi\nexit 0\n',
-		);
+		const probeScript = [
+			"#!/usr/bin/env sh",
+			`env > ${JSON.stringify(probeEnvPath)}`,
+			`printf x >> ${JSON.stringify(probeCountPath)}`,
+			options.validOutput === undefined ? "" : `printf "%s\\n" ${JSON.stringify(options.validOutput)}`,
+			options.descendantHoldsStdout ? `sleep ${JSON.stringify(String(options.sleepSeconds ?? 0))} & exit 0` : "",
+			options.holdStdoutOpen ? `sleep ${JSON.stringify(String(options.sleepSeconds ?? 0))} & wait "$!"` : "",
+			options.sleepSeconds === undefined ? "" : `exec sleep ${JSON.stringify(String(options.sleepSeconds))}`,
+			"exit 0",
+			"",
+		]
+			.filter(Boolean)
+			.join("\n");
+		await Bun.write(lspciPath, probeScript);
 		await fs.chmod(lspciPath, 0o755);
 
 		const scenarioPath = path.join(tempRoot, "scenario.ts");
@@ -37,7 +63,15 @@ async function runProbeScenario(options: {
 			scenarioPath,
 			`import { getGpuCachePath, refreshDirsFromEnv } from ${JSON.stringify(path.resolve(import.meta.dir, "../../utils/src/index.ts"))};
 import { buildSystemPrompt } from ${JSON.stringify(path.join(import.meta.dir, "system-prompt.ts"))};
+const originalSpawn = Bun.spawn;
+let gpuSpawnOptions;
+Bun.spawn = ((first, options) => {
+	const command = Array.isArray(first) ? first : first.cmd;
+	if (command?.[0] === "lspci") gpuSpawnOptions = Array.isArray(first) ? options : first;
+	return Array.isArray(first) ? originalSpawn(first, options) : originalSpawn(first);
+}) as typeof Bun.spawn;
 
+Object.defineProperty(process, "platform", { value: "linux" });
 refreshDirsFromEnv();
 const buildOptions = {
 	contextFiles: [],
@@ -60,12 +94,16 @@ const cacheFile = Bun.file(getGpuCachePath());
 const cached = await cacheFile.exists() ? await cacheFile.json() : null;
 const countFile = Bun.file(process.env.OMP_GPU_PROBE_COUNT ?? "");
 const count = await countFile.exists() ? (await countFile.text()).length : 0;
-console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt), cached, count }));
+const parentEnv = Object.fromEntries(${JSON.stringify(GPU_SECRET_KEYS)}.map(key => [key, process.env[key]]));
+const spawnHasEnv = gpuSpawnOptions !== undefined && Object.hasOwn(gpuSpawnOptions, "env");
+const spawnEnv = gpuSpawnOptions?.env;
+console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt), cached, count, parentEnv, spawnHasEnv, spawnEnv }));
 `,
 		);
 
 		const env: Record<string, string | undefined> = {
 			...process.env,
+			...options.ambientEnv,
 			PATH: `${binDir}:${process.env.PATH ?? ""}`,
 			XDG_CACHE_HOME: cacheRoot,
 			OMP_GPU_PROBE_COUNT: probeCountPath,
@@ -75,26 +113,6 @@ console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt
 		// the test cannot touch the developer/CI profile's real gpu_cache.json.
 		for (const key of ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]) {
 			delete env[key];
-		}
-		if (options.sleepSeconds === undefined) {
-			delete env.OMP_GPU_PROBE_SLEEP;
-		} else {
-			env.OMP_GPU_PROBE_SLEEP = String(options.sleepSeconds);
-		}
-		if (options.holdStdoutOpen) {
-			env.OMP_GPU_PROBE_HOLD_STDOUT_OPEN = "true";
-		} else {
-			delete env.OMP_GPU_PROBE_HOLD_STDOUT_OPEN;
-		}
-		if (options.descendantHoldsStdout) {
-			env.OMP_GPU_PROBE_DESCENDANT_HOLDS_STDOUT = "true";
-		} else {
-			delete env.OMP_GPU_PROBE_DESCENDANT_HOLDS_STDOUT;
-		}
-		if (options.validOutput !== undefined) {
-			env.OMP_GPU_PROBE_VALID_OUTPUT = options.validOutput;
-		} else {
-			delete env.OMP_GPU_PROBE_VALID_OUTPUT;
 		}
 
 		const childStartedAt = performance.now();
@@ -108,11 +126,33 @@ console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt
 		if (exitCode !== 0) {
 			throw new Error(`GPU probe scenario failed with exit ${exitCode}: ${stderr}`);
 		}
-		return { ...JSON.parse(stdout.trim()), childElapsedMs };
+		const probeEnvText = await Bun.file(probeEnvPath).text();
+		const probeEnv = Object.fromEntries(
+			probeEnvText
+				.split("\n")
+				.filter(Boolean)
+				.map(line => {
+					const separator = line.indexOf("=");
+					return [line.slice(0, separator), line.slice(separator + 1)];
+				}),
+		);
+		return { ...JSON.parse(stdout.trim()), childElapsedMs, expectedPath: env.PATH ?? "", probeEnv };
 	} finally {
 		await fs.rm(tempRoot, { recursive: true, force: true });
 	}
 }
+
+it("keeps ambient secrets out of the GPU probe environment", async () => {
+	const ambientEnv = Object.fromEntries(GPU_SECRET_KEYS.map(key => [key, `ambient-${key.toLowerCase()}`]));
+	const result = await runProbeScenario({ runs: 1, ambientEnv });
+
+	expect(result.parentEnv).toEqual(ambientEnv);
+	expect(result.spawnHasEnv).toBe(true);
+	expect(result.spawnEnv?.PATH).toBe(result.expectedPath);
+	for (const key of GPU_SECRET_KEYS) expect(result.spawnEnv).not.toHaveProperty(key);
+	expect(result.probeEnv.PATH).toBe(result.expectedPath);
+	for (const key of GPU_SECRET_KEYS) expect(result.probeEnv).not.toHaveProperty(key);
+});
 
 describe.skipIf(process.platform !== "linux")("system prompt GPU probe", () => {
 	it("caches empty GPU probe results", async () => {

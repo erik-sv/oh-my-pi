@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type SettingPath, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { renderHtmlToText } from "@oh-my-pi/pi-coding-agent/tools/fetch";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import * as imageResize from "@oh-my-pi/pi-coding-agent/utils/image-resize";
 import * as toolsManager from "@oh-my-pi/pi-coding-agent/utils/tools-manager";
@@ -582,5 +583,55 @@ describe("read tool URL handling", () => {
 		expect(pagedText?.text).toContain("Line 1");
 		expect(pagedText?.text).toContain("Line 2");
 		expect(fs.readdirSync(path.join(testDir, "session")).some(file => file.endsWith(".read.log"))).toBe(true);
+	});
+
+	it("passes an explicit sanitized env to the trafilatura network helper", async () => {
+		const poisoned = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			PARALLEL_API_KEY: "ambient-fetch-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		let helperOptions: { env?: Record<string, string | undefined> } | undefined;
+		vi.spyOn(toolsManager, "ensureTool").mockResolvedValue("/usr/bin/trafilatura");
+		vi.spyOn(ptree, "exec").mockImplementation(async (_command, options) => {
+			helperOptions = options;
+			return {
+				ok: true,
+				stdout: "Rendered helper content with enough semantic detail to clear the reader quality gate. ".repeat(3),
+				stderr: "",
+				exitCode: 0,
+			} as never;
+		});
+
+		try {
+			const rendered = await renderHtmlToText(
+				"https://example.com/helper-env",
+				"<html><body><main>Fallback input</main></body></html>",
+				5,
+				Settings.isolated({ "providers.fetch": "trafilatura" }),
+				undefined,
+				null,
+			);
+
+			expect(rendered.method).toBe("trafilatura");
+			expect(helperOptions?.env).toBeDefined();
+			expect(helperOptions?.env?.PATH).toBe(process.env.PATH);
+			expect(helperOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(helperOptions?.env).not.toHaveProperty("PARALLEL_API_KEY");
+			expect(helperOptions?.env).not.toHaveProperty("DATABASE_URL");
+			expect(helperOptions?.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(helperOptions?.env).not.toHaveProperty("JWT_SECRET");
+			expect(helperOptions?.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 });

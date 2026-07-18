@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { $which, getRemoteHostDir, getSshControlDir, isEnoent, logger, postmortem, ptree } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import { buildSshTarget, sanitizeHostName } from "./utils";
 
 export interface SSHConnectionTarget {
@@ -131,6 +132,7 @@ async function runSshSync(
 ): Promise<{ exitCode: number | null; stderr: string }> {
 	const result = await ptree.exec(["ssh", ...args], {
 		timeout: timeoutMs,
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		allowNonZero: true,
 		allowAbort: true,
 		stderr: "full",
@@ -144,6 +146,7 @@ async function runSshCaptureSync(
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
 	const result = await ptree.exec(["ssh", ...args], {
 		timeout: timeoutMs,
+		env: buildChildEnv("ssh-control", { parentEnv: Bun.env }),
 		allowNonZero: true,
 		allowAbort: true,
 		stderr: "full",

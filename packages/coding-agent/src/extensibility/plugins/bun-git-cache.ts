@@ -2,6 +2,7 @@ import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../../exec/child-env";
 import type { GitSource } from "./git-url";
 
 interface CommandResult {
@@ -12,6 +13,10 @@ interface CommandResult {
 
 async function runCommand(command: string[], cwd: string): Promise<CommandResult> {
 	const proc = Bun.spawn(command, {
+		env: buildChildEnv("repo-tool", {
+			parentEnv: Bun.env,
+			explicitEnv: { GH_TOKEN: Bun.env.GH_TOKEN, GITHUB_TOKEN: Bun.env.GITHUB_TOKEN },
+		}),
 		cwd,
 		stdin: "ignore",
 		stdout: "pipe",

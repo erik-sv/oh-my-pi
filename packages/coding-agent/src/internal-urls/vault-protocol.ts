@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { $which, isEnoent } from "@oh-my-pi/pi-utils";
 import { isSettingsInitialized, settings } from "../config/settings";
 import { getDefault } from "../config/settings-schema";
+import { buildChildEnv } from "../exec/child-env";
 import { parseInternalUrl } from "./parse";
 import { validateRelativePath } from "./skill-protocol";
 import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, WriteContext } from "./types";
@@ -252,6 +253,7 @@ export async function spawnObsidian(
 
 	const proc = Bun.spawn({
 		cmd: [bin, ...args],
+		env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
 		stdout: "pipe",
 		stderr: "pipe",
 	});

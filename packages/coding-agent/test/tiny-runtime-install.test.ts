@@ -1,8 +1,13 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Subprocess } from "bun";
 import { ensureOnnxRuntimeCudaProviders, formatOnnxRuntimeCudaDiagnostics } from "../src/subprocess/worker-runtime";
+
+interface SpawnOptions {
+	env?: Record<string, string | undefined>;
+}
 
 const tempDirs: string[] = [];
 const CUDA_PROVIDER_FILES = [
@@ -61,6 +66,67 @@ describe("tiny runtime CUDA provider repair", () => {
 			const binDir = path.join(runtimeDir, "node_modules", "onnxruntime-node", "bin", "napi-v6", "linux", "x64");
 			for (const file of CUDA_PROVIDER_FILES) {
 				expect(await Bun.file(path.join(binDir, file)).exists()).toBe(true);
+			}
+		}
+	});
+
+	it("gives the CUDA installer only its explicit install controls and a sanitized runtime environment", async () => {
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+		const archDescriptor = Object.getOwnPropertyDescriptor(process, "arch");
+		const poisoned = {
+			BUN_BE_BUN: "ambient-bun-mode",
+			ONNXRUNTIME_NODE_INSTALL: "ambient-install-mode",
+			OPENAI_API_KEY: "ambient-openai-secret",
+			ANTHROPIC_API_KEY: "ambient-anthropic-secret",
+			DATABASE_URL: "postgres://ambient-database-secret",
+			OMP_SESSION_DB_URL: "postgres://ambient-session-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+		Object.defineProperty(process, "arch", { value: "x64", configurable: true });
+		Object.assign(process.env, poisoned);
+
+		let childEnv: Record<string, string | undefined> | undefined;
+		try {
+			const runtimeDir = await makeRuntimeWithOnnxInstallScript();
+			const binDir = path.join(runtimeDir, "node_modules", "onnxruntime-node", "bin", "napi-v6", "linux", "x64");
+			vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[], options?: SpawnOptions) => {
+				childEnv = { ...(options?.env ?? Bun.env) } as Record<string, string | undefined>;
+				const exited = Promise.all(CUDA_PROVIDER_FILES.map(file => Bun.write(path.join(binDir, file), ""))).then(
+					() => 0,
+				);
+				return {
+					cmd,
+					exitCode: 0,
+					exited,
+					stdout: new Response("").body,
+					stderr: new Response("").body,
+				} as unknown as Subprocess;
+			}) as typeof Bun.spawn);
+
+			await ensureOnnxRuntimeCudaProviders(runtimeDir, "cuda");
+
+			expect(childEnv?.BUN_BE_BUN).toBe("1");
+			expect(childEnv?.ONNXRUNTIME_NODE_INSTALL).toBe("cuda12");
+			for (const key of [
+				"OPENAI_API_KEY",
+				"ANTHROPIC_API_KEY",
+				"DATABASE_URL",
+				"OMP_SESSION_DB_URL",
+				"JWT_SECRET",
+				"AGENTDESK_CONTROL_TOKEN",
+			]) {
+				expect(childEnv?.[key], `${key} must not cross the CUDA installer boundary`).toBeUndefined();
+			}
+		} finally {
+			vi.restoreAllMocks();
+			if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+			if (archDescriptor) Object.defineProperty(process, "arch", archDescriptor);
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
 			}
 		}
 	});

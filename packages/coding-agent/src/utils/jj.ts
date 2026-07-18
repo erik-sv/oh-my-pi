@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $which } from "@oh-my-pi/pi-utils";
 import { LRUCache } from "lru-cache/raw";
+import { buildChildEnv } from "../exec/child-env";
 import * as git from "./git";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -84,6 +85,7 @@ function formatCommandFailure(
 async function jj(cwd: string, args: readonly string[], options: CommandOptions = {}): Promise<JjCommandResult> {
 	const child = Bun.spawn(["jj", "--no-pager", "--color=never", ...args], {
 		cwd,
+		env: buildChildEnv("repo-tool", { parentEnv: Bun.env }),
 		signal: options.signal,
 		stdin: "ignore",
 		stdout: "pipe",

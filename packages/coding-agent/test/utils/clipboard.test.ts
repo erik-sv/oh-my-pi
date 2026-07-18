@@ -252,6 +252,83 @@ describe("readTextFromClipboard", () => {
 		expect(calls[0]?.cmd).toEqual(["pbpaste"]);
 	});
 
+	it("preserves display session env but strips ambient secrets from clipboard children", async () => {
+		setPlatform("linux");
+		const poisoned = {
+			DISPLAY: ":90",
+			WAYLAND_DISPLAY: "wayland-90",
+			XDG_RUNTIME_DIR: "/tmp/omp-clipboard-runtime",
+			DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/omp-clipboard-bus",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, "clipboard text");
+
+		try {
+			expect(await readTextFromClipboard()).toBe("clipboard text");
+			expect(calls[0]?.cmd).toEqual(["wl-paste", "--type", "text/plain", "--no-newline"]);
+			const childEnv = calls[0]?.options.env;
+			expect(childEnv).toEqual(
+				expect.objectContaining({
+					DISPLAY: ":90",
+					WAYLAND_DISPLAY: "wayland-90",
+					XDG_RUNTIME_DIR: "/tmp/omp-clipboard-runtime",
+					DBUS_SESSION_BUS_ADDRESS: "unix:path=/tmp/omp-clipboard-bus",
+				}),
+			);
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("DATABASE_URL");
+			expect(childEnv).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(childEnv).not.toHaveProperty("JWT_SECRET");
+			expect(childEnv).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
+	it("preserves Windows runtime env but strips ambient secrets from the PowerShell bridge", async () => {
+		setPlatform("win32");
+		const poisoned = {
+			SystemRoot: "C:\\Windows",
+			TEMP: "C:\\Temp",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const calls: SpawnCall[] = [];
+		spyPowershell(calls, "windows clipboard");
+
+		try {
+			expect(await readTextFromClipboard()).toBe("windows clipboard");
+			expect(calls[0]?.cmd[0]).toBe("powershell.exe");
+			const childEnv = calls[0]?.options.env;
+			expect(childEnv).toEqual(expect.objectContaining({ SystemRoot: "C:\\Windows", TEMP: "C:\\Temp" }));
+			expect(childEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(childEnv).not.toHaveProperty("DATABASE_URL");
+			expect(childEnv).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(childEnv).not.toHaveProperty("JWT_SECRET");
+			expect(childEnv).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
 	it("returns an empty string when the subprocess exits non-zero", async () => {
 		setPlatform("darwin");
 		spyPowershell([], "", 1);

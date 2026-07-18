@@ -1,6 +1,7 @@
 import * as path from "node:path";
 import * as timers from "node:timers/promises";
 import { logger, ptree, untilAborted } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 import { NON_INTERACTIVE_ENV } from "../exec/non-interactive-env";
 import { DapClient } from "./client";
 import type {
@@ -1315,11 +1316,11 @@ export class DapSessionManager {
 			const proc = ptree.spawn(args.args, {
 				cwd: path.resolve(session.cwd, args.cwd ?? "."),
 				stdin: "pipe",
-				env: {
-					...Bun.env,
-					...NON_INTERACTIVE_ENV,
-					...env,
-				},
+				env: buildChildEnv("debug-adapter", {
+					parentEnv: Bun.env,
+					patches: NON_INTERACTIVE_ENV,
+					explicitEnv: env,
+				}),
 				detached: true,
 			});
 			return { processId: proc.pid } satisfies DapRunInTerminalResponse;

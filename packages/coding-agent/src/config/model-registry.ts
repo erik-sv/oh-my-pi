@@ -31,6 +31,7 @@ import {
 	getVariantAliasSources,
 	resolveVariantAlias,
 } from "@oh-my-pi/pi-catalog/variant-collapse";
+import { buildChildEnv } from "../exec/child-env";
 
 const SPECIAL_MODEL_MANAGER_PROVIDER_IDS: readonly string[] = [
 	"google-antigravity",
@@ -290,7 +291,12 @@ function resolveCommandConfig(command: string): string | undefined {
 	const retryAt = commandFailureRetryAt.get(command);
 	if (retryAt !== undefined && Date.now() < retryAt) return undefined;
 	try {
-		const stdout = execSync(command, { encoding: "utf8", timeout: 10_000, windowsHide: true });
+		const stdout = execSync(command, {
+			encoding: "utf8",
+			env: buildChildEnv("provider-agent-child", { parentEnv: Bun.env }),
+			timeout: 10_000,
+			windowsHide: true,
+		});
 		const trimmed = stdout.trim();
 		if (trimmed.length === 0) {
 			commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);

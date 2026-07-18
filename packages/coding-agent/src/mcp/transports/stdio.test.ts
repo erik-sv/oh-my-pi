@@ -101,6 +101,51 @@ describe("StdioTransport.connect", () => {
 			spawnSpy.mockRestore();
 		}
 	});
+	it("passes an explicit sanitized env and preserves only explicitly configured MCP secrets", async () => {
+		const inherited = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			OMP_MCP_CHILD_TOKEN: "ambient-mcp-token",
+			HTTPS_PROXY: "http://proxy.internal:8443",
+			SSL_CERT_FILE: "/etc/ssl/custom-ca.pem",
+		};
+		const previous = Object.fromEntries(Object.keys(inherited).map(key => [key, Bun.env[key]]));
+		for (const [key, value] of Object.entries(inherited)) Bun.env[key] = value;
+
+		const transport = new StdioTransport({
+			command: process.execPath,
+			args: ["-e", "process.exit(0)"],
+			env: {
+				OMP_MCP_CHILD_TOKEN: "explicit-mcp-token",
+			},
+		});
+		const spawnSpy = spyOn(Bun, "spawn");
+
+		try {
+			await transport.connect();
+
+			const call = spawnSpy.mock.calls[0];
+			if (!call) throw new Error("expected StdioTransport.connect() to spawn exactly one subprocess");
+			const env = call[1]?.env as Record<string, string | undefined> | undefined;
+			expect(env).toBeDefined();
+			expect(env?.OMP_MCP_CHILD_TOKEN).toBe("explicit-mcp-token");
+			expect(env?.HTTPS_PROXY).toBe("http://proxy.internal:8443");
+			expect(env?.SSL_CERT_FILE).toBe("/etc/ssl/custom-ca.pem");
+			expect(env?.ANTHROPIC_API_KEY).toBeUndefined();
+			expect(env?.DATABASE_URL).toBeUndefined();
+			expect(env?.AGENTDESK_CONTROL_TOKEN).toBeUndefined();
+			expect(env?.JWT_SECRET).toBeUndefined();
+		} finally {
+			await transport.close();
+			spawnSpy.mockRestore();
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete Bun.env[key];
+				else Bun.env[key] = value;
+			}
+		}
+	});
 });
 
 // Regression for #3945: request() awaited stdin.write/flush, so a child that

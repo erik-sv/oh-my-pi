@@ -408,7 +408,10 @@ export class EventController {
 	async #handleAgentStart(_event: Extract<AgentSessionEvent, { type: "agent_start" }>): Promise<void> {
 		this.#toolTimelineComponents.clear();
 		this.#postToolAssistantComponents.clear();
-		startSessionTerminalTitleAnimation(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
+		startSessionTerminalTitleAnimation(
+			this.ctx.sessionManager?.getSessionName?.(),
+			this.ctx.sessionManager?.getCwd?.(),
+		);
 		this.#lastIntent = undefined;
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();

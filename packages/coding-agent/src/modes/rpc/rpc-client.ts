@@ -11,6 +11,7 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
+import { buildChildEnv } from "../../exec/child-env";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type {
 	RpcAvailableCommandsUpdateFrame,
@@ -33,6 +34,8 @@ import type {
 	RpcSubagentProgressFrame,
 	RpcSubagentSnapshot,
 	RpcSubagentSubscriptionLevel,
+	RpcTaskAdmissionPolicy,
+	RpcTaskAdmissionResult,
 } from "./rpc-types";
 
 /** Distributive Omit that works with union types */
@@ -260,7 +263,7 @@ export class RpcClient {
 
 		const child = ptree.spawn(["bun", cliPath, ...args], {
 			cwd: this.options.cwd,
-			env: { ...Bun.env, ...this.options.env },
+			env: buildChildEnv("provider-agent-child", { parentEnv: Bun.env, explicitEnv: this.options.env }),
 			stdin: "pipe",
 		});
 		this.#process = child;
@@ -669,6 +672,12 @@ export class RpcClient {
 	 */
 	async ephemeralTurn(prompt: string): Promise<RpcEphemeralTurnResult> {
 		const response = await this.#send({ type: "ephemeral_turn", prompt });
+		return this.#getData(response);
+	}
+
+	/** Apply the process-global task admission policy. */
+	async setTaskAdmission(policy: RpcTaskAdmissionPolicy): Promise<RpcTaskAdmissionResult> {
+		const response = await this.#send({ type: "set_task_admission", policy });
 		return this.#getData(response);
 	}
 

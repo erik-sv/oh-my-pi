@@ -11,6 +11,7 @@ import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import chalk from "chalk";
+import { buildChildEnv } from "../exec/child-env";
 import { theme } from "../modes/theme/theme";
 import { isTimeoutError, withTimeoutSignal } from "../utils/fetch-timeout";
 
@@ -100,7 +101,10 @@ export function parseUpdateArgs(args: string[]): { force: boolean; check: boolea
 async function getBunGlobalBinDir(): Promise<string | undefined> {
 	if (!$which("bun")) return undefined;
 	try {
-		const result = await $`bun pm bin -g`.quiet().nothrow();
+		const result = await $`bun pm bin -g`
+			.env(buildChildEnv("package-installer", { parentEnv: Bun.env }))
+			.quiet()
+			.nothrow();
 		if (result.exitCode !== 0) return undefined;
 		const output = result.text().trim();
 		return output.length > 0 ? output : undefined;
@@ -112,7 +116,10 @@ async function getBunGlobalBinDir(): Promise<string | undefined> {
 async function getNpmGlobalBinDir(): Promise<string | undefined> {
 	if (!$which("npm")) return undefined;
 	try {
-		const result = await $`npm prefix -g`.quiet().nothrow();
+		const result = await $`npm prefix -g`
+			.env(buildChildEnv("package-installer", { parentEnv: Bun.env }))
+			.quiet()
+			.nothrow();
 		if (result.exitCode !== 0) return undefined;
 		const prefix = result.text().trim();
 		if (prefix.length === 0) return undefined;
@@ -124,9 +131,10 @@ async function getNpmGlobalBinDir(): Promise<string | undefined> {
 
 async function getHomebrewFormulaPrefix(): Promise<string | undefined> {
 	if (!$which("brew")) return undefined;
+	const env = buildChildEnv("package-installer", { parentEnv: Bun.env });
 	for (const formula of [HOMEBREW_FORMULA, APP_NAME]) {
 		try {
-			const result = await $`brew --prefix ${formula}`.quiet().nothrow();
+			const result = await $`brew --prefix ${formula}`.env(env).quiet().nothrow();
 			if (result.exitCode !== 0) continue;
 			const output = result.text().trim();
 			if (output.length > 0) return output;
@@ -138,7 +146,10 @@ async function getHomebrewFormulaPrefix(): Promise<string | undefined> {
 async function getMiseBinDirs(): Promise<string[]> {
 	if (!$which("mise")) return [];
 	try {
-		const result = await $`mise bin-paths ${MISE_TOOL}`.quiet().nothrow();
+		const result = await $`mise bin-paths ${MISE_TOOL}`
+			.env(buildChildEnv("package-installer", { parentEnv: Bun.env }))
+			.quiet()
+			.nothrow();
 		if (result.exitCode !== 0) return [];
 		return result
 			.text()
@@ -498,7 +509,10 @@ export async function pruneBunInstallCache(
 
 async function resolveBunInstallCacheDir(): Promise<string | undefined> {
 	try {
-		const result = await $`bun pm cache`.quiet().nothrow();
+		const result = await $`bun pm cache`
+			.env(buildChildEnv("package-installer", { parentEnv: Bun.env }))
+			.quiet()
+			.nothrow();
 		if (result.exitCode !== 0) return undefined;
 		const output = result.text().trim();
 		return output.length > 0 ? output : undefined;
@@ -522,7 +536,10 @@ export function resolveBunGlobalNodeModulesDirFromLocations(
 
 async function resolveBunGlobalNodeModulesDir(cacheDir: string): Promise<string | undefined> {
 	try {
-		const result = await $`bun pm bin -g`.quiet().nothrow();
+		const result = await $`bun pm bin -g`
+			.env(buildChildEnv("package-installer", { parentEnv: Bun.env }))
+			.quiet()
+			.nothrow();
 		const globalBinDir = result.exitCode === 0 ? result.text().trim() : undefined;
 		return resolveBunGlobalNodeModulesDirFromLocations(globalBinDir, cacheDir);
 	} catch {
@@ -610,7 +627,10 @@ async function verifyInstalledVersion(expectedVersion: string): Promise<Installe
 	const ompPath = resolveOmpPath();
 	if (!ompPath) return { ok: false };
 	try {
-		const result = await $`${ompPath} --version`.quiet().nothrow();
+		const result = await $`${ompPath} --version`
+			.env(buildChildEnv("package-installer", { parentEnv: Bun.env }))
+			.quiet()
+			.nothrow();
 		if (result.exitCode !== 0) return { ok: false, path: ompPath };
 		const output = result.text().trim();
 		// Output format: "omp/X.Y.Z"
@@ -816,7 +836,7 @@ export function buildMiseForceInstallArgs(expectedVersion: string): string[] {
 async function updateViaBun(expectedVersion: string): Promise<void> {
 	console.log(chalk.dim("Updating via bun..."));
 	const args = buildBunInstallArgs(expectedVersion);
-	const result = await $`bun ${args}`.nothrow();
+	const result = await $`bun ${args}`.env(buildChildEnv("package-installer", { parentEnv: Bun.env })).nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`bun install failed with exit code ${result.exitCode}`);
 	}
@@ -835,7 +855,7 @@ async function updateViaBun(expectedVersion: string): Promise<void> {
 async function updateViaNpm(expectedVersion: string): Promise<void> {
 	console.log(chalk.dim("Updating via npm..."));
 	const args = buildNpmInstallArgs(expectedVersion);
-	const result = await $`npm ${args}`.nothrow();
+	const result = await $`npm ${args}`.env(buildChildEnv("package-installer", { parentEnv: Bun.env })).nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`npm install failed with exit code ${result.exitCode}`);
 	}
@@ -845,14 +865,15 @@ async function updateViaNpm(expectedVersion: string): Promise<void> {
 
 async function updateViaHomebrew(expectedVersion: string, force: boolean): Promise<void> {
 	console.log(chalk.dim("Updating Homebrew formulae..."));
-	const update = await $`brew update`.nothrow();
+	const env = buildChildEnv("package-installer", { parentEnv: Bun.env });
+	const update = await $`brew update`.env(env).nothrow();
 	if (update.exitCode !== 0) {
 		throw new Error(`brew update failed with exit code ${update.exitCode}`);
 	}
 
 	console.log(chalk.dim("Updating via Homebrew..."));
 	const args = buildHomebrewUpdateArgs(force);
-	const result = await $`brew ${args}`.nothrow();
+	const result = await $`brew ${args}`.env(env).nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`brew ${args[0]} failed with exit code ${result.exitCode}`);
 	}
@@ -863,14 +884,15 @@ async function updateViaHomebrew(expectedVersion: string, force: boolean): Promi
 async function updateViaMise(expectedVersion: string, force: boolean): Promise<void> {
 	console.log(chalk.dim("Updating via mise..."));
 	const args = buildMiseUpgradeArgs();
-	const result = await $`mise ${args}`.nothrow();
+	const env = buildChildEnv("package-installer", { parentEnv: Bun.env });
+	const result = await $`mise ${args}`.env(env).nothrow();
 	if (result.exitCode !== 0) {
 		throw new Error(`mise upgrade failed with exit code ${result.exitCode}`);
 	}
 
 	if (force) {
 		const forceArgs = buildMiseForceInstallArgs(expectedVersion);
-		const forceResult = await $`mise ${forceArgs}`.nothrow();
+		const forceResult = await $`mise ${forceArgs}`.env(env).nothrow();
 		if (forceResult.exitCode !== 0) {
 			throw new Error(`mise install --force failed with exit code ${forceResult.exitCode}`);
 		}

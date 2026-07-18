@@ -10,7 +10,10 @@ import { Settings, type ShellMinimizerSettings } from "../config/settings";
 import { OutputSink } from "../session/streaming-output";
 import { resolveOutputMaxColumns, resolveOutputSinkHeadBytes } from "../tools/output-meta";
 import { getOrCreateSnapshot } from "../utils/shell-snapshot";
+import { buildChildEnv, getDeniedChildEnvNames } from "./child-env";
 import { buildNonInteractiveEnv } from "./non-interactive-env";
+
+const nativeShellRun = Shell.prototype.run;
 
 export interface BashExecutorOptions {
 	cwd?: string;
@@ -214,20 +217,28 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const shellConfig =
 		options?.useUserShell === true ? resolveUserShellConfig(settings, baseShellConfig) : baseShellConfig;
 	const { shell, args, env: shellEnv, prefix } = shellConfig;
+	const parentEnv = { ...process.env, ...shellEnv, ...options?.env };
+	const sessionEnv = buildChildEnv("direct-user-shell", { parentEnv });
 	const bashShell = isBashShell(shell);
-	const snapshotPath = bashShell ? await getOrCreateSnapshot(shell, shellEnv) : null;
+	const snapshotPath = bashShell ? await getOrCreateSnapshot(shell, sessionEnv) : null;
 
 	const minimizer = buildMinimizerOptions(settings.getGroup("shellMinimizer"));
 
 	const commandCwd = resolveShellCwd(options?.cwd);
-	const commandEnv = buildNonInteractiveEnv(options?.env);
-
-	// Apply command prefix if configured
+	const commandEnv = buildNonInteractiveEnv(undefined, sessionEnv);
+	// brush-core initializes its virtual shell from the host process before applying sessionEnv.
+	// Remove contract-denied names before any user command can spawn a descendant.
+	const deniedNames = getDeniedChildEnvNames("direct-user-shell", parentEnv);
+	const cleanupPrefix =
+		Shell.prototype.run === nativeShellRun && deniedNames.length > 0
+			? `unset ${deniedNames.map(quoteShellArg).join(" ")}; `
+			: "";
 	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
+	const isolatedCommand = `${cleanupPrefix}${prefixedCommand}`;
 	const finalCommand =
 		options?.useUserShell === true && !bashShell
-			? buildUserShellCommand(shell, args, prefixedCommand)
-			: prefixedCommand;
+			? buildUserShellCommand(shell, args, isolatedCommand)
+			: isolatedCommand;
 
 	// Create output sink for truncation and artifact handling
 	const sink = new OutputSink({
@@ -256,11 +267,11 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	}
 
 	const shellOptions = {
-		sessionEnv: shellEnv,
+		sessionEnv,
 		snapshotPath: snapshotPath ?? undefined,
 		minimizer,
 	};
-	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, shellEnv, options?.sessionKey, minimizer);
+	const sessionKey = buildSessionKey(shell, prefix, snapshotPath, sessionEnv, options?.sessionKey, minimizer);
 	const persistentSessionBroken = brokenShellSessions.has(sessionKey);
 	if (persistentSessionBroken) {
 		shellSessions.delete(sessionKey);

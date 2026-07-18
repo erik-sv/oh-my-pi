@@ -5,6 +5,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 
 export const CASE_INSENSITIVE_ENV = process.platform === "win32";
 
@@ -35,18 +36,15 @@ export function createEnvFilter(
 		: options.allowPrefixes;
 
 	return (env: Record<string, string | undefined>): Record<string, string | undefined> => {
-		const filtered: Record<string, string | undefined> = {};
+		const filtered = buildChildEnv("model-child", { parentEnv: env });
 		for (const key in env) {
 			const value = env[key];
 			if (value === undefined) continue;
 			const normalizedKey = CASE_INSENSITIVE_ENV ? key.toUpperCase() : key;
-			if (normalizedDenyList.has(normalizedKey)) continue;
+			if (normalizedDenyList.has(normalizedKey) || SECRET_KEY_PATTERN.test(normalizedKey)) continue;
 			if (normalizedAllowList.has(normalizedKey)) {
 				filtered[normalizedKey === "PATH" ? "PATH" : key] = value;
-				continue;
-			}
-			if (SECRET_KEY_PATTERN.test(normalizedKey)) continue;
-			if (normalizedAllowPrefixes.some(prefix => normalizedKey.startsWith(prefix))) {
+			} else if (normalizedAllowPrefixes.some(prefix => normalizedKey.startsWith(prefix))) {
 				filtered[key] = value;
 			}
 		}

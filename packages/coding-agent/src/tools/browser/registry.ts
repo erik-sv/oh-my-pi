@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { logger, withTimeout } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
 import type { Browser, CDPSession } from "puppeteer-core";
+import { buildChildEnv } from "../../exec/child-env";
 import { ToolAbortError, ToolError } from "../tool-errors";
 import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, killExistingByPath, waitForCdp } from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
@@ -185,6 +186,7 @@ async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions)
 			stdout: "ignore",
 			stderr: "ignore",
 			stdin: "ignore",
+			env: buildChildEnv("browser-app", { parentEnv: Bun.env }),
 		});
 		child.unref();
 		subprocess = child;

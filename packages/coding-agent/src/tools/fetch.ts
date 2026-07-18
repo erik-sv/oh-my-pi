@@ -9,6 +9,7 @@ import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { $which, ptree, truncate } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { readEditableNotebookText } from "../edit/notebook";
+import { buildChildEnv } from "../exec/child-env";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
@@ -613,6 +614,7 @@ export async function renderHtmlToText(
 		allowAbort: true,
 		stderr: "full" as const,
 		signal: overallSignal,
+		env: buildChildEnv("network-helper", { parentEnv: Bun.env }),
 	};
 	const remoteBudgetMs = Math.min(timeout * 1000, REMOTE_READER_MAX_MS);
 	// Per-attempt budget for remote endpoints so one stall cannot consume the

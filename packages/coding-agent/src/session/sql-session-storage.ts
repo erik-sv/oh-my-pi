@@ -469,35 +469,37 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async writeFull(path: string, content: string, mtimeMs: number, title?: SessionTitleUpdate): Promise<void> {
-		await this.#client.begin(async transaction => {
+		await this.#withPathLocks([path], async transaction => {
 			await transaction.unsafe(this.#q.delete, [path]);
 			await this.#insertChunks(transaction, path, splitChunks(content), mtimeMs, 0, title);
 		});
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.updateTitle, [
-			title.title ?? null,
-			title.source ?? null,
-			title.updatedAt,
-			mtimeMs,
-			path,
-		]);
+		await this.#withPathLocks([path], async transaction => {
+			await transaction.unsafe(this.#q.updateTitle, [
+				title.title ?? null,
+				title.source ?? null,
+				title.updatedAt,
+				mtimeMs,
+				path,
+			]);
+		});
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
-		const firstChunks = (await this.#client.unsafe(this.#q.readFirstChunks, [path])) as ChunkRow[];
-		if (firstChunks.length === 1 && firstChunks[0].content === "") {
-			const title = rowTitleUpdate(firstChunks[0]);
-			await this.#client.begin(async transaction => {
+		await this.#withPathLocks([path], async transaction => {
+			const firstChunks = (await transaction.unsafe(this.#q.readFirstChunks, [path])) as ChunkRow[];
+			if (firstChunks.length === 1 && firstChunks[0].content === "") {
+				const title = rowTitleUpdate(firstChunks[0]);
 				await transaction.unsafe(this.#q.delete, [path]);
 				await this.#insertChunks(transaction, path, [line], mtimeMs, 0, title);
-			});
-			return;
-		}
-		const lastFirstSeq = firstChunks.length === 1 ? toNumber(firstChunks[0].seq) + 1 : undefined;
-		const seq = lastFirstSeq ?? (await this.#nextSeq(this.#client, path));
-		await this.#insertChunks(this.#client, path, [line], mtimeMs, seq);
+				return;
+			}
+			const lastFirstSeq = firstChunks.length === 1 ? toNumber(firstChunks[0].seq) + 1 : undefined;
+			const seq = lastFirstSeq ?? (await this.#nextSeq(transaction, path));
+			await this.#insertChunks(transaction, path, [line], mtimeMs, seq);
+		});
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
@@ -505,16 +507,41 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async remove(paths: string[]): Promise<void> {
-		await this.#client.begin(async transaction => {
+		await this.#withPathLocks(paths, async transaction => {
 			for (const path of paths) await transaction.unsafe(this.#q.delete, [path]);
 		});
 	}
 
 	async move(src: string, dst: string, mtimeMs: number): Promise<void> {
-		await this.#client.begin(async transaction => {
+		await this.#withPathLocks([src, dst], async transaction => {
 			await transaction.unsafe(this.#q.delete, [dst]);
 			await transaction.unsafe(this.#q.rename, [dst, mtimeMs, src]);
 		});
+	}
+
+	async #withPathLocks<T>(
+		paths: readonly string[],
+		callback: (transaction: SqlSessionStorageTransactionClient) => Promise<T>,
+	): Promise<T> {
+		if (this.#adapter !== "postgres") return this.#client.begin(callback);
+
+		let failure: Error | undefined;
+		const result = await this.#client.begin(async transaction => {
+			await transaction.unsafe("SAVEPOINT omp_path_mutation");
+			try {
+				for (const path of [...new Set(paths)].sort()) {
+					const key = createHash("sha256").update(path).digest().readBigInt64BE().toString();
+					await transaction.unsafe("SELECT pg_advisory_xact_lock($1::bigint)", [key]);
+				}
+				return await callback(transaction);
+			} catch (error) {
+				failure = toError(error);
+				await transaction.unsafe("ROLLBACK TO SAVEPOINT omp_path_mutation");
+				return undefined as T;
+			}
+		});
+		if (failure) throw new Error(failure.message);
+		return result;
 	}
 
 	async #migrateDefaultLegacyRows(client: SqlSessionStorageClient): Promise<void> {

@@ -18,10 +18,15 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { refreshBunGitCache } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/bun-git-cache";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/manager";
 import * as piUtils from "@oh-my-pi/pi-utils";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import type { Subprocess } from "bun";
+
+interface SpawnOptions {
+	env?: Record<string, string | undefined>;
+}
 
 function textStream(text: string): ReadableStream<Uint8Array> {
 	const body = new Response(text).body;
@@ -525,5 +530,168 @@ describe("PluginManager.install with git sources", () => {
 	test("still rejects invalid npm names with the original error", async () => {
 		const mgr = new PluginManager(tmpRoot);
 		await expect(mgr.install("Invalid Name With Spaces")).rejects.toThrow(/Invalid (package name|characters)/);
+	});
+
+	test("passes an explicit sanitized env to plugin package-manager children", async () => {
+		await Bun.write(
+			pluginsPkgJson,
+			JSON.stringify({ name: "omp-plugins", private: true, dependencies: {} }, null, 2),
+		);
+		const poisoned = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		let installOptions: SpawnOptions | undefined;
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[], options?: SpawnOptions) => {
+			installOptions = options;
+			const prepare = (async () => {
+				await Bun.write(
+					pluginsPkgJson,
+					JSON.stringify(
+						{ name: "omp-plugins", private: true, dependencies: { "env-plugin": "github:foo/env-plugin" } },
+						null,
+						2,
+					),
+				);
+				const installedDir = path.join(pluginsNodeModules, "env-plugin");
+				await fs.mkdir(installedDir, { recursive: true });
+				await Bun.write(
+					path.join(installedDir, "package.json"),
+					JSON.stringify({ name: "env-plugin", version: "1.0.0" }),
+				);
+			})();
+			expect(cmd).toEqual(["bun", "install", "github:foo/env-plugin"]);
+			return {
+				pid: 1,
+				stdout: emptyStream(),
+				stderr: emptyStream(),
+				exitCode: 0,
+				exited: prepare.then(() => 0),
+			} as Subprocess;
+		}) as typeof Bun.spawn);
+
+		try {
+			const installed = await new PluginManager(tmpRoot).install("github:foo/env-plugin");
+			expect(installed.name).toBe("env-plugin");
+			expect(installOptions?.env).toBeDefined();
+			expect(installOptions?.env?.PATH).toBe(process.env.PATH);
+			expect(installOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(installOptions?.env).not.toHaveProperty("DATABASE_URL");
+			expect(installOptions?.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(installOptions?.env).not.toHaveProperty("JWT_SECRET");
+			expect(installOptions?.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
+	test("passes an explicit sanitized env to plugin uninstall children", async () => {
+		await Bun.write(
+			pluginsPkgJson,
+			JSON.stringify({ name: "omp-plugins", private: true, dependencies: { "env-plugin": "1.0.0" } }, null, 2),
+		);
+		const poisoned = {
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		let uninstallOptions: SpawnOptions | undefined;
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[], options?: SpawnOptions) => {
+			uninstallOptions = options;
+			expect(cmd).toEqual(["bun", "uninstall", "env-plugin"]);
+			return {
+				pid: 1,
+				stdout: emptyStream(),
+				stderr: emptyStream(),
+				exitCode: 0,
+				exited: Promise.resolve(0),
+			} as Subprocess;
+		}) as typeof Bun.spawn);
+
+		try {
+			await new PluginManager(tmpRoot).uninstall("env-plugin");
+			expect(uninstallOptions?.env).toBeDefined();
+			expect(uninstallOptions?.env?.PATH).toBe(process.env.PATH);
+			expect(uninstallOptions?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+			expect(uninstallOptions?.env).not.toHaveProperty("DATABASE_URL");
+			expect(uninstallOptions?.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+			expect(uninstallOptions?.env).not.toHaveProperty("JWT_SECRET");
+			expect(uninstallOptions?.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	});
+
+	test("keeps GitHub auth but strips unrelated ambient secrets from plugin git-cache children", async () => {
+		const cacheDir = path.join(tmpRoot, "env-bun-cache");
+		await fs.mkdir(path.join(cacheDir, "github.com-foo-env-plugin.git"), { recursive: true });
+		const poisoned = {
+			GH_TOKEN: "explicit-github-auth",
+			GITHUB_TOKEN: "explicit-github-token",
+			ANTHROPIC_API_KEY: "ambient-provider-secret",
+			DATABASE_URL: "postgres://ambient-storage-secret",
+			AGENTDESK_CONTROL_TOKEN: "ambient-control-secret",
+			JWT_SECRET: "ambient-jwt-secret",
+			GENERIC_SERVICE_SECRET: "ambient-generic-secret",
+		};
+		const saved = Object.fromEntries(Object.keys(poisoned).map(key => [key, process.env[key]]));
+		Object.assign(process.env, poisoned);
+		const childOptions: SpawnOptions[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(((cmd: string[], options?: SpawnOptions) => {
+			childOptions.push(options ?? {});
+			const stdout =
+				cmd[0] === "bun" ? cacheDir : cmd.includes("config") ? "https://github.com/foo/env-plugin.git" : "";
+			return {
+				pid: 1,
+				stdout: textStream(stdout),
+				stderr: emptyStream(),
+				exitCode: 0,
+				exited: Promise.resolve(0),
+			} as Subprocess;
+		}) as typeof Bun.spawn);
+
+		try {
+			await refreshBunGitCache(
+				{
+					type: "git",
+					repo: "https://github.com/foo/env-plugin.git",
+					host: "github.com",
+					path: "foo/env-plugin",
+					pinned: false,
+				},
+				tmpRoot,
+			);
+			expect(childOptions).toHaveLength(3);
+			for (const options of childOptions) {
+				expect(options.env).toEqual(
+					expect.objectContaining({ GH_TOKEN: "explicit-github-auth", GITHUB_TOKEN: "explicit-github-token" }),
+				);
+				expect(options.env).not.toHaveProperty("ANTHROPIC_API_KEY");
+				expect(options.env).not.toHaveProperty("DATABASE_URL");
+				expect(options.env).not.toHaveProperty("AGENTDESK_CONTROL_TOKEN");
+				expect(options.env).not.toHaveProperty("JWT_SECRET");
+				expect(options.env).not.toHaveProperty("GENERIC_SERVICE_SECRET");
+			}
+		} finally {
+			for (const [key, value] of Object.entries(saved)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	});
 });

@@ -10,6 +10,7 @@ import {
 	resolveRuntimeModule,
 } from "@oh-my-pi/pi-utils";
 import packageJson from "../../package.json" with { type: "json" };
+import { buildChildEnv } from "../exec/child-env";
 
 /**
  * Child-side scaffolding shared by the ONNX inference worker bodies
@@ -210,7 +211,10 @@ async function installOnnxRuntimeCudaProviders(packageDir: string, runtimeDir: s
 
 	const proc = Bun.spawn([process.execPath, script], {
 		cwd: runtimeDir,
-		env: { ...Bun.env, BUN_BE_BUN: "1", ONNXRUNTIME_NODE_INSTALL: ONNX_RUNTIME_CUDA_INSTALL },
+		env: buildChildEnv("package-installer", {
+			parentEnv: Bun.env,
+			patches: { BUN_BE_BUN: "1", ONNXRUNTIME_NODE_INSTALL: ONNX_RUNTIME_CUDA_INSTALL },
+		}),
 		stdout: "pipe",
 		stderr: "pipe",
 	});

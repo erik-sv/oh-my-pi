@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
 import { $which, logger } from "@oh-my-pi/pi-utils";
+import { buildChildEnv } from "../exec/child-env";
 
 const URL_SCHEME_PATTERN = /^[a-zA-Z][a-zA-Z\d+.-]*:/;
 
@@ -22,7 +23,11 @@ function getExistingWslLocalPath(urlOrPath: string): string | undefined {
 				: path.resolve(urlOrPath);
 		if (!localPath || !fs.existsSync(localPath)) return undefined;
 
-		const result = Bun.spawnSync(["wslpath", "-w", localPath], { stdout: "pipe", stderr: "ignore" });
+		const result = Bun.spawnSync(["wslpath", "-w", localPath], {
+			env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
+			stdout: "pipe",
+			stderr: "ignore",
+		});
 		if (result.exitCode !== 0) return undefined;
 
 		return result.stdout.toString().trim() || undefined;
@@ -93,7 +98,12 @@ export function openPath(urlOrPath: string): void {
 	}
 	let child: Bun.Subprocess | undefined;
 	try {
-		child = Bun.spawn(cmd, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+		child = Bun.spawn(cmd, {
+			env: buildChildEnv("desktop-helper", { parentEnv: process.env }),
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
 	} catch (error) {
 		// Spawn threw synchronously (missing binary, denied exec, sandbox
 		// restriction, …). Best-effort: log so the failure isn't invisible while
