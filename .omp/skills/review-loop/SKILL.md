@@ -82,6 +82,11 @@ agent definition (`~/.omp/agent/agents/*.md`) - cheaper than spawning peer
 processes, visible in AgentDesk session activity, and lifecycle-managed (idle
 agents park; no orphan processes):
 
+Every plan and completion gate MUST consult BOTH `openai-think` and
+`anthropic-think` before scoring. A gate cannot clear when either role is
+missing, fails, or returns no actionable assessment. Give both the same
+factual packet independently; add their findings to the scorer packet.
+
 - `reviewer-gpt55` - read-only scorer, `openai-codex/gpt-5.5:xhigh`.
 - `reviewer-opus` - read-only scorer, latest Opus (`anthropic/claude-opus-4-8:high`).
 - `sweep-gpt55` - edit-capable worker, GPT-5.5: simplification pass, security sweep.
@@ -100,6 +105,10 @@ instead of re-spawning and re-sending the full packet - it still holds the
 prior cycle in its own thread, and the lead's context stays lean. Pass bulky
 packets as `local://` file references, never inline. Spawn fresh reviewers only
 at gate start or if the old one was lost.
+
+The think-agent requirement has no fallback to a generic `task` role. Missing
+`openai-think` or `anthropic-think` blocks the gate and MUST be fixed before
+the loop continues.
 
 If the pinned agents are missing on this machine (`task` reports unknown
 agent), recreate them from this skill's contract or fall back to `task` with an
@@ -302,7 +311,7 @@ Bar: 9.5  Max cycles: 5  Worktree/branch: <path|n/a>  Resumed at: <phase>
   and conflict resolution. Never two writers in the tree at once.
 - Rubric-anchored scores only; a bare number with no findings is rejected and
   re-reviewed. Never average reviewers; both must clear each dimension.
-- In-process `task` subagents only. Never the legacy AgentDesk `/subagent` route.
+- In-process `task` subagents only. Never use the legacy AgentDesk `/subagent` route or spawn separate agent processes.
 - Do not broaden the feature. Out-of-scope findings become follow-ups.
 - A clean pass must say what was inspected and why nothing blocked.
 - UI changes need puppeteer at desktop AND mobile viewports; local CI must be
