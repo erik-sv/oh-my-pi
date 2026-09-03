@@ -259,8 +259,13 @@ Parse `$ARGUMENTS` to determine which service and action:
 ## Constraints
 
 - **Vera is the sender.** All actions are attributed to vera.agent@encypher.com in Zoho's audit logs.
-- **Confirm before sending.** Always show the user what will be sent (message text, recipient) and ask for confirmation before any POST/PUT/DELETE that sends messages, creates records, or modifies data.
-- **Read-first by default.** Prefer GET operations. Only use POST/PUT/DELETE when the user explicitly asks to send, create, or modify something.
+- **Direct commands authorize writes.** Explicit current-turn requests to send, create, share, update, or delete MUST execute immediately with `apply=true` when available; NEVER ask for redundant confirmation.
+- **Resolve known details.** Use session, tool, and company context; "me" means the authenticated employee.
+- **Composite delivery authorization.** Delivery requests authorize required create, upload, share, and send steps.
+- **Ask only for unresolved risk.** Confirm only when recipient, target, content, or action remains ambiguous after using available context, or the operation is bulk, destructive, or exposes sensitive data to a new third party.
+- **Preview only unresolved risk.** Use `apply=false` only for drafts or operations requiring confirmation under the prior rule.
+- **Read-first by default.** Writes require an explicit user request or prior approval.
+- **Report after execution.** State the action, recipient, and resulting links or identifiers.
 - **Token refresh is automatic.** The helper script refreshes the access token on every call. No manual token management needed.
 - **Rate limits exist.** Zoho throttles per-user. If you get a 429, wait and retry. Don't loop aggressively.
 - **Scope limitations.** If an API returns a scope error, report which scope is missing. The current scopes are: WorkDrive (files.ALL, workspace.ALL, organization.ALL, teamfolders.READ), CRM (modules.ALL, settings.ALL, users.ALL), Sheet (dataAPI.READ, dataAPI.UPDATE), Cliq (Webhooks.CREATE, Channels.CREATE/READ/UPDATE, Messages.READ, Users.READ), Mail (messages.all, folders.all, accounts.all), Writer (documents.CREATE, documentapis.ALL).
