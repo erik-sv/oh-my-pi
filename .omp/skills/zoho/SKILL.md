@@ -260,11 +260,12 @@ Parse `$ARGUMENTS` to determine which service and action:
 
 - **Vera is the sender.** All actions are attributed to vera.agent@encypher.com in Zoho's audit logs.
 - **Direct commands authorize writes.** Explicit current-turn requests to send, create, share, update, or delete MUST execute immediately with `apply=true` when available; NEVER ask for redundant confirmation.
+- **Standing duties authorize routine writes.** System, project, or user instructions assigning CRM maintenance, relationship tracking, follow-ups, or recordkeeping count as prior approval; execute required routine creates, updates, and upserts with `apply=true`.
 - **Resolve known details.** Use session, tool, and company context; "me" means the authenticated employee.
 - **Composite delivery authorization.** Delivery requests authorize required create, upload, share, and send steps.
 - **Ask only for unresolved risk.** Confirm only when recipient, target, content, or action remains ambiguous after using available context, or the operation is bulk, destructive, or exposes sensitive data to a new third party.
 - **Preview only unresolved risk.** Use `apply=false` only for drafts or operations requiring confirmation under the prior rule.
-- **Read-first by default.** Writes require an explicit user request or prior approval.
+- **Read-first by default.** Writes require a direct request, standing duty, or prior approval.
 - **Report after execution.** State the action, recipient, and resulting links or identifiers.
 - **Token refresh is automatic.** The helper script refreshes the access token on every call. No manual token management needed.
 - **Rate limits exist.** Zoho throttles per-user. If you get a 429, wait and retry. Don't loop aggressively.
