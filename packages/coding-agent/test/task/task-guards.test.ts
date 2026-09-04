@@ -27,7 +27,7 @@ import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 
 interface SteerCall {
 	content: string;
-	options?: { deliverAs?: "steer" | "followUp" };
+	options?: { deliverAs?: "steer" | "followUp" | "aside" };
 }
 
 interface FakeSessionConfig {
@@ -81,6 +81,7 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 		extensionRunner: undefined as never,
 		sessionManager: { appendSessionInit: () => {} } as never,
 		getActiveToolNames: () => ["read", "yield"],
+		getEnabledToolNames: () => ["read", "yield"],
 		setActiveToolsByName: async (_names: string[]) => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			if (config.events?.length) {
@@ -98,6 +99,8 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 		waitForIdle: async () => {
 			await hang;
 		},
+		prepareForHeadlessAdvisorDrain: () => {},
+		waitForAdvisorCatchup: async () => true,
 		sendUserMessage: async (content, options) => {
 			steerCalls.push({ content: String(content), options });
 		},
@@ -107,6 +110,8 @@ function createFakeSession(config: FakeSessionConfig = {}): FakeSessionHandle {
 			releaseHang();
 		},
 		dispose: async () => {},
+		setIrcWakeTurnObserver: () => {},
+		subscribeRunState: () => () => {},
 	};
 	return {
 		session: session as AgentSession,

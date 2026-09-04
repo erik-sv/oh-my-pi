@@ -1,4 +1,6 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type {
 	Api,
 	ApiKeyResolver,
@@ -8,18 +10,27 @@ import type {
 	Model,
 	SimpleStreamOptions,
 } from "@oh-my-pi/pi-ai";
-import { type BenchModelRegistry, type BenchSummary, runBenchCommand } from "@oh-my-pi/pi-coding-agent/cli/bench-cli";
-import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
+import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-models";
+import { type BenchSummary, runBenchCommand } from "@oh-my-pi/pi-coding-agent/cli/bench-cli";
+import type { BenchModelRegistry } from "@oh-my-pi/pi-coding-agent/cli/bench-runtime";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { getModelDbPath, TempDir } from "@oh-my-pi/pi-utils";
 
 function fakeModel(provider: string, id: string): Model<Api> {
-	return {
+	return buildModel({
 		provider,
 		id,
 		name: id,
 		api: "openai-completions",
+		baseUrl: "https://example.test/v1",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		maxTokens: 4096,
 		contextWindow: 128_000,
-	} as unknown as Model<Api>;
+	});
 }
 
 function fakeStream(): AssistantMessageEventStream {
@@ -65,6 +76,7 @@ function fakeRegistry(opts: FakeRegistryOptions): BenchModelRegistry {
 	const authed = new Set(opts.authedProviders);
 	return {
 		getAll: () => opts.models,
+		getAvailable: () => opts.models.filter(model => authed.has(model.provider)),
 		hasConfiguredAuth: model => authed.has(model.provider),
 		getApiKey: async model => (authed.has(model.provider) ? "sk-test" : undefined),
 		resolver: () => (() => Promise.resolve("sk-test")) as unknown as ApiKeyResolver,
@@ -75,12 +87,13 @@ async function runBench(
 	selector: string,
 	registry: BenchModelRegistry,
 	streamFactory: () => AssistantMessageEventStream = fakeStream,
+	settings?: Settings,
 ) {
 	const stderr: string[] = [];
 	const summary = await runBenchCommand(
 		{ models: [selector], flags: { runs: 1, maxTokens: 64, json: false } },
 		{
-			createRuntime: async () => ({ modelRegistry: registry, settings: undefined, close: () => {} }),
+			createRuntime: async () => ({ modelRegistry: registry, settings, close: () => {} }),
 			randomSessionId: () => "sess-1",
 			writeStdout: () => {},
 			writeStderr: text => stderr.push(text),
@@ -92,6 +105,75 @@ async function runBench(
 	);
 	return { summary, stderr: stderr.join("") };
 }
+describe("default bench runtime", () => {
+	it("hydrates credential-scoped model caches before selector resolution", async () => {
+		const tempDir = TempDir.createSync("@omp-bench-runtime-");
+		const apiKey = "bench-cache-test-key";
+		const modelId = "cached-bench-model";
+		const cacheDbPath = getModelDbPath(tempDir.path());
+		await fs.mkdir(path.dirname(cacheDbPath), { recursive: true });
+		try {
+			writeModelCache(
+				resolveModelCacheProviderId("opencode-go", { apiKey }),
+				Date.now(),
+				[
+					buildModel({
+						id: modelId,
+						name: "Cached Bench Model",
+						provider: "opencode-go",
+						api: "openai-completions",
+						baseUrl: "https://opencode.ai/zen/go/v1",
+						reasoning: false,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 128_000,
+						maxTokens: 4096,
+					}),
+				],
+				true,
+				"",
+				cacheDbPath,
+			);
+			const script = `
+				import { createDefaultBenchRuntime, resolveBenchTargets } from "./packages/coding-agent/src/cli/bench-runtime.ts";
+				const runtime = await createDefaultBenchRuntime();
+				try {
+					const [target] = resolveBenchTargets(
+						["opencode-go/${modelId}"],
+						runtime.modelRegistry,
+						runtime.settings,
+						() => {},
+					);
+					console.log(target.model.provider + "/" + target.model.id);
+				} finally {
+					runtime.close?.();
+				}
+			`;
+			const child = Bun.spawn([process.execPath, "-e", script], {
+				cwd: path.resolve(import.meta.dir, "../../.."),
+				env: {
+					...process.env,
+					NO_COLOR: "1",
+					OPENCODE_API_KEY: apiKey,
+					PI_CODING_AGENT_DIR: tempDir.path(),
+				},
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [stdout, stderr, exitCode] = await Promise.all([
+				new Response(child.stdout).text(),
+				new Response(child.stderr).text(),
+				child.exited,
+			]);
+
+			expect(exitCode).toBe(0);
+			expect(stderr).toBe("");
+			expect(stdout.trim()).toBe(`opencode-go/${modelId}`);
+		} finally {
+			await tempDir.remove();
+		}
+	});
+});
 
 describe("bench credential-aware provider selection", () => {
 	it("redirects an ambiguous shared-id selector to an authenticated provider", async () => {
@@ -141,6 +223,36 @@ describe("bench credential-aware provider selection", () => {
 	});
 });
 
+describe("bench configured role selection", () => {
+	it("resolves configured bare role names", async () => {
+		const model = fakeModel("acme", "bench-model");
+		const registry = fakeRegistry({ models: [model], authedProviders: ["acme"] });
+		const settings = Settings.isolated({ modelRoles: { task: "acme/bench-model" } });
+
+		const { summary } = await runBench("task", registry, fakeStream, settings);
+
+		expect(summary.models[0].model).toBe("acme/bench-model");
+		expect(summary.failures).toBe(0);
+	});
+
+	it("honors provider-pinned configured role targets", async () => {
+		const registry = fakeRegistry({
+			models: [fakeModel("groq", "openai/gpt-oss-20b"), fakeModel("openrouter", "openai/gpt-oss-20b")],
+			authedProviders: ["openrouter"],
+		});
+		const settings = Settings.isolated({
+			modelRoles: { task: "groq/openai/gpt-oss-20b" },
+		});
+
+		const { summary, stderr } = await runBench("task", registry, fakeStream, settings);
+
+		expect(summary.models[0].model).toBe("groq/openai/gpt-oss-20b");
+		expect(summary.failures).toBe(1);
+		expect(summary.models[0].results[0]).toMatchObject({ ok: false });
+		expect(stderr).not.toContain("benchmarking");
+	});
+});
+
 describe("bench empty-output guard", () => {
 	it("reports a run with no streamed content and no tokens as a failure", async () => {
 		const registry = fakeRegistry({ models: [fakeModel("acme", "model-x")], authedProviders: ["acme"] });
@@ -151,7 +263,7 @@ describe("bench empty-output guard", () => {
 		const run = summary.models[0].results[0];
 		expect(run.ok).toBe(false);
 		if (!run.ok) expect(run.error).toContain("no output");
-		expect(summary.models[0].average).toBeNull();
+		expect(summary.models[0].stats).toBeNull();
 	});
 });
 

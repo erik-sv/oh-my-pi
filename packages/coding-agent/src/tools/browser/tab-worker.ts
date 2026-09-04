@@ -2,8 +2,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { postmortem, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
-import type { HTMLElement } from "linkedom";
+import { postmortem, Snowflake, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
+import type { HTMLElement } from "@oh-my-pi/pi-utils/dom";
 import type {
 	Browser,
 	CDPSession,
@@ -11,7 +11,7 @@ import type {
 	ElementHandle,
 	ElementScreenshotOptions,
 	HTTPResponse,
-	ImageFormat,
+	KeyboardTypeOptions,
 	KeyInput,
 	Page,
 	SerializedAXNode,
@@ -21,9 +21,23 @@ import { JsRuntime, type RuntimeHooks } from "../../eval/js/shared/runtime";
 import { resizeImage } from "../../utils/image-resize";
 import { resolveToCwd } from "../path-utils";
 import { formatScreenshot } from "../render-utils";
+import {
+	bindRunFacade,
+	CELL_BUDGET_SLACK_MS,
+	installBrowserWorkerRejectionGuard,
+	isBrowserRunOwnedRejection,
+	markBrowserRunRejection,
+	markHandled,
+	observeBrowserRunPromise,
+	resolvePredicateTimeout,
+	type WaitPredicateOptions,
+	waitForRun,
+	withBrowserPromiseCombinatorTracking,
+} from "../run-scope";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tool-errors";
 import {
 	type AriaSnapshotOptions,
+	assertSelectorString,
 	captureAriaSnapshot,
 	parseAriaRefSelector,
 	resolveAriaRefHandle,
@@ -36,13 +50,7 @@ import {
 	loadPuppeteerInWorker,
 } from "./launch";
 import { extractReadableFromHtml, type ReadableFormat } from "./readable";
-import {
-	CELL_BUDGET_SLACK_MS,
-	markHandled,
-	resolvePredicateTimeout,
-	type WaitPredicateOptions,
-	waitForBrowserRun,
-} from "./run-cancellation";
+
 import { cloneSafe, RunOutput } from "./run-output";
 import type {
 	Observation,
@@ -71,6 +79,7 @@ declare global {
 	var innerHeight: number;
 	var document: {
 		elementFromPoint(x: number, y: number): Element | null;
+		readonly visibilityState: "visible" | "hidden";
 	};
 }
 
@@ -144,6 +153,8 @@ interface OpenDialogInfo {
  */
 const QUICK_OP_TIMEOUT_MS = 20_000;
 const ACTION_OP_TIMEOUT_MS = 8_000;
+/** Maximum wait for a renderer acknowledgement after a wheel event is queued. */
+const SCROLL_ACK_TIMEOUT_MS = 2_000;
 /** Headroom subtracted from the cell budget so a per-op deadline fires before it. */
 const OP_DEADLINE_SLACK_MS = CELL_BUDGET_SLACK_MS;
 /**
@@ -155,6 +166,10 @@ const OP_DEADLINE_SLACK_MS = CELL_BUDGET_SLACK_MS;
 const ZERO_MATCH_FAIL_FAST_MS = 2_000;
 /** Poll cadence for the zero-match watchdog. */
 const ZERO_MATCH_POLL_MS = 250;
+/** Cleanup must settle inside the supervisor's 750ms post-run grace window. */
+const REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS = 500;
+/** Bound cleanup window after a timed-out raw handle action. */
+const HANDLE_ACTION_INVALIDATION_TIMEOUT_MS = 500;
 
 export interface OpTimeouts {
 	/** Largest per-op deadline allowed — strictly below the cell budget. */
@@ -173,6 +188,21 @@ export function resolveOpTimeouts(cellTimeoutMs: number): OpTimeouts {
 		quickOpMs: Math.min(budgetBound, QUICK_OP_TIMEOUT_MS),
 		actionOpMs: Math.min(budgetBound, ACTION_OP_TIMEOUT_MS),
 	};
+}
+
+/** Queue a wheel event without treating a delayed renderer acknowledgement as dispatch failure. */
+export async function dispatchScroll(
+	dispatch: () => Promise<void>,
+	ackTimeoutMs = SCROLL_ACK_TIMEOUT_MS,
+): Promise<void> {
+	const deadline = Promise.withResolvers<void>();
+	const timer = setTimeout(() => deadline.resolve(), ackTimeoutMs);
+	timer.unref();
+	try {
+		await Promise.race([dispatch(), deadline.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 /**
@@ -196,7 +226,6 @@ export function resolveWaitTimeout(cellTimeoutMs: number, explicit?: number): nu
 interface ScreenshotOptions {
 	selector?: string;
 	fullPage?: boolean;
-	save?: string;
 	silent?: boolean;
 }
 
@@ -212,7 +241,7 @@ interface TabApi {
 	): Promise<void>;
 	observe(opts?: { includeAll?: boolean; viewportOnly?: boolean }): Promise<Observation>;
 	ariaSnapshot(selector?: string, opts?: AriaSnapshotOptions): Promise<string>;
-	screenshot(opts?: ScreenshotOptions): Promise<ScreenshotResult>;
+	screenshot(opts?: ScreenshotOptions): Promise<string>;
 	extract(format?: ReadableFormat): Promise<string>;
 	click(selector: string): Promise<void>;
 	type(selector: string, text: string): Promise<void>;
@@ -221,10 +250,7 @@ interface TabApi {
 	scroll(deltaX: number, deltaY: number): Promise<void>;
 	drag(from: DragTarget, to: DragTarget): Promise<void>;
 	waitFor(selector: string, opts?: { timeout?: number }): Promise<ActionableHandle>;
-	evaluate<TResult, TArgs extends unknown[]>(
-		fn: string | ((...args: TArgs) => TResult | Promise<TResult>),
-		...args: TArgs
-	): Promise<TResult>;
+	evaluate<R, TArgs extends unknown[]>(fn: string | ((...args: TArgs) => R | Promise<R>), ...args: TArgs): Promise<R>;
 	scrollIntoView(selector: string): Promise<void>;
 	select(selector: string, ...values: string[]): Promise<string[]>;
 	uploadFile(selector: string, ...filePaths: string[]): Promise<void>;
@@ -246,6 +272,7 @@ interface TabApi {
 }
 
 export function normalizeSelector(selector: string): string {
+	assertSelectorString(selector);
 	if (!selector) return selector;
 	if (
 		!SELECTOR_HANDLER_PREFIXES.some(prefix => selector.startsWith(prefix)) &&
@@ -293,18 +320,197 @@ function asElementHandle(handle: unknown): ElementHandle | null {
 export type ActionableHandle = ElementHandle & { fill(value: string): Promise<void> };
 
 /**
- * Attach `fill()` to a puppeteer ElementHandle before handing it to user code.
- * Puppeteer handles expose `type()` but no `fill()`; the semantics mirror the
- * selector-based `tab.fill()`: focus, clear any existing value, then type.
+ * A named per-op guard: runs `fn` inside the active run's fail-fast deadline and
+ * in-flight tracking (the same wrapper `tab.click(selector)` uses), so a stalled
+ * handle action rejects with a named error before the cell budget instead of
+ * hanging on puppeteer's protocol timeout.
  */
-export function toActionableHandle(handle: ElementHandle): ActionableHandle {
-	const enriched = handle as ActionableHandle;
-	enriched.fill = value => fillViaHandle(enriched, value);
+export type HandleOpGuard = <T>(label: string, fn: (signal: AbortSignal) => Promise<T>) => Promise<T>;
+
+/**
+ * Every `ElementHandle` method that dispatches input, pointer/touch, drag, or navigation
+ * work and can therefore stall on a busy page. When {@link toActionableHandle} is given a
+ * guard, each is routed through the per-op fail-fast wrapper; without it the inherited
+ * puppeteer method runs outside the op map and a stall consumes the whole cell (issue #9535).
+ * Pure reads (`boundingBox`, `screenshot`, `evaluate`, queries) are omitted — they are not
+ * user-driven actions and keep their native puppeteer behavior.
+ */
+const GUARDED_HANDLE_METHODS = [
+	"click",
+	"type",
+	"hover",
+	"tap",
+	"focus",
+	"press",
+	"select",
+	"uploadFile",
+	"scrollIntoView",
+	"drag",
+	"dragEnter",
+	"dragOver",
+	"drop",
+	"dragAndDrop",
+	"touchStart",
+	"touchMove",
+	"touchEnd",
+	"autofill",
+] as const satisfies readonly (keyof ElementHandle)[];
+
+type GuardedHandleMethod = (typeof GUARDED_HANDLE_METHODS)[number];
+type RawHandleMethod = (...args: unknown[]) => Promise<unknown>;
+
+interface RawHandleMethods {
+	interactive: Partial<Record<GuardedHandleMethod, RawHandleMethod>>;
+	type: ElementHandle["type"];
+	invalidatedBy?: string;
+}
+
+/** Symbol-keyed original methods travel with each cached handle without enumerating or colliding. */
+const RAW_HANDLE_METHODS = Symbol("browser.rawHandleMethods");
+
+type HandleWithRawMethods = ActionableHandle & { [RAW_HANDLE_METHODS]?: RawHandleMethods };
+
+async function runGuardedHandleAction<T>(
+	handle: ElementHandle,
+	state: RawHandleMethods,
+	label: string,
+	signal: AbortSignal,
+	action: () => Promise<T>,
+	invalidate?: () => Promise<void>,
+): Promise<T> {
+	if (state.invalidatedBy) {
+		throw new ToolError(
+			`${label} cannot run: this handle was invalidated after ${state.invalidatedBy} timed out; ` +
+				"run tab.observe() or tab.ariaSnapshot() to resolve a fresh handle",
+		);
+	}
+	throwIfAborted(signal);
+	const pending = action();
+	try {
+		return await untilAborted(signal, () => pending);
+	} catch (error) {
+		if (!signal.aborted) throw error;
+		state.invalidatedBy = label;
+		void pending.catch(() => undefined);
+		await withTimeout(
+			Promise.all([handle.dispose().catch(() => undefined), invalidate?.().catch(() => undefined)]),
+			HANDLE_ACTION_INVALIDATION_TIMEOUT_MS,
+			`Timed out invalidating ${label}`,
+		).catch(() => undefined);
+		throw error;
+	}
+}
+
+/**
+ * Attach `fill()` to a puppeteer ElementHandle before handing it to user code and,
+ * when a `guard` is supplied, route every interactive method ({@link GUARDED_HANDLE_METHODS})
+ * through the same fail-fast per-op wrapper as the selector-based helpers — so
+ * `(await tab.id(n)).click()` fails fast with `handle.click() timed out after …ms`
+ * instead of stalling until the whole browser cell expires. Repeated enrichment is
+ * idempotent: cached handles are always rewrapped from their original bound methods,
+ * never from wrappers retaining an earlier run's guard. A timed-out action invalidates
+ * and disposes its handle before surfacing the named error, so catching it cannot
+ * dispatch a duplicate retry through the stale handle. Puppeteer handles expose
+ * `type()` but no `fill()`; the `fill()` semantics mirror the selector-based
+ * `tab.fill()`: focus, clear any existing value, then type.
+ */
+export function toActionableHandle(
+	handle: ElementHandle,
+	guard?: HandleOpGuard,
+	invalidate?: () => Promise<void>,
+): ActionableHandle {
+	const enriched = handle as HandleWithRawMethods;
+	const methods = enriched as unknown as Partial<Record<GuardedHandleMethod, RawHandleMethod>>;
+	const preserved = enriched[RAW_HANDLE_METHODS];
+	if (!guard) {
+		if (preserved) {
+			for (const method of GUARDED_HANDLE_METHODS) {
+				const original = preserved.interactive[method];
+				if (original) methods[method] = original;
+			}
+		}
+		enriched.fill = value => fillViaHandle(enriched, value, undefined, preserved?.type);
+		return enriched;
+	}
+
+	let originals = preserved;
+	if (!originals) {
+		const interactive: Partial<Record<GuardedHandleMethod, RawHandleMethod>> = {};
+		for (const method of GUARDED_HANDLE_METHODS) {
+			const original = methods[method];
+			if (typeof original === "function") interactive[method] = original.bind(enriched);
+		}
+		originals = { interactive, type: enriched.type.bind(enriched) };
+		enriched[RAW_HANDLE_METHODS] = originals;
+	}
+
+	for (const method of GUARDED_HANDLE_METHODS) {
+		if (method === "type") continue;
+		const original = originals.interactive[method];
+		if (!original) continue;
+		methods[method] = (...args) =>
+			guard(`handle.${method}()`, signal =>
+				runGuardedHandleAction(
+					enriched,
+					originals,
+					`handle.${method}()`,
+					signal,
+					() => original(...args),
+					invalidate,
+				),
+			);
+	}
+	enriched.type = (text, options) =>
+		guard<void>("handle.type()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.type()",
+				signal,
+				() => typeViaHandle(enriched, text, options, signal),
+				invalidate,
+			),
+		);
+	enriched.fill = value =>
+		guard<void>("handle.fill()", signal =>
+			runGuardedHandleAction(
+				enriched,
+				originals,
+				"handle.fill()",
+				signal,
+				() => fillViaHandle(enriched, value, signal, text => typeViaHandle(enriched, text, { delay: 0 }, signal)),
+				invalidate,
+			),
+		);
 	return enriched;
 }
 
+/** Focus once, then type one code point at a time so abort stops before the next key dispatch. */
+async function typeViaHandle(
+	handle: ElementHandle,
+	text: string,
+	options: Readonly<KeyboardTypeOptions> | undefined,
+	signal: AbortSignal,
+): Promise<void> {
+	await untilAborted(signal, () =>
+		handle.evaluate(el => {
+			const node = el as unknown as { focus?: () => void };
+			node.focus?.();
+		}),
+	);
+	for (const character of text) {
+		throwIfAborted(signal);
+		await untilAborted(signal, () => handle.frame.page().keyboard.type(character, options));
+	}
+}
+
 /** Focus, clear any existing value, then retype — shared by `tab.fill(aria-ref)` and enriched handles. */
-async function fillViaHandle(handle: ElementHandle, value: string, signal?: AbortSignal): Promise<void> {
+async function fillViaHandle(
+	handle: ElementHandle,
+	value: string,
+	signal?: AbortSignal,
+	type: (text: string) => Promise<unknown> = text => handle.type(text, { delay: 0 }),
+): Promise<void> {
 	await untilAborted(signal, () =>
 		handle.evaluate(el => {
 			const node = el as unknown as { value?: string; focus?: () => void };
@@ -312,7 +518,7 @@ async function fillViaHandle(handle: ElementHandle, value: string, signal?: Abor
 			if ("value" in node) node.value = "";
 		}),
 	);
-	await untilAborted(signal, () => handle.type(value, { delay: 0 }));
+	await untilAborted(signal, () => type(value));
 }
 
 /**
@@ -334,12 +540,125 @@ function redactUrlCredentials(url: string): string {
 	}
 }
 
+class RequestInterceptionCleanupError extends ToolError {}
+
+interface RunPageScope {
+	page: Page;
+	cleanup(): Promise<void>;
+}
+
+/**
+ * Expose the tab page while retaining the request handlers created by this run.
+ * Puppeteer's Page wraps an internal emitter, so `removeAllListeners("request")`
+ * would also remove its forwarding listener; the facade removes only user handlers.
+ */
+function createRunPageScope(page: Page): RunPageScope {
+	const requestHandlers: unknown[] = [];
+	const on = page.on;
+	const off = page.off;
+	const once = page.once;
+	const removeAllListeners = page.removeAllListeners;
+	const onDescriptor = Object.getOwnPropertyDescriptor(page, "on");
+	const offDescriptor = Object.getOwnPropertyDescriptor(page, "off");
+	const onceDescriptor = Object.getOwnPropertyDescriptor(page, "once");
+	const removeAllDescriptor = Object.getOwnPropertyDescriptor(page, "removeAllListeners");
+
+	Object.defineProperties(page, {
+		on: {
+			configurable: true,
+			value: (type: unknown, handler: unknown): Page => {
+				Reflect.apply(on, page, [type, handler]);
+				if (type === "request") requestHandlers.push(handler);
+				return page;
+			},
+		},
+		once: {
+			configurable: true,
+			value: (type: unknown, handler: unknown): Page => {
+				if (type !== "request" || typeof handler !== "function") {
+					Reflect.apply(once, page, [type, handler]);
+					return page;
+				}
+				const wrapper = (event: unknown): void => {
+					const index = requestHandlers.lastIndexOf(wrapper);
+					if (index >= 0) requestHandlers.splice(index, 1);
+					Reflect.apply(off, page, ["request", wrapper]);
+					Reflect.apply(handler, page, [event]);
+				};
+				requestHandlers.push(wrapper);
+				Reflect.apply(on, page, [type, wrapper]);
+				return page;
+			},
+		},
+		off: {
+			configurable: true,
+			value: (type: unknown, handler?: unknown): Page => {
+				Reflect.apply(off, page, [type, handler]);
+				if (type === "request") {
+					if (handler === undefined) requestHandlers.length = 0;
+					else {
+						const index = requestHandlers.lastIndexOf(handler);
+						if (index >= 0) requestHandlers.splice(index, 1);
+					}
+				}
+				return page;
+			},
+		},
+		removeAllListeners: {
+			configurable: true,
+			value: (type?: unknown): Page => {
+				Reflect.apply(removeAllListeners, page, [type]);
+				if (type === undefined || type === "request") requestHandlers.length = 0;
+				return page;
+			},
+		},
+	});
+
+	return {
+		page,
+		async cleanup() {
+			if (onDescriptor) Object.defineProperty(page, "on", onDescriptor);
+			else Reflect.deleteProperty(page, "on");
+			if (offDescriptor) Object.defineProperty(page, "off", offDescriptor);
+			else Reflect.deleteProperty(page, "off");
+			if (onceDescriptor) Object.defineProperty(page, "once", onceDescriptor);
+			else Reflect.deleteProperty(page, "once");
+			if (removeAllDescriptor) Object.defineProperty(page, "removeAllListeners", removeAllDescriptor);
+			else Reflect.deleteProperty(page, "removeAllListeners");
+			for (const handler of requestHandlers) Reflect.apply(off, page, ["request", handler]);
+			requestHandlers.length = 0;
+			try {
+				await withTimeout(
+					page.setRequestInterception(false),
+					REQUEST_INTERCEPTION_CLEANUP_TIMEOUT_MS,
+					"Timed out clearing browser request interception",
+				);
+			} catch (error) {
+				throw new RequestInterceptionCleanupError(
+					"Failed to clear browser request interception after browser.run",
+					{
+						error: error instanceof Error ? error.message : String(error),
+					},
+				);
+			}
+		},
+	};
+}
+
 function errorPayload(error: unknown): RunErrorPayload {
+	const recoverTab = error instanceof RequestInterceptionCleanupError || undefined;
 	if (error instanceof ToolAbortError) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: true };
 	}
 	if (error instanceof ToolError) {
-		return { name: error.name, message: error.message, stack: error.stack, isToolError: true, isAbort: false };
+		return {
+			name: error.name,
+			message: error.message,
+			stack: error.stack,
+			isToolError: true,
+			isAbort: false,
+			recoverTab,
+		};
 	}
 	if (error instanceof Error) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: false };
@@ -360,9 +679,14 @@ function replyError(payload: RunErrorPayload): Error {
 	return err;
 }
 
-async function targetIdForTarget(target: Target): Promise<string> {
+function privateTargetId(target: Target): string | undefined {
 	const raw = target as unknown as { _targetId?: unknown };
-	if (typeof raw._targetId === "string") return raw._targetId;
+	return typeof raw._targetId === "string" ? raw._targetId : undefined;
+}
+
+async function targetIdForTarget(target: Target): Promise<string> {
+	const fastTargetId = privateTargetId(target);
+	if (fastTargetId) return fastTargetId;
 	const session = await target.createCDPSession();
 	try {
 		const info = (await session.send("Target.getTargetInfo")) as { targetInfo?: { targetId?: string } };
@@ -375,6 +699,26 @@ async function targetIdForTarget(target: Target): Promise<string> {
 
 async function targetIdForPage(page: Page): Promise<string> {
 	return await targetIdForTarget(page.target());
+}
+
+async function createTrackedHeadlessPage(browser: Browser, reportTarget: (targetId: string) => void): Promise<Page> {
+	const session = await browser.target().createCDPSession();
+	let targetId: string;
+	try {
+		({ targetId } = await session.send("Target.createTarget", { url: "about:blank" }));
+		reportTarget(targetId);
+	} finally {
+		await session.detach().catch(() => undefined);
+	}
+	const existing = browser.targets().find(target => privateTargetId(target) === targetId);
+	const target =
+		existing ??
+		(await browser.waitForTarget(candidate => privateTargetId(candidate) === targetId, {
+			timeout: BROWSER_PROTOCOL_TIMEOUT_MS,
+		}));
+	const page = await target.page();
+	if (!page) throw new ToolError(`Created headless target ${targetId} did not expose a page`);
+	return page;
 }
 
 async function collectObservationEntries(
@@ -567,6 +911,9 @@ interface ActiveRun {
 	output: RunOutput;
 	screenshots: ScreenshotResult[];
 	pendingTools: Map<string, { resolve(value: unknown): void; reject(error: Error): void }>;
+	rejectionOwner: object;
+	floatingRejections: unknown[];
+	floatingFailure: { promise: Promise<never>; reject(reason?: unknown): void };
 	/** Helper invocations currently awaiting the page/network, keyed by op id. */
 	inflight: Map<number, InflightOp>;
 	opCounter: number;
@@ -578,17 +925,20 @@ export function describeScreenshot(opts?: ScreenshotOptions): string {
 	if (opts?.fullPage) return "tab.screenshot({ fullPage: true })";
 	return "tab.screenshot()";
 }
-
-/** Map an explicit save path's extension to a puppeteer capture format (default png). */
-export function imageFormatForPath(filePath: string): ImageFormat {
-	switch (path.extname(filePath).toLowerCase()) {
-		case ".webp":
-			return "webp";
-		case ".jpg":
-		case ".jpeg":
-			return "jpeg";
-		default:
-			return "png";
+export async function preparePageForScreenshot(
+	page: Pick<Page, "bringToFront" | "evaluate">,
+	signal: AbortSignal | undefined,
+	activate: boolean,
+): Promise<void> {
+	if (activate) {
+		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
+		return;
+	}
+	const visible = await untilAborted(signal, () => page.evaluate(() => document.visibilityState === "visible")).catch(
+		() => false,
+	);
+	if (!visible) {
+		throw new ToolError("The attached browser tab is not visible; switch to it before taking a screenshot");
 	}
 }
 
@@ -611,16 +961,75 @@ export class WorkerCore {
 	#active: ActiveRun | null = null;
 	#runtime: JsRuntime | null = null;
 	#unsub: () => void;
+	#isolated: boolean;
+	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
+	#activateForScreenshot = true;
 	#dialogPolicy?: DialogPolicy;
 	#dialogHandler?: (dialog: Dialog) => void;
 	#openDialog?: OpenDialogInfo;
 
-	constructor(transport: Transport) {
+	constructor(transport: Transport, isolated: boolean) {
 		this.#transport = transport;
+		this.#isolated = isolated;
 		this.#unsub = this.#transport.onMessage(msg => {
 			void this.#handleMessage(msg as WorkerInbound);
 		});
+		this.#uninstallRejectionGuard = this.#installRejectionGuard();
+	}
+
+	#installRejectionGuard(): () => void {
+		if (!this.#isolated) {
+			return postmortem.interceptUnhandledRejections(reason => this.#consumeUnhandledRejection(reason));
+		}
+		return installBrowserWorkerRejectionGuard(reason => this.#consumeUnhandledRejection(reason));
+	}
+
+	#consumeUnhandledRejection(reason: unknown): boolean {
+		const active = this.#active;
+		if (!active) return false;
+		if (!isBrowserRunOwnedRejection(reason, active.rejectionOwner, `browser-run-${active.id}.js`)) return false;
+		this.#recordFloatingRejection(active, reason);
+		return true;
+	}
+
+	#recordFloatingRejection(active: ActiveRun, reason: unknown): void {
+		if (postmortem.isExpectedCleanupError(reason)) return;
+		if (this.#active !== active) {
+			this.#log("warn", "Unhandled rejection after browser run ended", {
+				runId: active.id,
+				error: reason instanceof Error ? reason.message : String(reason),
+			});
+			return;
+		}
+		const isFirst = active.floatingRejections.length === 0;
+		active.floatingRejections.push(reason);
+		if (isFirst) active.floatingFailure.reject(this.#floatingRejectionError(reason));
+	}
+
+	#floatingRejectionError(reason: unknown): Error {
+		const message = reason instanceof Error ? reason.message : String(reason);
+		const error = new Error(`Unhandled rejection (missing await?): ${message}`, { cause: reason });
+		if (reason instanceof Error) error.name = reason.name;
+		return error;
+	}
+
+	#foldFloatingRejections(active: ActiveRun, failure: { error: unknown } | undefined): { error: unknown } | undefined {
+		const rejections = active.floatingRejections;
+		if (rejections.length === 0) return failure;
+		let reported = rejections;
+		if (!failure) {
+			failure = { error: this.#floatingRejectionError(rejections[0]) };
+			reported = rejections.slice(1);
+		} else if (failure.error instanceof Error && failure.error.cause === rejections[0]) {
+			reported = rejections.slice(1);
+		}
+		for (const reason of reported) {
+			this.#log("warn", "Additional unhandled browser-run rejection", {
+				error: reason instanceof Error ? reason.message : String(reason),
+			});
+		}
+		return failure;
 	}
 
 	nextElementId(): number {
@@ -660,25 +1069,30 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
+			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			this.#browser = await puppeteer.connect({
 				browserWSEndpoint: payload.browserWSEndpoint,
 				defaultViewport: null,
 				protocolTimeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 			});
+
+			// Realm setup is done: puppeteer loaded and browser connected. Sent before
+			// page acquisition so the supervisor's cold-start budget bounds only the
+			// realm setup; page creation and the first navigation run under the ready
+			// wait.
+			this.#transport.send({ type: "setup" });
 			if (payload.mode === "headless") {
-				this.#page = await this.#browser.newPage();
+				// Create the target directly so its id is reportable before
+				// Puppeteer waits for target/page initialization. If that wait
+				// wedges, the supervisor can still close the created target.
+				this.#page = await createTrackedHeadlessPage(this.#browser, targetId => {
+					this.#transport.send({ type: "page-created", targetId });
+				});
 				this.#observeDialogs();
 				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
-				await applyViewport(this.#page, payload.viewport);
+				if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
-				if (payload.url) {
-					await this.#page.goto(payload.url, {
-						// Default to "load" because dev servers with HMR/WS never reach networkidle.
-						waitUntil: payload.waitUntil ?? "load",
-						timeout: payload.timeoutMs,
-					});
-				}
 			} else {
 				const target = await this.#findAttachedTarget(payload.targetId);
 				// Post-timeout recycle: unblock the target BEFORE adopting the page — an open
@@ -688,12 +1102,27 @@ export class WorkerCore {
 				const page = await target.page();
 				if (!page) throw new ToolError(`Target ${payload.targetId} is no longer available on the attached browser`);
 				this.#page = page;
+				await this.#claimRelayTarget(page);
 				this.#observeDialogs();
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
+			}
+			if (payload.url) {
+				await this.#page.goto(payload.url, {
+					// Default to "load" because dev servers with HMR/WS never reach networkidle.
+					waitUntil: payload.waitUntil ?? "load",
+					timeout: payload.timeoutMs,
+				});
 			}
 			this.#targetId = await targetIdForPage(this.#page);
 			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
 		} catch (error) {
+			// A failed headless init leaves the worker's page orphaned in the shared
+			// browser (the supervisor retries with a fresh worker), so close it before
+			// reporting. Attach mode adopts an existing target — never close it.
+			const page = this.#page;
+			if (payload.mode === "headless" && page && !page.isClosed()) {
+				await page.close().catch(() => undefined);
+			}
 			this.#transport.send({ type: "init-failed", error: errorPayload(error) });
 		}
 	}
@@ -705,6 +1134,26 @@ export class WorkerCore {
 			return target;
 		}
 		throw new ToolError(`Target ${targetId} is no longer available on the attached browser`);
+	}
+
+	/**
+	 * Tell the omp browser relay this worker drives the adopted page, so the
+	 * relay adds it to the per-window "omp" tab group. Best-effort: plain CDP
+	 * backends (real Chrome, cmux) reject the relay-private method.
+	 */
+	async #claimRelayTarget(page: Page): Promise<void> {
+		let session: CDPSession | undefined;
+		try {
+			session = await page.createCDPSession();
+			// Puppeteer's protocol map cannot express the relay-private method; the
+			// send signature is otherwise identical.
+			const raw = session as unknown as { send(method: string): Promise<unknown> };
+			await raw.send("OMP.claimTarget");
+		} catch {
+			// Not the omp relay; nothing to claim.
+		} finally {
+			await session?.detach().catch(() => undefined);
+		}
 	}
 
 	/**
@@ -720,6 +1169,7 @@ export class WorkerCore {
 			await session.send("Page.enable").catch(() => undefined);
 			await session.send("Page.handleJavaScriptDialog", { accept: false }).catch(() => undefined);
 			await session.send("Page.stopLoading").catch(() => undefined);
+			await session.send("Fetch.disable").catch(() => undefined);
 		} catch (error) {
 			this.#log("debug", "Recovery CDP session failed; proceeding with attach", {
 				error: error instanceof Error ? error.message : String(error),
@@ -805,6 +1255,7 @@ export class WorkerCore {
 		const signal = AbortSignal.any([timeoutSignal, ac.signal, runAc.signal]);
 		const output = new RunOutput();
 		const screenshots: ScreenshotResult[] = [];
+		const floatingFailure = Promise.withResolvers<never>();
 		const active: ActiveRun = {
 			id: msg.id,
 			ac,
@@ -812,21 +1263,29 @@ export class WorkerCore {
 			output,
 			screenshots,
 			pendingTools: new Map(),
+			rejectionOwner: {},
+			floatingRejections: [],
+			floatingFailure,
 			inflight: new Map(),
 			opCounter: 0,
 		};
 		this.#active = active;
+		let completed = false;
+		let returnValue: unknown;
+		let failure: { error: unknown } | undefined;
+		let runPage: RunPageScope | undefined;
 		try {
 			throwIfAborted(signal);
-			const page = this.#requirePage();
+			runPage = createRunPageScope(this.#requirePage());
 			const browser = this.#requireBrowser();
 			const tabApi = this.#createTabApi(msg.name, msg.timeoutMs, signal, msg.session, output, screenshots, active);
 			const runtime = this.#ensureRuntime(msg.session);
 			runtime.setCwd(msg.session.cwd);
+			const onFloatingRejection = (reason: unknown): void => this.#recordFloatingRejection(active, reason);
 			runtime.setRunScope({
-				page,
-				browser,
-				tab: tabApi,
+				page: bindRunFacade(runPage.page, signal, active.rejectionOwner, onFloatingRejection),
+				browser: bindRunFacade(browser, signal, active.rejectionOwner, onFloatingRejection),
+				tab: bindRunFacade(tabApi, signal, active.rejectionOwner, onFloatingRejection),
 				assert: (cond: unknown, text?: string): void => {
 					if (!cond) throw new ToolError(text ?? "Assertion failed");
 				},
@@ -838,10 +1297,12 @@ export class WorkerCore {
 						typeof msOrPredicate === "number"
 							? undefined
 							: { timeout: resolvePredicateTimeout(msg.timeoutMs, opts?.timeout), interval: opts?.interval };
-					return markHandled(
+					return observeBrowserRunPromise(
 						this.#runOp(active, label, signal, Number.POSITIVE_INFINITY, sig =>
-							waitForBrowserRun(msOrPredicate, sig, resolved),
+							waitForRun(msOrPredicate, sig, resolved),
 						),
+						active.rejectionOwner,
+						onFloatingRejection,
 					);
 				},
 			});
@@ -879,25 +1340,48 @@ export class WorkerCore {
 			try {
 				const hooks = this.#hooksForActiveRun();
 				if (!hooks) throw new ToolError("Browser runtime started without an active run");
-				const returnValue = await Promise.race([
-					runtime.run(msg.code, `browser-run-${msg.id}.js`, hooks, { runId: msg.id, cwd: msg.session.cwd }),
-					cancelRejection,
-				]);
-				await this.#postReadyInfo();
-				this.#transport.send({
-					type: "result",
-					id: msg.id,
-					ok: true,
-					payload: { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots },
-				});
+				returnValue = await withBrowserPromiseCombinatorTracking(
+					active.rejectionOwner,
+					onFloatingRejection,
+					async () =>
+						await Promise.race([
+							runtime.run(msg.code, `browser-run-${msg.id}.js`, hooks, {
+								runId: msg.id,
+								cwd: msg.session.cwd,
+							}),
+							cancelRejection,
+							floatingFailure.promise,
+						]),
+				);
+				completed = true;
 			} finally {
 				signal.removeEventListener("abort", onCancel);
 			}
 		} catch (error) {
-			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(error) });
+			failure = { error };
 		} finally {
-			if (this.#active?.id === msg.id) this.#active = null;
 			runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Browser run ended")));
+			await Bun.sleep(0);
+			try {
+				await runPage?.cleanup();
+			} catch (error) {
+				failure = { error };
+			}
+			failure = this.#foldFloatingRejections(active, failure);
+			if (this.#active?.id === msg.id) this.#active = null;
+		}
+		if (failure) {
+			this.#transport.send({ type: "result", id: msg.id, ok: false, error: errorPayload(failure.error) });
+			return;
+		}
+		if (completed) {
+			await this.#postReadyInfo();
+			this.#transport.send({
+				type: "result",
+				id: msg.id,
+				ok: true,
+				payload: { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots },
+			});
 		}
 	}
 
@@ -998,9 +1482,12 @@ export class WorkerCore {
 				(opTimeout?.aborted || (err instanceof Error && err.name === "TimeoutError"))
 			) {
 				const hint = selector ? await this.#selectorTimeoutHint(selector) : "";
-				throw new ToolError(`${label} timed out after ${perOpTimeoutMs}ms${hint}`);
+				throw markBrowserRunRejection(
+					new ToolError(`${label} timed out after ${perOpTimeoutMs}ms${hint}`),
+					active.rejectionOwner,
+				);
 			}
-			throw err;
+			throw markBrowserRunRejection(err, active.rejectionOwner);
 		} finally {
 			earlyAc.abort();
 			active.inflight.delete(opId);
@@ -1080,6 +1567,19 @@ export class WorkerCore {
 			fn: (sig: AbortSignal) => Promise<T>,
 			selectorOpts?: { selector?: string; zeroMatchAfterMs?: number },
 		): Promise<T> => markHandled(this.#runOp(active, label, signal, perOpMs, fn, selectorOpts));
+		// Hand user-facing handles the fail-fast per-op guard so their interactive
+		// methods (`.click()`, `.type()`, …) can't outrun the cell budget (issue #9535).
+		const enrich = (handle: ElementHandle): ActionableHandle =>
+			toActionableHandle(
+				handle,
+				(label, fn) => op(label, actionOpMs, fn),
+				async () => {
+					// Raw Puppeteer actions have no AbortSignal. Poison + dispose every
+					// cached handle and stop navigation before reporting a recoverable timeout.
+					this.#clearElementCache();
+					await this.#stopLoading();
+				},
+			);
 		return {
 			name,
 			page,
@@ -1212,18 +1712,29 @@ export class WorkerCore {
 			press: (key, opts) =>
 				op(`tab.press(${JSON.stringify(key)})`, actionOpMs, async sig => {
 					const selector = opts?.selector;
-					if (selector) await untilAborted(sig, () => page.focus(normalizeSelector(selector)));
+					if (selector) {
+						if (parseAriaRefSelector(selector) !== null) {
+							const handle = await this.#resolveAriaRef(selector);
+							try {
+								await untilAborted(sig, () => handle.focus());
+							} finally {
+								await handle.dispose().catch(() => undefined);
+							}
+						} else await untilAborted(sig, () => page.focus(normalizeSelector(selector)));
+					}
 					await untilAborted(sig, () => page.keyboard.press(key));
 				}),
 			scroll: (deltaX, deltaY) =>
-				op("tab.scroll()", actionOpMs, sig => untilAborted(sig, () => page.mouse.wheel({ deltaX, deltaY }))),
+				op("tab.scroll()", actionOpMs, sig =>
+					untilAborted(sig, () => dispatchScroll(() => page.mouse.wheel({ deltaX, deltaY }))),
+				),
 			drag: (from, to) => op("tab.drag()", actionOpMs, sig => this.#drag(from, to, sig)),
 			waitFor: (selector, opts) => {
 				const w = waitMs(opts?.timeout);
 				return op(
 					`tab.waitFor(${JSON.stringify(selector)})`,
 					w,
-					async sig => toActionableHandle(await this.#resolveActionHandle(selector, w, sig)),
+					async sig => enrich(await this.#resolveActionHandle(selector, w, sig)),
 					{ selector, zeroMatchAfterMs: opts?.timeout === undefined ? ZERO_MATCH_FAIL_FAST_MS : undefined },
 				);
 			},
@@ -1233,8 +1744,7 @@ export class WorkerCore {
 					`tab.waitForSelector(${JSON.stringify(selector)})`,
 					w,
 					async sig => {
-						if (parseAriaRefSelector(selector) !== null)
-							return toActionableHandle(await this.#resolveAriaRef(selector));
+						if (parseAriaRefSelector(selector) !== null) return enrich(await this.#resolveAriaRef(selector));
 						const handle = (await untilAborted(sig, () =>
 							page.waitForSelector(normalizeSelector(selector), {
 								timeout: w,
@@ -1243,7 +1753,7 @@ export class WorkerCore {
 								signal: sig,
 							}),
 						)) as ElementHandle | null;
-						return handle ? toActionableHandle(handle) : null;
+						return handle ? enrich(handle) : null;
 					},
 					{
 						selector,
@@ -1314,8 +1824,8 @@ export class WorkerCore {
 				const w = waitMs(opts?.timeout);
 				return op("tab.waitForResponse()", w, sig => this.#waitForResponse(pattern, w, sig));
 			},
-			id: async id => toActionableHandle(await this.#resolveCachedHandle(id)),
-			ref: async id => toActionableHandle(await this.#resolveAriaRef(id)),
+			id: async id => enrich(await this.#resolveCachedHandle(id)),
+			ref: async id => enrich(await this.#resolveAriaRef(id)),
 		};
 	}
 
@@ -1369,27 +1879,28 @@ export class WorkerCore {
 		screenshots: ScreenshotResult[],
 		signal: AbortSignal | undefined,
 		opts: ScreenshotOptions = {},
-	): Promise<ScreenshotResult> {
+	): Promise<string> {
 		const page = this.#requirePage();
 		// Multiple tabs can share one Chromium (sibling headless tabs on a shared
 		// endpoint, cdp/app attach). CDP `Page.captureScreenshot` reads the
-		// compositor surface, which follows the *active* target — a backgrounded
+		// compositor surface, which follows the *active* target: a backgrounded
 		// page can stall waiting for a fresh frame (the 20s screenshot timeouts)
 		// or hand back a sibling tab's pixels. Activate first; best-effort so an
 		// already-active or freshly-closed target never fails the capture.
-		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
+		//
+		// For a user-driven browser, redundant activation would steal window focus.
+		// The supervisor disables it only after adopting the visible tab; if the user
+		// later switches away, reject capture rather than risk sibling-tab pixels.
+		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
 		const fullPage = opts.selector ? false : (opts.fullPage ?? false);
-		// An explicit save path picks the full-res capture format: puppeteer encodes
-		// png/jpeg/webp natively, so `save: "shot.webp"` gets real WebP bytes instead
-		// of PNG bytes hiding behind a .webp name. Unknown/missing extensions stay PNG.
-		const explicitPath = opts.save ? resolveToCwd(opts.save, session.cwd) : undefined;
-		const captureType = explicitPath ? imageFormatForPath(explicitPath) : "png";
-		const captureMime = `image/${captureType}` as const;
+		const captureType = "png";
+		const captureMime = "image/png" as const;
 		let buffer: Buffer;
 		if (opts.selector) {
-			const handle = (await untilAborted(signal, () =>
-				page.$(normalizeSelector(opts.selector!)),
-			)) as ElementHandle | null;
+			const handle =
+				parseAriaRefSelector(opts.selector) !== null
+					? await this.#resolveAriaRef(opts.selector)
+					: asElementHandle(await untilAborted(signal, () => page.$(normalizeSelector(opts.selector!))));
 			if (!handle) throw new ToolError("Screenshot selector did not resolve to an element");
 			try {
 				// Bring the element into view with a single instant scroll instead of puppeteer's
@@ -1417,20 +1928,16 @@ export class WorkerCore {
 			{ type: "image", data: buffer.toBase64(), mimeType: captureMime },
 			{ maxWidth: 1024, maxHeight: 1024, maxBytes: 150 * 1024, jpegQuality: 70, excludeWebP: session.excludeWebP },
 		);
-		const saveFullRes = !!(explicitPath || session.browserScreenshotDir);
+		const saveFullRes = !!session.browserScreenshotDir;
 		const savedBuffer = saveFullRes ? buffer : resized.buffer;
 		const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
-		// Names must match the bytes we actually write: full-res follows the capture
-		// format, the resized buffer is whichever of PNG/JPEG/WebP encoded smallest.
 		const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
-		const dest =
-			explicitPath ??
-			(session.browserScreenshotDir
-				? path.join(
-						session.browserScreenshotDir,
-						`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
-					)
-				: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`));
+		const dest = session.browserScreenshotDir
+			? path.join(
+					session.browserScreenshotDir,
+					`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
+				)
+			: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
 		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
 		await Bun.write(dest, savedBuffer);
 		const info: ScreenshotResult = {
@@ -1452,7 +1959,7 @@ export class WorkerCore {
 			output.push({ type: "text", text: lines.join("\n") });
 			output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
 		}
-		return info;
+		return dest;
 	}
 
 	async #drag(from: DragTarget, to: DragTarget, signal: AbortSignal): Promise<void> {
@@ -1462,9 +1969,10 @@ export class WorkerCore {
 			role: "from" | "to",
 		): Promise<{ x: number; y: number; handle?: ElementHandle }> => {
 			if (typeof target === "string") {
-				const handle = (await untilAborted(signal, () =>
-					page.$(normalizeSelector(target)),
-				)) as ElementHandle | null;
+				const handle =
+					parseAriaRefSelector(target) !== null
+						? await this.#resolveAriaRef(target)
+						: asElementHandle(await untilAborted(signal, () => page.$(normalizeSelector(target))));
 				if (!handle) throw new ToolError(`Drag ${role} selector did not resolve: ${target}`);
 				const box = (await untilAborted(signal, () => handle.boundingBox())) as {
 					x: number;
@@ -1505,10 +2013,7 @@ export class WorkerCore {
 	}
 
 	async #select(selector: string, values: string[], timeoutMs: number, signal: AbortSignal): Promise<string[]> {
-		const page = this.#requirePage();
-		const handle = (await untilAborted(signal, () =>
-			page.locator(normalizeSelector(selector)).setTimeout(timeoutMs).waitHandle({ signal }),
-		)) as ElementHandle;
+		const handle = await this.#resolveActionHandle(selector, timeoutMs, signal);
 		try {
 			return (await untilAborted(signal, () =>
 				handle.evaluate((el, vals) => {
@@ -1527,10 +2032,17 @@ export class WorkerCore {
 						globalThis as unknown as { Event: new (type: string, init?: { bubbles: boolean }) => unknown }
 					).Event;
 					const wanted = new Set(vals as string[]);
-					const selected: string[] = [];
+					// Assign the full selection first, then read back: on a single
+					// <select>, un-selecting the current option mid-loop leaves the
+					// browser reporting it selected until another option takes over,
+					// which double-counted the old value in the returned list.
 					for (let i = 0; i < select.options.length; i++) {
 						const opt = select.options[i] as SelectOption;
 						opt.selected = wanted.has(opt.value);
+					}
+					const selected: string[] = [];
+					for (let i = 0; i < select.options.length; i++) {
+						const opt = select.options[i] as SelectOption;
 						if (opt.selected) selected.push(opt.value);
 					}
 					select.dispatchEvent(new EventCtor("input", { bubbles: true }));
@@ -1551,10 +2063,7 @@ export class WorkerCore {
 		session: SessionSnapshot,
 	): Promise<void> {
 		if (!filePaths.length) throw new ToolError("tab.uploadFile() requires at least one file path");
-		const page = this.#requirePage();
-		const handle = (await untilAborted(signal, () =>
-			page.locator(normalizeSelector(selector)).setTimeout(timeoutMs).waitHandle({ signal }),
-		)) as ElementHandle;
+		const handle = await this.#resolveActionHandle(selector, timeoutMs, signal);
 		try {
 			const absolute = filePaths.map(filePath => resolveToCwd(filePath, session.cwd));
 			const upload = handle as unknown as { uploadFile: (...paths: string[]) => Promise<void> };
@@ -1674,6 +2183,7 @@ export class WorkerCore {
 
 	async #close(): Promise<void> {
 		this.#unsub();
+		this.#uninstallRejectionGuard();
 		this.#clearElementCache();
 		const page = this.#page;
 		if (this.#dialogHandler && page && !page.isClosed()) page.off("dialog", this.#dialogHandler);

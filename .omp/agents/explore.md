@@ -3,8 +3,8 @@ name: explore
 description: Fast read-only codebase scout returning compressed context for handoff
 tools:
   - read
-  - search
-  - find
+  - grep
+  - glob
   - web_search
   - yield
 model:

@@ -6,6 +6,8 @@ wrapper writes typed frames back.
 Host -> wrapper:
   {"id": str, "code": str, "silent": bool?, "storeHistory": bool?}
   {"id": str, "code": str, "silent": bool?, "storeHistory": bool?, "cwd": str?, "env": dict?}
+  {"type": "tool", "id": str, "op": "describe", "names": [str]}
+  {"type": "tool", "id": str, "op": "call", "name": str, "args": dict}
   {"type": "exit"}                                # graceful shutdown
 
 Wrapper -> host:
@@ -40,6 +42,7 @@ import os
 import re
 import runpy
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -191,10 +194,14 @@ class _RunnerState:
         self.capture_rid: str | None = None
 
 
-_CURRENT_RID: contextvars.ContextVar[str | None] = contextvars.ContextVar("omp_current_rid", default=None)
-_CURRENT_DISPLAYED_MATPLOTLIB_FIGURE_IDS: contextvars.ContextVar[set[int] | None] = contextvars.ContextVar(
-    "omp_displayed_matplotlib_figure_ids",
-    default=None,
+_CURRENT_RID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "omp_current_rid", default=None
+)
+_CURRENT_DISPLAYED_MATPLOTLIB_FIGURE_IDS: contextvars.ContextVar[set[int] | None] = (
+    contextvars.ContextVar(
+        "omp_displayed_matplotlib_figure_ids",
+        default=None,
+    )
 )
 
 
@@ -233,7 +240,9 @@ def _drain_captured_stdout() -> None:
 def _start_capture_drain() -> None:
     if _CAPTURE_READ_FD is None:
         return
-    thread = threading.Thread(target=_drain_captured_stdout, name="omp-fd1-capture", daemon=True)
+    thread = threading.Thread(
+        target=_drain_captured_stdout, name="omp-fd1-capture", daemon=True
+    )
     thread.start()
 
 
@@ -242,7 +251,9 @@ def _start_capture_drain() -> None:
 # ---------------------------------------------------------------------------
 
 
-_MAGIC_LINE_RE = re.compile(r"^(?P<indent>[ \t]*)(?P<name>[A-Za-z_][A-Za-z_0-9]*)(?:[ \t]+(?P<args>.*))?$")
+_MAGIC_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<name>[A-Za-z_][A-Za-z_0-9]*)(?:[ \t]+(?P<args>.*))?$"
+)
 _ASSIGN_LINE_RE = re.compile(
     r"^(?P<indent>[ \t]*)(?P<lhs>[A-Za-z_][A-Za-z_0-9.\[\], ]*?)\s*=\s*(?P<rhs>.+)$"
 )
@@ -337,7 +348,9 @@ def transform_cell(source: str) -> str:
             rhs = m.group("rhs").strip()
             if rhs.startswith("!"):
                 cmd = rhs[1:].strip()
-                out.append(f"{m.group('indent')}{m.group('lhs').rstrip()} = __omp_shell({_quote_arg(cmd)})")
+                out.append(
+                    f"{m.group('indent')}{m.group('lhs').rstrip()} = __omp_shell({_quote_arg(cmd)})"
+                )
                 i += 1
                 continue
             if rhs.startswith("%") and not rhs.startswith("%%"):
@@ -383,7 +396,9 @@ def line_magic(name: str) -> Callable[[Callable[[str], Any]], Callable[[str], An
     return decorator
 
 
-def cell_magic(name: str) -> Callable[[Callable[[str, str], Any]], Callable[[str, str], Any]]:
+def cell_magic(
+    name: str,
+) -> Callable[[Callable[[str, str], Any]], Callable[[str, str], Any]]:
     def decorator(fn: Callable[[str, str], Any]) -> Callable[[str, str], Any]:
         _CELL_MAGICS[name] = fn
         return fn
@@ -397,6 +412,7 @@ def _emit_status(op: str, **data: Any) -> None:
     if rid is None:
         return
     _emit({"type": "display", "id": rid, "bundle": bundle})
+
 
 _SHELL_READ_CHUNK_BYTES = 8192
 _SHELL_OUTPUT_MAX_BYTES = 1024 * 1024
@@ -458,12 +474,16 @@ class _ShellOutputLimiter:
             return
         limited = _take_prefix_by_lines(text, self._remaining_lines)
         truncated = limited != text
-        byte_limited = _take_prefix_by_encoded_bytes(limited, self._remaining_bytes, self._encoding)
+        byte_limited = _take_prefix_by_encoded_bytes(
+            limited, self._remaining_bytes, self._encoding
+        )
         truncated = truncated or byte_limited != limited
         if byte_limited:
             sys.stdout.write(byte_limited)
             sys.stdout.flush()
-            self._remaining_bytes -= len(byte_limited.encode(self._encoding, errors="strict"))
+            self._remaining_bytes -= len(
+                byte_limited.encode(self._encoding, errors="strict")
+            )
             self._remaining_lines -= byte_limited.count("\n")
             self._at_line_start = byte_limited.endswith("\n")
         if truncated:
@@ -478,7 +498,9 @@ class _ShellOutputLimiter:
         self._truncated = True
 
 
-def _stream_process_output(proc: subprocess.Popen, on_text: Callable[[str], None] | None = None) -> None:
+def _stream_process_output(
+    proc: subprocess.Popen, on_text: Callable[[str], None] | None = None
+) -> None:
     assert proc.stdout is not None
     encoding = _process_output_encoding()
     decoder = _process_output_decoder(encoding)
@@ -514,7 +536,9 @@ class _BoundedTextCapture:
         if self._remaining_bytes <= 0 or self._remaining_lines <= 0:
             return
         line_limited = _take_prefix_by_lines(text, self._remaining_lines)
-        part = _take_prefix_by_encoded_bytes(line_limited, self._remaining_bytes, self._encoding)
+        part = _take_prefix_by_encoded_bytes(
+            line_limited, self._remaining_bytes, self._encoding
+        )
         if not part:
             return
         self._parts.append(part)
@@ -555,8 +579,10 @@ class _BoundedLineScanner:
 def _magic_pip(args: str) -> None:
     argv = shlex.split(args) if args else ["--help"]
     cmd = [sys.executable, "-m", "pip", *argv]
+    # stdin=DEVNULL: see _run_shell_body.
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -583,7 +609,9 @@ def _magic_pip(args: str) -> None:
             head = mod_name.split(".", 1)[0].lower()
             if head in prefixes:
                 sys.modules.pop(mod_name, None)
-    _emit_status("pip", args=args, installed=installed_packages, exit_code=proc.returncode)
+    _emit_status(
+        "pip", args=args, installed=installed_packages, exit_code=proc.returncode
+    )
 
 
 @line_magic("cd")
@@ -658,7 +686,9 @@ def _magic_who(_args: str) -> list[str]:
     names = sorted(
         name
         for name, value in _STATE.user_ns.items()
-        if not name.startswith("_") and not callable(value) or hasattr(value, "__class__")
+        if not name.startswith("_")
+        and not callable(value)
+        or hasattr(value, "__class__")
     )
     return [n for n in names if not n.startswith("__")]
 
@@ -677,7 +707,9 @@ def _magic_whos(_args: str) -> list[tuple[str, str]]:
 @line_magic("reset")
 def _magic_reset(_args: str) -> None:
     _STATE.user_ns.clear()
-    _STATE.user_ns.update({"__name__": "__main__", "__doc__": None, "__builtins__": builtins})
+    _STATE.user_ns.update(
+        {"__name__": "__main__", "__doc__": None, "__builtins__": builtins}
+    )
     _install_builtins(_STATE.user_ns)
     _emit_status("reset")
 
@@ -686,7 +718,9 @@ def _magic_reset(_args: str) -> None:
 def _magic_load(args: str) -> None:
     path = Path(os.path.expanduser(args.strip()))
     source = path.read_text(encoding="utf-8")
-    _emit({"type": "display", "id": _CURRENT_RID.get(), "bundle": {"text/plain": source}})
+    _emit(
+        {"type": "display", "id": _CURRENT_RID.get(), "bundle": {"text/plain": source}}
+    )
     _exec_source(source, _STATE.user_ns)
 
 
@@ -708,9 +742,38 @@ def _magic_run(args: str) -> None:
         _STATE.user_ns[name] = value
 
 
+def _resolve_bash() -> str:
+    if os.name != "nt":
+        return "/bin/bash"
+    # Prefer Git Bash over WSL's System32 bash.exe, which runs inside a
+    # separate Linux environment and does not share the Windows filesystem
+    # layout or PATH.
+    for env_var, suffix in (
+        ("ProgramFiles", r"Git\bin\bash.exe"),
+        ("ProgramFiles(x86)", r"Git\bin\bash.exe"),
+        ("LOCALAPPDATA", r"Programs\Git\bin\bash.exe"),
+    ):
+        root = os.environ.get(env_var)
+        if root:
+            candidate = os.path.join(root, suffix)
+            if os.path.isfile(candidate):
+                return candidate
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    # WSL's System32 bash.exe runs in a separate Linux environment, so
+    # silently falling back to it would execute the cell somewhere the user
+    # did not intend; fail loudly instead.
+    raise RuntimeError(
+        "%%bash requires a POSIX bash, but none was found. "
+        "Install Git for Windows or add a non-WSL bash to PATH."
+    )
+
+
 @cell_magic("bash")
 def _magic_cell_bash(args: str, body: str) -> int:
-    return _run_shell_body(body, shell_arg="/bin/bash")
+    return _run_shell_body(body, shell_arg=_resolve_bash())
+
 
 @cell_magic("capture")
 def _magic_cell_capture(args: str, body: str) -> str:
@@ -750,8 +813,12 @@ def _magic_cell_writefile(args: str, body: str) -> str:
 
 
 def _run_shell_body(body: str, *, shell_arg: str) -> int:
+    # stdin=DEVNULL: children must not inherit the runner's stdin, which is
+    # the host's NDJSON control channel (a reading child would steal frames,
+    # and inheriting the pipe deadlocks nested interpreters on Windows).
     proc = subprocess.Popen(
         [shell_arg, "-c", body],
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
@@ -791,13 +858,17 @@ class _ShellResult(list):
 
 
 def __omp_shell(cmd: str) -> _ShellResult:
+    # stdin=DEVNULL: see _run_shell_body.
     proc = subprocess.Popen(
         cmd,
         shell=True,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    capture = _BoundedTextCapture(_SHELL_RESULT_CAPTURE_BYTES, _SHELL_OUTPUT_MAX_LINES, _process_output_encoding())
+    capture = _BoundedTextCapture(
+        _SHELL_RESULT_CAPTURE_BYTES, _SHELL_OUTPUT_MAX_LINES, _process_output_encoding()
+    )
     _stream_process_output(proc, capture.add)
     proc.wait()
     lines = [line for line in capture.text().splitlines()]
@@ -827,7 +898,9 @@ def _is_matplotlib_figure(value: Any) -> bool:
         return True
 
     value_type = type(value)
-    return value_type.__module__ == "matplotlib.figure" and value_type.__name__ == "Figure"
+    return (
+        value_type.__module__ == "matplotlib.figure" and value_type.__name__ == "Figure"
+    )
 
 
 def _matplotlib_figure_png(value: Any) -> str | None:
@@ -868,7 +941,6 @@ def _mime_bundle(value: Any) -> dict:
     matplotlib_png = _matplotlib_figure_png(value)
     if matplotlib_png is not None:
         bundle["image/png"] = matplotlib_png
-
 
     mimebundle = getattr(value, "_repr_mimebundle_", None)
     if callable(mimebundle):
@@ -990,7 +1062,9 @@ def _await_sync(coro) -> Any:
     except RuntimeError:
         running_loop = None
     if running_loop is not None and running_loop.is_running():
-        raise RuntimeError("top-level await is not supported from synchronous magic execution")
+        raise RuntimeError(
+            "top-level await is not supported from synchronous magic execution"
+        )
     return asyncio.run(coro)
 
 
@@ -1003,7 +1077,6 @@ def _run_compiled_sync(code, ns: dict, *, want_value: bool) -> Any:
         return eval(code, ns)
     exec(code, ns)
     return None
-
 
 
 async def _run_compiled_async(code, ns: dict, *, want_value: bool) -> Any:
@@ -1023,7 +1096,7 @@ async def _run_compiled_async(code, ns: dict, *, want_value: bool) -> Any:
 
 
 def _compile_source(source: str) -> tuple[Any, Any | None, bool]:
-    module = ast.parse(source, mode="exec")
+    module = ast.parse(source, "<cell>", "exec")
     if not module.body:
         return None, None, False
 
@@ -1127,6 +1200,7 @@ def _apply_request_runtime(req: dict) -> None:
             elif value is None:
                 os.environ.pop(key, None)
 
+
 def _start_parent_watchdog() -> None:
     """Self-terminate when the host process dies.
 
@@ -1162,6 +1236,62 @@ def _start_parent_watchdog() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _jsonable(value: Any) -> Any:
+    """Convert a tool result into a JSON-safe value without failing the request."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(item) for item in value]
+    return repr(value)
+
+
+def _handle_tool_request(req: dict) -> None:
+    """Describe or invoke a kernel-defined tool on a dedicated runner thread."""
+    rid = str(req.get("id"))
+    token = _CURRENT_RID.set(rid)
+    status = "ok"
+    _emit({"type": "started", "id": rid})
+    try:
+        tools = _STATE.user_ns.get("__omp_tools__") or {}
+        op = req.get("op")
+        if op == "describe":
+            requested = req.get("names") or list(tools)
+            envelope = {
+                "ok": True,
+                "tools": [tools[name].describe() for name in requested if name in tools],
+                "missing": [name for name in requested if name not in tools],
+            }
+        elif op == "call":
+            name = str(req.get("name") or "")
+            spec = tools.get(name)
+            if spec is None:
+                raise KeyError(f"tool {name!r} is not defined")
+            result = spec.fn(**(req.get("args") or {}))
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            envelope = {"ok": True, "value": _jsonable(result)}
+        else:
+            raise ValueError(f"unknown tool operation {op!r}")
+        _emit_display({"application/json": envelope})
+    except BaseException as exc:  # noqa: BLE001 - protocol errors must settle the request
+        status = "error"
+        _emit_error(rid, exc)
+    finally:
+        _flush_stream_proxies(rid)
+        _emit(
+            {
+                "type": "done",
+                "id": rid,
+                "status": status,
+                "executionCount": _STATE.execution_count,
+                "cancelled": False,
+            }
+        )
+        _CURRENT_RID.reset(token)
+
+
 async def _handle_request_async(req: dict) -> None:
     rid = str(req.get("id"))
     token = _CURRENT_RID.set(rid)
@@ -1182,23 +1312,27 @@ async def _handle_request_async(req: dict) -> None:
             transformed = transform_cell(req.get("code", ""))
         except SyntaxError as exc:
             _emit_error(rid, exc)
-            _emit({
-                "type": "done",
-                "id": rid,
-                "status": "error",
-                "executionCount": execution_count,
-                "cancelled": False,
-            })
+            _emit(
+                {
+                    "type": "done",
+                    "id": rid,
+                    "status": "error",
+                    "executionCount": execution_count,
+                    "cancelled": False,
+                }
+            )
             return
         except BaseException as exc:  # noqa: BLE001 - runtime setup errors must settle the request
             _emit_error(rid, exc)
-            _emit({
-                "type": "done",
-                "id": rid,
-                "status": "error",
-                "executionCount": execution_count,
-                "cancelled": False,
-            })
+            _emit(
+                {
+                    "type": "done",
+                    "id": rid,
+                    "status": "error",
+                    "executionCount": execution_count,
+                    "cancelled": False,
+                }
+            )
             return
 
         _begin_exec_sigint()
@@ -1222,13 +1356,15 @@ async def _handle_request_async(req: dict) -> None:
                 pass
 
         _flush_stream_proxies(rid)
-        _emit({
-            "type": "done",
-            "id": rid,
-            "status": status,
-            "executionCount": execution_count,
-            "cancelled": cancelled,
-        })
+        _emit(
+            {
+                "type": "done",
+                "id": rid,
+                "status": status,
+                "executionCount": execution_count,
+                "cancelled": cancelled,
+            }
+        )
     finally:
         if _STATE.capture_rid == rid:
             _STATE.capture_rid = None
@@ -1238,14 +1374,30 @@ async def _handle_request_async(req: dict) -> None:
 
 
 def _emit_error(rid: str, exc: BaseException) -> None:
-    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-    _emit({
-        "type": "error",
-        "id": rid,
-        "ename": type(exc).__name__,
-        "evalue": str(exc),
-        "traceback": [line.rstrip("\n") for line in tb_lines],
-    })
+    if isinstance(exc, SyntaxError) and exc.filename == "<cell>":
+        # Syntax error in the cell source itself: every stack frame is runner
+        # machinery, so emit only the caret display, like a REPL.
+        tb_lines = traceback.format_exception_only(type(exc), exc)
+    else:
+        # Drop the leading runner-internal frames (_handle_request_async ->
+        # _exec_source_async -> _run_compiled_*) so tracebacks start at user
+        # code. If the exception never reached user code it is a runner bug;
+        # keep the full traceback because those frames are the diagnosis.
+        tb = exc.__traceback__
+        while tb is not None and tb.tb_frame.f_code.co_filename == __file__:
+            tb = tb.tb_next
+        tb_lines = traceback.format_exception(
+            type(exc), exc, tb if tb is not None else exc.__traceback__
+        )
+    _emit(
+        {
+            "type": "error",
+            "id": rid,
+            "ename": type(exc).__name__,
+            "evalue": str(exc),
+            "traceback": [line.rstrip("\n") for line in tb_lines],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1253,24 +1405,138 @@ def _emit_error(rid: str, exc: BaseException) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _read_stdin(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, stdin) -> None:
-    for raw_line in stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as exc:
-            _emit({
+def _parse_request(line: str) -> dict | None:
+    """Parse one NDJSON control line, or ``None`` when it should be skipped.
+
+    Emits a ``ProtocolError`` frame for malformed JSON so the host sees the
+    same diagnostic the reader has always produced.
+    """
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError as exc:
+        _emit(
+            {
                 "type": "error",
                 "id": "",
                 "ename": "ProtocolError",
                 "evalue": f"Invalid JSON request: {exc}",
                 "traceback": [],
-            })
+            }
+        )
+        return None
+
+
+def _read_stdin(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, stdin) -> None:
+    """Feed control-channel requests to the event loop from a reader thread.
+
+    POSIX only -- see ``_serve_windows`` for why Windows cannot run a
+    perpetually blocked stdin reader.
+    """
+    for raw_line in stdin:
+        line = raw_line.strip()
+        if not line:
+            continue
+        req = _parse_request(line)
+        if req is None:
+            continue
+        if req.get("type") == "tool":
+            threading.Thread(
+                target=_handle_tool_request,
+                args=(req,),
+                name=f"omp-tool-{req.get('id')}",
+                daemon=True,
+            ).start()
             continue
         loop.call_soon_threadsafe(queue.put_nowait, req)
     loop.call_soon_threadsafe(queue.put_nowait, {"type": "exit"})
+
+
+async def _serve_posix(loop: asyncio.AbstractEventLoop, stdin) -> None:
+    """Dispatch requests concurrently, one asyncio task per request.
+
+    A background thread reads stdin and enqueues requests so a cell parked on
+    a top-level ``await`` (an ``await agent(...)`` bridge call, say) does not
+    block sibling requests: eval sessions are shared across concurrent agents
+    (subagents inherit the parent's eval session id), so multiple requests can
+    be in flight on one kernel at once. The reader thread stays blocked in a
+    ``sys.stdin`` read for its whole life, which is safe on POSIX but wedges
+    native-extension imports on Windows (see ``_serve_windows``).
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    reader = threading.Thread(
+        target=_read_stdin,
+        args=(loop, queue, stdin),
+        name="omp-stdin-reader",
+        daemon=True,
+    )
+    reader.start()
+
+    tasks: set[asyncio.Task] = set()
+
+    def _task_done(task: asyncio.Task) -> None:
+        tasks.discard(task)
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            _emit_error("", exc)
+
+    try:
+        while True:
+            req = await queue.get()
+            if req.get("type") == "exit":
+                break
+            task = asyncio.create_task(_handle_request_async(req))
+            tasks.add(task)
+            task.add_done_callback(_task_done)
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _serve_windows(loop: asyncio.AbstractEventLoop, stdin) -> None:
+    """Dispatch requests serially, serving tool requests between cells.
+
+    A thread perpetually parked in a blocking ``sys.stdin`` read deadlocks
+    native-extension imports (NumPy in particular) under a pipe-backed
+    subprocess on Windows: the native DLL load and the concurrent stdin read
+    wedge each other (numpy#24290, issue #7985). Reading each line via
+    ``run_in_executor`` confines the stdin read to the gap *between* requests
+    -- once a line arrives the reader returns, so no thread is reading stdin
+    while a cell (and its imports) run. The trade-off is that requests are
+    handled one at a time instead of interleaved; on Windows that is strictly
+    better than the alternative, since any concurrent reader deadlocks the
+    import outright.
+    """
+    while True:
+        raw_line = await loop.run_in_executor(None, stdin.readline)
+        if not raw_line:
+            break  # EOF: the host closed the control channel.
+        line = raw_line.strip()
+        if not line:
+            continue
+        req = _parse_request(line)
+        if req is None:
+            continue
+        if req.get("type") == "exit":
+            break
+        if req.get("type") == "tool":
+            threading.Thread(
+                target=_handle_tool_request,
+                args=(req,),
+                name=f"omp-tool-{req.get('id')}",
+                daemon=True,
+            ).start()
+            continue
+        try:
+            await _handle_request_async(req)
+        except asyncio.CancelledError:
+            raise  # task cancellation must propagate; never swallow it and spin
+        except BaseException as exc:  # noqa: BLE001 - one bad request must not wedge the loop
+            _emit_error(str(req.get("id", "")), exc)
 
 
 async def _main_async() -> None:
@@ -1286,32 +1552,11 @@ async def _main_async() -> None:
 
     loop = asyncio.get_running_loop()
     _STATE.loop = loop
-    queue: asyncio.Queue = asyncio.Queue()
-    reader = threading.Thread(target=_read_stdin, args=(loop, queue, stdin), name="omp-stdin-reader", daemon=True)
-    reader.start()
 
-    tasks: set[asyncio.Task] = set()
-    def _task_done(task: asyncio.Task) -> None:
-        tasks.discard(task)
-        try:
-            exc = task.exception()
-        except asyncio.CancelledError:
-            return
-        if exc is not None:
-            _emit_error("", exc)
-    try:
-        while True:
-            req = await queue.get()
-            if req.get("type") == "exit":
-                break
-            task = asyncio.create_task(_handle_request_async(req))
-            tasks.add(task)
-            task.add_done_callback(_task_done)
-    finally:
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+    if os.name == "nt":
+        await _serve_windows(loop, stdin)
+    else:
+        await _serve_posix(loop, stdin)
 
 
 def main() -> None:

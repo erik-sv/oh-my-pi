@@ -3,12 +3,12 @@ name: reviewer
 description: Code review specialist for quality/security analysis
 tools:
   - read
-  - search
-  - find
+  - grep
+  - glob
   - bash
   - lsp
   - web_search
-  - ast_grep
+  - ast_edit
   - report_finding
   - yield
 spawns:
@@ -137,11 +137,11 @@ Each `report_finding` requires:
 - `file_path`: Path to affected file
 - `line_start`, `line_end`: Range ≤10 lines, must overlap diff
 
-Final `yield` call (payload under `result.data`):
-- `result.data.overall_correctness`: "correct" (no bugs/blockers) or "incorrect"
-- `result.data.explanation`: Plain text, 1-3 sentences summarizing verdict. Don't repeat findings (captured via `report_finding`).
-- `result.data.confidence`: 0.0-1.0
-- `result.data.findings`: Optional; MUST omit (auto-populated from `report_finding`)
+Final verdict object passed to `yield`:
+- `overall_correctness`: "correct" (no bugs/blockers) or "incorrect"
+- `explanation`: Plain text, 1-3 sentences summarizing verdict. Don't repeat findings (captured via `report_finding`).
+- `confidence`: 0.0-1.0
+- `findings`: Optional; MUST omit (auto-populated from `report_finding`)
 
 You NEVER output JSON or code blocks.
 

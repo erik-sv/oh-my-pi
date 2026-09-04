@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import type { Model, TextContent } from "@oh-my-pi/pi-ai";
@@ -14,16 +15,16 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TodoTool, type ToolSession, USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
 
 // Re-injecting eager preludes after compaction: the first-message preludes are the
 // oldest messages, so compaction summarizes them away and the agent silently loses
 // the delegate-via-tasks / phased-todo guidance. The post-compaction auto-continuation
 // turn must carry the gated reminders again (reminder-only — never a forced tool_choice).
 
-const CONTINUE_MARKER = "Resume work on the user's most recent intent";
+const TASK_DELEGATION_MARKER = "Task delegation enabled";
 
 type ObservedPromptCall = {
+	callIndex: number;
 	toolChoice: string | undefined;
 	messageTexts: string[];
 };
@@ -58,10 +59,11 @@ function getMessageText(message: AgentMessage): string {
 	if (!("content" in message)) return "";
 	if (typeof message.content === "string") return message.content;
 	if (!Array.isArray(message.content)) return "";
-	return message.content
-		.filter(isTextContentBlock)
-		.map(content => content.text)
-		.join("\n");
+	const text: string[] = [];
+	for (const content of message.content) {
+		if (isTextContentBlock(content)) text.push(content.text);
+	}
+	return text.join("\n");
 }
 
 function createAssistantResponse(text: string) {
@@ -120,7 +122,23 @@ function emitHighUsageTurn(session: AgentSession): void {
 
 describe("AgentSession eager prelude re-injection after compaction", () => {
 	let tempDir: TempDir;
+	let sharedDir: TempDir;
+	let sharedAuthStorage: AuthStorage;
+	let sharedModelRegistry: ModelRegistry;
 	const cleanups: Array<() => Promise<void>> = [];
+
+	beforeAll(async () => {
+		sharedDir = TempDir.createSync("@pi-agent-session-eager-compaction-shared-");
+		sharedAuthStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
+		sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
+		sharedAuthStorage.setRuntimeApiKey("openai-codex", "test-key");
+		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
+	});
+
+	afterAll(() => {
+		sharedAuthStorage.close();
+		sharedDir.removeSync();
+	});
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-agent-session-eager-compaction-");
@@ -151,13 +169,14 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 		// not shift the headroom math.
 		const model = { ...selectedModel, contextWindow: 200_000, maxTokens: 64_000 };
 
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), `testauth-${cleanups.length}.db`));
-		authStorage.setRuntimeApiKey(model.provider, "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${cleanups.length}.yml`));
+		const modelRegistry = sharedModelRegistry;
 		const settings = Settings.isolated({
 			"compaction.enabled": true,
+			// These suites assert the blocking threshold pass itself; keep the
+			// speculation grace band from deferring it.
+			"compaction.asyncEnabled": false,
 			"compaction.autoContinue": true,
-			"compaction.strategy": "context-full",
+			"compaction.methodOrder": ["soft"],
 			"task.eager": "always",
 			"todo.enabled": false,
 			"todo.eager": "default",
@@ -193,7 +212,6 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 			? [todoTool as unknown as AgentTool, mockTaskTool, mockBashTool]
 			: [mockTaskTool, mockBashTool];
 
-		let session: AgentSession;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools, messages: [] },
@@ -201,6 +219,7 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 			getToolChoice: () => session?.nextToolChoiceDirective(),
 			streamFn: (_model, context, options) => {
 				const call: ObservedPromptCall = {
+					callIndex: observedCalls.length,
 					toolChoice: getToolChoiceName(options?.toolChoice),
 					messageTexts: context.messages.map(message => getMessageText(message)),
 				};
@@ -228,7 +247,7 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 		]);
 		if (todoTool) toolRegistry.set(todoTool.name, todoTool as unknown as AgentTool);
 
-		session = new AgentSession({
+		const session = new AgentSession({
 			agent,
 			sessionManager,
 			settings,
@@ -246,18 +265,33 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 			return promise;
 		};
 
-		cleanups.push(async () => {
-			await session.dispose();
-			authStorage.close();
-		});
+		cleanups.push(() => session.dispose());
 		return { session, observedCalls, sessionManager, waitForCall };
+	}
+
+	function activateOngoingGoal(session: AgentSession): void {
+		const now = Date.now();
+		session.setGoalModeState({
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "eager-prelude-compaction",
+				objective: "finish the parser refactor",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: now,
+				updatedAt: now,
+			},
+		});
 	}
 
 	/** Run the first prompt, drive a compaction, and resolve with the auto-continuation provider call. */
 	async function runToContinuation(session: AgentSession, waitForCall: WaitForCall): Promise<ObservedPromptCall> {
+		activateOngoingGoal(session);
 		await session.prompt("refactor the parser across modules");
 		emitHighUsageTurn(session);
-		return waitForCall(call => call.messageTexts.some(text => text.includes(CONTINUE_MARKER)));
+		return waitForCall(call => call.callIndex > 0);
 	}
 
 	it("re-injects the eager task reminder on the auto-continuation turn (task.eager always)", async () => {
@@ -266,40 +300,36 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 
 		const continuation = await runToContinuation(session, waitForCall);
 
-		const reminder = continuation.messageTexts.find(text => text.includes("delegation is enabled"));
+		const reminder = continuation.messageTexts.find(text => text.includes(TASK_DELEGATION_MARKER));
 		expect(reminder).toBeDefined();
 		expect(reminder).toContain("`task`");
 		// Reminder-only: the post-compaction nudge never forces a tool on the resumed turn.
 		expect(continuation.toolChoice).toBeUndefined();
 	});
-
 	it("does not re-inject the eager task reminder when task.eager is default", async () => {
 		const { session, waitForCall } = await createHarness({ "task.eager": "default" });
 		stubCompaction();
 
 		const continuation = await runToContinuation(session, waitForCall);
 
-		expect(continuation.messageTexts.some(text => text.includes("delegation is enabled"))).toBe(false);
+		expect(continuation.messageTexts.some(text => text.includes(TASK_DELEGATION_MARKER))).toBe(false);
 	});
-
 	it("does not re-inject the eager task reminder when task.eager is preferred", async () => {
 		const { session, waitForCall } = await createHarness({ "task.eager": "preferred" });
 		stubCompaction();
 
 		const continuation = await runToContinuation(session, waitForCall);
 
-		expect(continuation.messageTexts.some(text => text.includes("delegation is enabled"))).toBe(false);
+		expect(continuation.messageTexts.some(text => text.includes(TASK_DELEGATION_MARKER))).toBe(false);
 	});
-
 	it("does not re-inject the eager task reminder for subagent sessions", async () => {
 		const { session, waitForCall } = await createHarness({}, { agentId: "SubAgent", agentKind: "sub" });
 		stubCompaction();
 
 		const continuation = await runToContinuation(session, waitForCall);
 
-		expect(continuation.messageTexts.some(text => text.includes("delegation is enabled"))).toBe(false);
+		expect(continuation.messageTexts.some(text => text.includes(TASK_DELEGATION_MARKER))).toBe(false);
 	});
-
 	it("does not re-inject the eager task reminder in plan mode", async () => {
 		const { session, waitForCall } = await createHarness();
 		session.setPlanModeState({ enabled: true, planFilePath: path.join(tempDir.path(), "plan.md") });
@@ -307,7 +337,7 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 
 		const continuation = await runToContinuation(session, waitForCall);
 
-		expect(continuation.messageTexts.some(text => text.includes("delegation is enabled"))).toBe(false);
+		expect(continuation.messageTexts.some(text => text.includes(TASK_DELEGATION_MARKER))).toBe(false);
 	});
 
 	it("re-injects the eager todo reminder on the auto-continuation turn (todo.eager preferred)", async () => {
@@ -347,13 +377,14 @@ describe("AgentSession eager prelude re-injection after compaction", () => {
 			"todo.eager": "preferred",
 		});
 		await session.prompt("refactor the parser across modules");
+		activateOngoingGoal(session);
 		// A surviving todo entry; pin firstKeptEntryId so compaction preserves it in the branch.
 		const todoEntryId = sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
 			phases: [{ name: "Work", tasks: [{ content: "do the thing", status: "pending" }] }],
 		});
 		stubCompaction(todoEntryId);
 
-		const continuationPromise = waitForCall(call => call.messageTexts.some(text => text.includes(CONTINUE_MARKER)));
+		const continuationPromise = waitForCall(call => call.callIndex > 0);
 		emitHighUsageTurn(session);
 		const continuation = await continuationPromise;
 

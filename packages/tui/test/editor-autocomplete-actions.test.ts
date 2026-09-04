@@ -21,6 +21,56 @@ function onceAutocompleteUpdate(editor: Editor): Promise<void> {
 	};
 	return promise;
 }
+/** Resolve once the popup is open, driven by autocomplete update events (no wall-clock waits). */
+async function untilAutocompleteShown(editor: Editor): Promise<void> {
+	while (!editor.isShowingAutocomplete()) {
+		await onceAutocompleteUpdate(editor);
+	}
+}
+describe("Editor async autocomplete scheduling", () => {
+	it("keeps only the latest request queued while the provider is busy", async () => {
+		const requests: Array<{
+			text: string;
+			signal: AbortSignal | undefined;
+			result: PromiseWithResolvers<{ items: AutocompleteItem[]; prefix: string } | null>;
+		}> = [];
+		const secondStarted = Promise.withResolvers<void>();
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider({
+			getSuggestions(lines, cursorLine, cursorCol, signal) {
+				const result = Promise.withResolvers<{ items: AutocompleteItem[]; prefix: string } | null>();
+				requests.push({
+					text: (lines[cursorLine] ?? "").slice(0, cursorCol),
+					signal,
+					result,
+				});
+				if (requests.length === 2) secondStarted.resolve();
+				return result.promise;
+			},
+			applyCompletion(lines, cursorLine, cursorCol) {
+				return { lines, cursorLine, cursorCol };
+			},
+		});
+
+		for (const char of "@abcd") editor.handleInput(char);
+
+		expect(requests).toHaveLength(1);
+		expect(requests[0]?.signal?.aborted).toBeTrue();
+		requests[0]?.result.resolve(null);
+		await secondStarted.promise;
+		expect(requests).toHaveLength(2);
+		expect(requests[1]?.text).toBe("@abcd");
+		expect(requests[1]?.signal?.aborted).toBeFalse();
+
+		const updated = onceAutocompleteUpdate(editor);
+		requests[1]?.result.resolve({
+			items: [{ label: "abcde.ts", value: "abcde.ts" }],
+			prefix: "@abcd",
+		});
+		await updated;
+		expect(editor.isShowingAutocomplete()).toBeTrue();
+	});
+});
 
 class HashActionProvider implements AutocompleteProvider {
 	async getSuggestions(
@@ -150,6 +200,72 @@ describe("Editor slash autocomplete acceptance", () => {
 			fs.rmSync(baseDir, { recursive: true, force: true });
 		}
 	});
+	it("shows a sole forced file suggestion before applying it", async () => {
+		const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "editor-single-file-tab-"));
+		try {
+			fs.writeFileSync(path.join(baseDir, "alpha.ts"), "export {};\n");
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const getForceFileSuggestions = provider.getForceFileSuggestions;
+			const requestHandled = Promise.withResolvers<void>();
+			provider.getForceFileSuggestions = async (lines, cursorLine, cursorCol) => {
+				const suggestions = await getForceFileSuggestions.call(provider, lines, cursorLine, cursorCol);
+				requestHandled.resolve();
+				return suggestions;
+			};
+			const editor = new Editor(defaultEditorTheme);
+			editor.setAutocompleteProvider(provider);
+			editor.setText("alp");
+
+			editor.handleInput("\t");
+			await requestHandled.promise;
+			await Promise.resolve();
+
+			expect(editor.getText()).toBe("alp");
+			expect(editor.isShowingAutocomplete()).toBe(true);
+
+			editor.handleInput("\t");
+			expect(editor.getText()).toBe("alpha.ts");
+		} finally {
+			fs.rmSync(baseDir, { recursive: true, force: true });
+		}
+	});
+	it("accepts the selection with right arrow when the cursor is at end of line", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "skills:fix-bug", description: "Fix a bug" }], "/tmp"),
+		);
+
+		editor.handleInput("/");
+		await untilAutocompleteShown(editor);
+		editor.handleInput("s");
+		editor.handleInput("k");
+		editor.handleInput("i");
+		await untilAutocompleteShown(editor);
+
+		editor.handleInput("\x1b[C");
+
+		expect(editor.getText()).toBe("/skills:fix-bug ");
+	});
+
+	it("keeps right arrow as cursor movement mid-line while the popup is open", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "skills:fix-bug", description: "Fix a bug" }], "/tmp"),
+		);
+
+		editor.handleInput("/");
+		await untilAutocompleteShown(editor);
+		editor.handleInput("s");
+		editor.handleInput("k");
+		editor.handleInput("i");
+		await untilAutocompleteShown(editor);
+
+		editor.handleInput("\x1b[D"); // Left: cursor now mid-line before "i"
+		editor.handleInput("\x1b[C"); // Right: plain movement back to EOL, no accept
+
+		expect(editor.getText()).toBe("/ski");
+		expect(editor.getCursor()).toEqual({ line: 0, col: 4 });
+	});
 });
 class SyncSlashProvider implements AutocompleteProvider {
 	async getSuggestions(
@@ -205,6 +321,27 @@ class SyncSlashProvider implements AutocompleteProvider {
 }
 
 describe("Editor Enter handler sync slash completion", () => {
+	async function createRelocatedModelPopup() {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider([{ name: "model", description: "Switch AI model" }], "/tmp"),
+		);
+		const submissions: string[] = [];
+		editor.onSubmit = text => {
+			submissions.push(text);
+		};
+
+		editor.handleInput("/mo");
+		await Promise.resolve();
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("\x01"); // Ctrl+A: move before the command.
+		editor.handleInput("fix ");
+		editor.handleInput("\x05"); // Ctrl+E: return to the stale command prefix.
+		expect(editor.getText()).toBe("fix /mo");
+
+		return { editor, submissions };
+	}
 	const skillCommands = [
 		{ name: "skill:security-scan", description: "Security scan" },
 		{ name: "model", description: "Switch model" },
@@ -225,6 +362,46 @@ describe("Editor Enter handler sync slash completion", () => {
 		expect(editor.isShowingAutocomplete()).toBe(true);
 	}
 
+	it("expands the /skill: namespace row with Tab and chains into the skill list", async () => {
+		const editor = createSkillEditor();
+
+		editor.handleInput("/");
+		await Promise.resolve();
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		// The collapsed namespace row is the top selection on a bare "/".
+		editor.handleInput("\t");
+		expect(editor.getText()).toBe("/skill:");
+
+		// The chained re-trigger reopens the popup with the individual skills.
+		await untilAutocompleteShown(editor);
+
+		editor.handleInput("\t");
+		expect(editor.getText()).toBe("/skill:security-scan ");
+	});
+
+	it("expands the /skill: namespace row on Enter instead of submitting", async () => {
+		const editor = createSkillEditor();
+		let submitted: string | undefined;
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.handleInput("/");
+		await Promise.resolve();
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("\r");
+
+		expect(submitted).toBeUndefined();
+		expect(editor.getText()).toBe("/skill:");
+
+		await untilAutocompleteShown(editor);
+
+		editor.handleInput("\r");
+		expect(submitted?.trimEnd()).toBe("/skill:security-scan");
+	});
+
 	it("accepts a bare mid-prompt skill slash with Tab without replacing prose", async () => {
 		const editor = createSkillEditor();
 
@@ -235,9 +412,9 @@ describe("Editor Enter handler sync slash completion", () => {
 		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
-	it("accepts a bare mid-prompt skill slash with Enter and submits the completed prompt", async () => {
+	it("accepts a bare mid-prompt skill slash with Enter without submitting the draft", async () => {
 		const editor = createSkillEditor();
-		let submitted = "";
+		let submitted: string | undefined;
 		editor.onSubmit = text => {
 			submitted = text;
 		};
@@ -245,8 +422,8 @@ describe("Editor Enter handler sync slash completion", () => {
 		await openMidPromptSkillAutocomplete(editor, "run a ");
 		editor.handleInput("\r");
 
-		expect(submitted).toBe("run a /skill:security-scan");
-		expect(editor.getText()).toBe("");
+		expect(submitted).toBeUndefined();
+		expect(editor.getText()).toBe("run a /skill:security-scan ");
 	});
 
 	it("hides mid-prompt skill autocomplete immediately when Backspace removes the slash", async () => {
@@ -256,6 +433,19 @@ describe("Editor Enter handler sync slash completion", () => {
 		editor.handleInput("\x7f");
 
 		expect(editor.getText()).toBe("run a ");
+		expect(editor.isShowingAutocomplete()).toBe(false);
+	});
+
+	it("hides leading slash autocomplete immediately when Backspace removes the slash", async () => {
+		const editor = createSkillEditor();
+
+		editor.handleInput("/");
+		await Promise.resolve();
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("\x7f");
+
+		expect(editor.getText()).toBe("");
 		expect(editor.isShowingAutocomplete()).toBe(false);
 	});
 
@@ -361,6 +551,81 @@ describe("Editor Enter handler sync slash completion", () => {
 		expect(editor.getText()).toBe("explain this\n/skill:security-scan ");
 	});
 
+	it("inserts a mid-prompt skill token without submitting on Enter", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider(
+				[
+					{ name: "skill:security-scan", description: "Security scan" },
+					{ name: "model", description: "Switch model" },
+				],
+				"/tmp",
+			),
+		);
+		let submitted: string | undefined;
+		editor.onSubmit = text => {
+			submitted = text;
+		};
+
+		editor.setText("fix bug ");
+		editor.handleInput("/");
+		await Promise.resolve();
+
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("security");
+		editor.handleInput("\r");
+
+		expect(editor.getText()).toBe("fix bug /skill:security-scan ");
+		expect(submitted).toBeUndefined();
+	});
+
+	it("does not replace a live skill prefix with a stale different skill on Enter", async () => {
+		const editor = new Editor(defaultEditorTheme);
+		editor.setAutocompleteProvider(
+			new CombinedAutocompleteProvider(
+				[
+					{ name: "skill:alpha", description: "Alpha" },
+					{ name: "skill:security-scan", description: "Security scan" },
+				],
+				"/tmp",
+			),
+		);
+		const submissions: string[] = [];
+		editor.onSubmit = text => {
+			submissions.push(text);
+		};
+
+		editor.setText("fix ");
+		editor.handleInput("/");
+		await Promise.resolve();
+		expect(editor.isShowingAutocomplete()).toBe(true);
+
+		editor.handleInput("sec");
+		editor.handleInput("\r");
+
+		expect(submissions).toEqual(["fix /sec"]);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("submits the raw draft when Enter sees a relocated non-skill popup", async () => {
+		const { editor, submissions } = await createRelocatedModelPopup();
+
+		editor.handleInput("\r");
+
+		expect(submissions).toEqual(["fix /mo"]);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("leaves the raw draft when Tab sees a relocated non-skill popup", async () => {
+		const { editor, submissions } = await createRelocatedModelPopup();
+
+		editor.handleInput("\t");
+
+		expect(submissions).toEqual([]);
+		expect(editor.getText()).toBe("fix /mo");
+	});
+
 	it("preserves Tab file completion for an absolute path token after prose", async () => {
 		let forceFileCalls = 0;
 		const editor = new Editor(defaultEditorTheme);
@@ -388,10 +653,7 @@ describe("Editor Enter handler sync slash completion", () => {
 
 		editor.setText("see /tmp");
 		editor.handleInput("\t");
-		await Promise.resolve();
-		await Promise.resolve();
-		await Promise.resolve();
-		await Promise.resolve();
+		await untilAutocompleteShown(editor);
 
 		expect(forceFileCalls).toBe(1);
 		expect(editor.isShowingAutocomplete()).toBe(true);

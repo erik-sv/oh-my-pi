@@ -11,9 +11,11 @@ import {
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Loader, Markdown, padding, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
-import { formatDuration, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
+import { formatDuration, logger, Snowflake, sanitizeText } from "@oh-my-pi/pi-utils";
 import { shouldEnableAppendOnlyContext } from "../../config/append-only-context-mode";
+import { type BashResult, isPersistentShellCdCommand } from "../../exec/bash-executor";
 import { type LoadedCustomShare, loadCustomShare } from "../../export/custom-share";
+import { parseExportArgs } from "../../export/html/args";
 import { shareSession } from "../../export/share";
 import type { CompactOptions } from "../../extensibility/extensions/types";
 import {
@@ -26,8 +28,8 @@ import {
 	seedAlreadyExists,
 	summarizeMentalModel,
 } from "../../hindsight";
-import { resolveMemoryBackend } from "../../memory-backend";
-import { BashExecutionComponent } from "../../modes/components/bash-execution";
+import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memory-backend";
+import { BashExecutionComponent, bashPtyViewport } from "../../modes/components/bash-execution";
 import { BorderedLoader } from "../../modes/components/bordered-loader";
 import { DynamicBorder } from "../../modes/components/dynamic-border";
 import { EvalExecutionComponent } from "../../modes/components/eval-execution";
@@ -42,8 +44,16 @@ import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
 import type { NewSessionOptions } from "../../session/session-entries";
+import {
+	cleanSourceCheckoutIfConfigured,
+	createSessionWorktree,
+	defaultSessionWorktreeBranch,
+	formatSessionWorktreeSummary,
+	type SessionWorktree,
+} from "../../session/session-worktree";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
-import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
+import { formatActiveAccountLabel, limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
+import { formatProviderName } from "../../slash-commands/helpers/format";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
 import { replaceTabs, truncateToWidth } from "../../tools/render-utils";
@@ -57,6 +67,10 @@ import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 
+function formatCreditValue(value: number): string {
+	return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
+}
+
 function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown: string): void {
 	const block = new TranscriptBlock();
 	block.addChild(new DynamicBorder());
@@ -64,31 +78,97 @@ function showMarkdownPanel(ctx: InteractiveModeContext, title: string, markdown:
 	block.addChild(new Spacer(1));
 	block.addChild(new Markdown(markdown.trim(), 1, 1, getMarkdownTheme()));
 	block.addChild(new DynamicBorder());
-	ctx.present(block);
+	ctx.presentCommandOutput(block);
 }
 
 export class CommandController {
 	constructor(private readonly ctx: InteractiveModeContext) {}
+
+	async #restoreAfterMoveFailure(
+		previousState: Parameters<InteractiveModeContext["sessionManager"]["rollbackMove"]>[0],
+		initialError?: unknown,
+	): Promise<void> {
+		if (initialError !== undefined) {
+			this.ctx.showError(
+				`Failed to switch workspace: ${initialError instanceof Error ? initialError.message : String(initialError)}`,
+			);
+		}
+
+		try {
+			await this.ctx.sessionManager.rollbackMove(previousState);
+		} catch (rollbackError) {
+			const actual = this.ctx.sessionManager.getCwd();
+			let realigned = false;
+			try {
+				realigned = await this.ctx.applyCwdChange(actual);
+			} catch {}
+			if (!realigned) {
+				this.ctx.showError(
+					`Failed to roll back move: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)} (failed to re-align workspace to ${actual})`,
+				);
+				await this.ctx.shutdown();
+				return;
+			}
+			this.ctx.showError(
+				`Failed to roll back move: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)} (workspace remains at ${actual})`,
+			);
+			return;
+		}
+
+		let sourceRestored = false;
+		try {
+			sourceRestored = await this.ctx.applyCwdChange(previousState.cwd);
+		} catch {}
+		if (sourceRestored) return;
+
+		const actual = this.ctx.sessionManager.getCwd();
+		let realigned = false;
+		try {
+			realigned = await this.ctx.applyCwdChange(actual);
+		} catch {}
+		if (!realigned) {
+			this.ctx.showError(`Failed to restore source workspace after rollback: workspace remains at ${actual}`);
+			await this.ctx.shutdown();
+			return;
+		}
+		this.ctx.showError(`Failed to restore source workspace after rollback: workspace remains at ${actual}`);
+	}
 
 	openInBrowser(urlOrPath: string): void {
 		openPath(urlOrPath);
 	}
 
 	async handleExportCommand(text: string): Promise<void> {
-		const parts = text.split(/\s+/);
-		const arg = parts.length > 1 ? parts[1] : undefined;
-
-		if (arg === "--copy" || arg === "clipboard" || arg === "copy") {
-			this.ctx.showWarning("Use /dump to copy the session to clipboard.");
-			return;
-		}
-
 		try {
-			const filePath = await this.ctx.session.exportToHtml(arg);
+			const { outputPath, useUserThemes } = parseExportArgs(text.slice("/export".length));
+			if (outputPath === "--copy" || outputPath === "clipboard" || outputPath === "copy") {
+				this.ctx.showWarning("Use /dump to copy the session to clipboard.");
+				return;
+			}
+
+			const filePath = await this.ctx.session.exportToHtml(outputPath, useUserThemes);
 			this.ctx.showStatus(`Session exported to: ${filePath}`);
 			this.openInBrowser(filePath);
 		} catch (error: unknown) {
 			this.ctx.showError(`Failed to export session: ${error instanceof Error ? error.message : "Unknown error"}`);
+		}
+	}
+	async handleTraceCommand(): Promise<void> {
+		const sessionFile = this.ctx.session.sessionFile;
+		if (!sessionFile) {
+			this.ctx.showWarning("No session file yet — send a message first.");
+			return;
+		}
+		try {
+			// Lazy: the stats dashboard (server + sqlite) loads on demand only,
+			// matching src/cli/stats-cli.ts, to keep CLI startup fast.
+			const { formatStatsDashboardUrl, startServer } = await import("@oh-my-pi/omp-stats");
+			const { hostname, port } = await startServer();
+			const url = `${formatStatsDashboardUrl(hostname, port)}/#/traces?s=${encodeURIComponent(sessionFile)}`;
+			this.openInBrowser(url);
+			this.ctx.showStatus(`Trace: ${url}`);
+		} catch (error: unknown) {
+			this.ctx.showError(`Failed to open trace: ${error instanceof Error ? error.message : "Unknown error"}`);
 		}
 	}
 
@@ -252,9 +332,9 @@ export class CommandController {
 				: this.ctx.session.sessionManager.getUsageStatistics().premiumRequests;
 		const normalizedPremiumRequests = Math.round((premiumRequests + Number.EPSILON) * 100) / 100;
 
-		let info = `${theme.bold("Session Info")}\n\n`;
+		let info = "";
 		info += `${theme.fg("dim", "File:")} ${stats.sessionFile ?? "In-memory"}\n`;
-		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n\n`;
+		info += `${theme.fg("dim", "ID:")} ${stats.sessionId}\n`;
 		info += `\n${theme.bold("Provider")}\n`;
 		const model = this.ctx.session.model;
 		if (!model) {
@@ -277,6 +357,14 @@ export class CommandController {
 				providerSessionState: this.ctx.session.providerSessionState,
 			});
 			info += renderProviderSection(providerDetails, theme);
+			if (stats.routedModels !== undefined) {
+				const routed = Object.entries(stats.routedModels)
+					.sort(([aId, aCount], [bId, bCount]) => bCount - aCount || aId.localeCompare(bId))
+					.map(
+						([id, count]) => `${replaceTabs(sanitizeText(id))}${count > 1 ? theme.fg("dim", ` ×${count}`) : ""}`,
+					);
+				info += `${theme.fg("dim", "Served:")} ${routed.join(", ")}\n`;
+			}
 		}
 		info += `\n`;
 		info += `${theme.bold("Messages")}\n`;
@@ -305,13 +393,18 @@ export class CommandController {
 		}
 		info += `${theme.fg("dim", "Total:")} ${stats.tokens.total.toLocaleString()}\n`;
 
-		if (stats.cost > 0 || normalizedPremiumRequests > 0) {
+		if (stats.cost > 0 || normalizedPremiumRequests > 0 || stats.credits !== undefined) {
 			info += `\n${theme.bold("Cost")}\n`;
 			if (stats.cost > 0) {
 				info += `${theme.fg("dim", "Total:")} ${stats.cost.toFixed(4)}\n`;
 			}
 			if (normalizedPremiumRequests > 0) {
 				info += `${theme.fg("dim", "Premium Requests:")} ${normalizedPremiumRequests.toLocaleString()}\n`;
+			}
+			if (stats.credits !== undefined) {
+				info += `${theme.fg("dim", "Credits:")} ${formatCreditValue(stats.credits.cost)}\n`;
+				info += `${theme.fg("dim", "Committed Credits:")} ${formatCreditValue(stats.credits.committedCost)}\n`;
+				info += `${theme.fg("dim", "Committed ACU:")} ${formatCreditValue(stats.credits.acuCost)}\n`;
 			}
 		}
 
@@ -346,49 +439,122 @@ export class CommandController {
 			}
 		}
 
-		this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+		this.ctx.showSessionInfo(info);
 	}
+
+	static readonly #advisorStatusGlyph: Record<string, string> = {
+		running: "●",
+		paused: "○",
+		no_model: "○",
+		quota_exhausted: "✕",
+		error: "✕",
+	};
+
+	static readonly #advisorStatusLabel: Record<string, string> = {
+		running: "running",
+		paused: "off",
+		no_model: "no model",
+		quota_exhausted: "quota exhausted",
+		error: "error",
+	};
 
 	async handleAdvisorStatusCommand(): Promise<void> {
 		const stats = this.ctx.session.getAdvisorStats();
-		if (!stats.active) {
-			this.ctx.present([
-				new Spacer(1),
-				new Text(
-					stats.configured
-						? "Advisor setting is enabled, but no model is assigned to the 'advisor' role."
-						: "Advisor is disabled.",
-					1,
-					0,
-				),
-			]);
+		if (!stats.configured) {
+			this.ctx.presentCommandOutput([new Spacer(1), new Text("Advisor is disabled.", 1, 0)]);
 			return;
 		}
-		if (stats.advisors.length > 1) {
+		// Fetch live quota data (cached 5 min by the auth-gateway) so we can show
+		// real usage windows/reset timers per advisor provider. Non-fatal when absent.
+		const usageProvider = this.ctx.session as { fetchUsageReports?: () => Promise<UsageReport[] | null> };
+		let usageReports: UsageReport[] | null = null;
+		if (usageProvider.fetchUsageReports) {
+			try {
+				usageReports = await usageProvider.fetchUsageReports();
+			} catch {
+				// Network/auth failure is non-fatal — just skip the quota line.
+			}
+		}
+		// Resolve the active OAuth identity for each advisor's provider so quota
+		// filtering matches the credential actually in use (not sibling accounts).
+		const resolveActiveAdvisorAccount = (provider: string, sessionId?: string): OAuthAccountIdentity | undefined =>
+			this.ctx.session.modelRegistry.authStorage.getOAuthAccountIdentity(
+				provider,
+				sessionId ?? this.ctx.session.sessionId,
+			);
+		const nowMs = Date.now();
+		// Roster view: show every configured advisor with its status, even when
+		// none are live (all paused/no-model). The old code returned a generic
+		// message that hid the per-advisor state the user needs to act on.
+		if (stats.advisors.length > 1 || (stats.configured && !stats.active)) {
 			let info = `${theme.bold("Advisor Status")} (${stats.advisors.length} advisors)\n`;
 			for (const a of stats.advisors) {
-				const ctx =
-					a.contextWindow > 0
-						? `${a.contextTokens.toLocaleString()} / ${a.contextWindow.toLocaleString()} (${Math.round((a.contextTokens / a.contextWindow) * 100)}%)`
-						: `${a.contextTokens.toLocaleString()}`;
-				info += `\n${theme.bold(a.name)}\n`;
-				info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
-				info += `${theme.fg("dim", "Context:")} ${ctx}\n`;
-				info += `${theme.fg("dim", "Messages:")} ${a.messages.total.toLocaleString()}\n`;
-				info += `${theme.fg("dim", "Spend:")} ${a.tokens.input.toLocaleString()} in / ${a.tokens.output.toLocaleString()} out`;
-				if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
-				info += "\n";
+				const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
+				const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
+				const color =
+					a.status === "running"
+						? "success"
+						: a.status === "quota_exhausted" || a.status === "error"
+							? "error"
+							: "dim";
+				info += `\n${theme.fg(color, glyph)} ${theme.bold(a.name)} ${theme.fg("dim", `[${label}]`)}\n`;
+				if (a.model) {
+					info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
+				}
+				if (a.model && usageReports) {
+					const quota = formatCompactQuota(
+						a.model.provider,
+						usageReports,
+						nowMs,
+						resolveActiveAdvisorAccount(a.model.provider, a.sessionId),
+					);
+					if (quota) info += `${theme.fg("dim", quota)}\n`;
+				}
+				if (a.status === "running" || a.status === "quota_exhausted") {
+					const ctx =
+						a.contextWindow > 0
+							? `${a.contextTokens.toLocaleString()} / ${a.contextWindow.toLocaleString()} (${Math.round((a.contextTokens / a.contextWindow) * 100)}%)`
+							: `${a.contextTokens.toLocaleString()}`;
+					info += `${theme.fg("dim", "Context:")} ${ctx}\n`;
+					info += `${theme.fg("dim", "Messages:")} ${a.messages.total.toLocaleString()}\n`;
+					info += `${theme.fg("dim", "Spend:")} ${a.tokens.input.toLocaleString()} in / ${a.tokens.output.toLocaleString()} out`;
+					if (a.cost > 0) info += `, $${a.cost.toFixed(4)}`;
+					info += "\n";
+				}
 			}
-			info += `\n${theme.bold("Totals")}\n`;
-			info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
-			if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
-			this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+			if (stats.active) {
+				info += `\n${theme.bold("Totals")}\n`;
+				info += `${theme.fg("dim", "Tokens:")} ${stats.tokens.total.toLocaleString()}\n`;
+				if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+			}
+			this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 			return;
 		}
-		const model = stats.model!;
+		// Single active advisor — detailed view.
+		const model = stats.model;
 		let info = `${theme.bold("Advisor Status")}\n\n`;
-		info += `${theme.bold("Provider")}\n`;
-		info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n`;
+		if (stats.advisors.length === 1) {
+			const a = stats.advisors[0];
+			const glyph = CommandController.#advisorStatusGlyph[a.status] ?? "?";
+			const label = CommandController.#advisorStatusLabel[a.status] ?? a.status;
+			info += `${theme.fg(a.status === "running" ? "success" : "error", glyph)} ${a.name} ${theme.fg("dim", `[${label}]`)}\n\n`;
+		}
+		if (model) {
+			info += `${theme.bold("Provider")}\n`;
+			info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n`;
+		}
+		if (model && usageReports) {
+			const quota = formatCompactQuota(
+				model.provider,
+				usageReports,
+				nowMs,
+				resolveActiveAdvisorAccount(model.provider, stats.advisors[0]?.sessionId),
+			);
+			if (quota) {
+				info += `\n${theme.bold("Quota")}\n`;
+				info += `${theme.fg("dim", quota)}\n`;
+			}
+		}
 		info += `\n${theme.bold("Messages")}\n`;
 		info += `${theme.fg("dim", "User:")} ${stats.messages.user.toLocaleString()}\n`;
 		info += `${theme.fg("dim", "Assistant:")} ${stats.messages.assistant.toLocaleString()}\n`;
@@ -406,15 +572,8 @@ export class CommandController {
 		if (stats.tokens.cacheRead > 0) {
 			info += `${theme.fg("dim", "Cache Read:")} ${stats.tokens.cacheRead.toLocaleString()}\n`;
 		}
-		if (stats.tokens.cacheWrite > 0) {
-			info += `${theme.fg("dim", "Cache Write:")} ${stats.tokens.cacheWrite.toLocaleString()}\n`;
-		}
-		info += `${theme.fg("dim", "Total:")} ${stats.tokens.total.toLocaleString()}\n`;
-		if (stats.cost > 0) {
-			info += `\n${theme.bold("Cost")}\n`;
-			info += `${theme.fg("dim", "Total:")} $${stats.cost.toFixed(4)}\n`;
-		}
-		this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+		if (stats.cost > 0) info += `${theme.fg("dim", "Cost:")} $${stats.cost.toFixed(4)}\n`;
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 	}
 
 	async handleJobsCommand(): Promise<void> {
@@ -431,7 +590,7 @@ export class CommandController {
 
 		if (snapshot.running.length === 0 && snapshot.recent.length === 0) {
 			info += `\n${theme.fg("dim", "No async jobs yet.")}\n`;
-			this.ctx.present([new Spacer(1), new Text(info, 1, 0)]);
+			this.ctx.presentCommandOutput([new Spacer(1), new Text(info, 1, 0)]);
 			return;
 		}
 
@@ -451,7 +610,7 @@ export class CommandController {
 			}
 		}
 
-		this.ctx.present([new Spacer(1), new Text(info.trimEnd(), 1, 0)]);
+		this.ctx.presentCommandOutput([new Spacer(1), new Text(info.trimEnd(), 1, 0)]);
 	}
 
 	async handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
@@ -475,18 +634,7 @@ export class CommandController {
 			return;
 		}
 
-		const availableWidth = Math.max(40, (this.ctx.ui.terminal.columns ?? 100) - 2);
-		const currentProvider = this.ctx.session.model?.provider;
-		const activeAccount = currentProvider
-			? this.ctx.session.modelRegistry.authStorage.getOAuthAccountIdentity(
-					currentProvider,
-					this.ctx.session.sessionId,
-				)
-			: undefined;
-		const output = renderUsageReports(usageReports, theme, Date.now(), availableWidth, provider =>
-			provider === currentProvider ? activeAccount : undefined,
-		);
-		this.ctx.present([new Spacer(1), new Text(output, 1, 0)]);
+		this.ctx.showUsageDashboard(usageReports);
 	}
 
 	async handleChangelogCommand(showFull = false): Promise<void> {
@@ -506,7 +654,7 @@ export class CommandController {
 		block.addChild(new Spacer(1));
 		block.addChild(new Markdown(changelogMarkdown + hint, 1, 1, getMarkdownTheme()));
 		block.addChild(new DynamicBorder());
-		this.ctx.present(block);
+		this.ctx.presentCommandOutput(block);
 	}
 
 	handleHotkeysCommand(): void {
@@ -515,7 +663,10 @@ export class CommandController {
 	}
 
 	handleToolsCommand(): void {
-		const tools = buildToolsMarkdown({ tools: this.ctx.session.agent.state.tools });
+		const tools = buildToolsMarkdown({
+			tools: this.ctx.session.agent.state.tools,
+			xdevTools: this.ctx.session.getXdevToolEntries(),
+		});
 		showMarkdownPanel(this.ctx, "Available Tools", tools);
 	}
 
@@ -532,7 +683,7 @@ export class CommandController {
 		block.addChild(new Spacer(1));
 		block.addChild(new Text(output, 1, 0));
 		block.addChild(new DynamicBorder());
-		this.ctx.present(block);
+		this.ctx.presentCommandOutput(block);
 	}
 
 	async handleMemoryCommand(text: string): Promise<void> {
@@ -553,7 +704,7 @@ export class CommandController {
 			block.addChild(new Spacer(1));
 			block.addChild(new Markdown(payload, 1, 1, getMarkdownTheme()));
 			block.addChild(new DynamicBorder());
-			this.ctx.present(block);
+			this.ctx.presentCommandOutput(block);
 			return;
 		}
 
@@ -577,13 +728,40 @@ export class CommandController {
 			}
 			return;
 		}
+		if (action === "queue") {
+			try {
+				const payload = await backend.queuePreview?.({
+					agentDir,
+					cwd: this.ctx.sessionManager.getCwd(),
+					session: this.ctx.session,
+				});
+				if (!payload) {
+					this.ctx.showWarning(`Memory queue is not available for the ${backend.id} backend.`);
+					return;
+				}
+				showMarkdownPanel(this.ctx, "Memory Queue", payload);
+			} catch (error) {
+				this.ctx.showError(`Memory queue failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
+		}
+
+		if (action === "sync") {
+			try {
+				await backend.enqueue(agentDir, this.ctx.sessionManager.getCwd(), this.ctx.session);
+				this.ctx.showStatus("Memory consolidation ran.");
+			} catch (error) {
+				this.ctx.showError(`Memory sync failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
+		}
 
 		if (action === "stats" || action === "diagnose") {
 			const hook = action === "stats" ? backend.stats : backend.diagnose;
 			try {
 				const payload = await hook?.(agentDir, this.ctx.sessionManager.getCwd(), this.ctx.session);
 				if (!payload) {
-					this.ctx.showWarning(`Memory ${action} is not available for the ${backend.id} backend.`);
+					this.ctx.showWarning(memoryStatsUnavailableMessage(backend.id, action));
 					return;
 				}
 				showMarkdownPanel(this.ctx, `Memory ${action === "stats" ? "Stats" : "Diagnostics"}`, payload);
@@ -598,7 +776,7 @@ export class CommandController {
 			return;
 		}
 
-		this.ctx.showError("Usage: /memory <view|stats|diagnose|clear|reset|enqueue|rebuild|mm ...>");
+		this.ctx.showError("Usage: /memory <view|stats|diagnose|clear|reset|enqueue|rebuild|queue|sync|mm ...>");
 	}
 
 	async #handleMentalModelsSubcommand(argumentText: string): Promise<void> {
@@ -856,6 +1034,12 @@ export class CommandController {
 			}
 		}
 		if (!(await this.ctx.session.newSession(options))) return;
+		// A focused subagent view keeps its own history: return to the main session
+		// first so the transcript below cannot rebuild from the subagent's surviving
+		// conversation, then drop any turn-scoped anchors (coalescing timers,
+		// in-flight dispatches) the session boundary orphaned.
+		if (this.ctx.focusedAgentId) await this.ctx.unfocusSession();
+		this.ctx.eventController.resetTranscriptAnchors();
 		this.ctx.resetObserverRegistry();
 		setSessionTerminalTitle(this.ctx.sessionManager.getSessionName(), this.ctx.sessionManager.getCwd());
 
@@ -884,6 +1068,37 @@ export class CommandController {
 		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();
 		this.ctx.showStatus(`Fresh provider session started (${result.closedProviderSessions} ${stateLabel} pruned).`);
+	}
+
+	async handleResetContextCommand(): Promise<void> {
+		if (this.ctx.session.isCompacting) {
+			this.ctx.session.abortCompaction();
+			while (this.ctx.session.isCompacting) {
+				await Bun.sleep(10);
+			}
+		}
+		const result = await this.ctx.session.resetSessionContext();
+		if (!result) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before resetting the context.");
+			return;
+		}
+		// Drop the rendered transcript so the UI matches the now-empty model
+		// context (mirrors #runNewSessionFlow's teardown, minus the new session —
+		// the session id, title, and transcript file all survive).
+		this.ctx.clearTransientSessionUi();
+		this.ctx.resetTranscript();
+		this.ctx.statusLine.invalidate();
+		this.ctx.updateEditorBorderColor();
+		const noun = result.droppedCount === 1 ? "message" : "messages";
+		this.ctx.present([
+			new Spacer(1),
+			new Text(
+				`${theme.fg("accent", `${theme.status.success} Context reset — ${result.droppedCount} ${noun} dropped; session continues.`)}`,
+				1,
+				1,
+			),
+		]);
+		this.ctx.ui.requestRender(true, { clearScrollback: true });
 	}
 
 	async handleDropCommand(): Promise<void> {
@@ -990,24 +1205,100 @@ export class CommandController {
 				return;
 			}
 		}
+		if (await this.#relocateSession(resolvedPath)) {
+			this.ctx.present([
+				new Spacer(1),
+				new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
+			]);
+		}
+	}
 
-		try {
-			await this.ctx.sessionManager.moveTo(resolvedPath);
-		} catch (err) {
-			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+	/**
+	 * `/wt [<branch>]` — fork the checkout into a new linked git worktree on
+	 * `branch` (default `wt/<timestamp>`), carrying uncommitted changes along,
+	 * then relocate the session there like `/move`.
+	 */
+	async handleWorktreeCommand(branch?: string): Promise<void> {
+		if (this.ctx.session.isStreaming) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before creating a worktree.");
 			return;
 		}
+		const branchName = branch?.trim() || defaultSessionWorktreeBranch();
+		const cwd = this.ctx.sessionManager.getCwd();
+		this.ctx.statusContainer.disposeChildren();
+		const loader = new Loader(
+			this.ctx.ui,
+			spinner => theme.fg("accent", spinner),
+			text => theme.fg("muted", text),
+			`Creating worktree on ${branchName}…`,
+			getSymbolTheme().spinnerFrames,
+		);
+		this.ctx.statusContainer.addChild(loader);
+		this.ctx.ui.requestRender();
+		let worktree: SessionWorktree;
+		try {
+			worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName);
+		} catch (err) {
+			this.ctx.showError(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
+			return;
+		} finally {
+			loader.stop();
+			this.ctx.statusContainer.disposeChildren();
+		}
+		if (worktree.cloneError) {
+			logger.warn("worktree clone fell back to plain checkout", { path: worktree.path, error: worktree.cloneError });
+		}
+		if (await this.#relocateSession(worktree.path)) {
+			const cleanup = await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings);
+			if (cleanup.errorMessage !== undefined) {
+				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
+			}
+			this.ctx.present([
+				new Spacer(1),
+				new Text(
+					`${theme.fg("accent", `${theme.status.success} ${formatSessionWorktreeSummary(worktree, cleanup.cleaned)}`)}`,
+					1,
+					1,
+				),
+			]);
+		}
+	}
 
-		await this.ctx.applyCwdChange(resolvedPath);
+	/**
+	 * Move the session and process cwd to an existing directory, rolling back
+	 * on failure. Returns true when the session now lives at `resolvedPath`.
+	 */
+	async #relocateSession(resolvedPath: string): Promise<boolean> {
+		try {
+			await this.ctx.settings.flush();
+		} catch (err) {
+			this.ctx.showError(`Failed to save pending settings: ${err instanceof Error ? err.message : String(err)}`);
+			return false;
+		}
+
+		const previousState = this.ctx.sessionManager.captureState();
+		try {
+			await this.ctx.session.moveSession(resolvedPath);
+		} catch (err) {
+			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
+			return false;
+		}
+		let applied = false;
+		try {
+			applied = await this.ctx.applyCwdChange(resolvedPath);
+		} catch (error) {
+			await this.#restoreAfterMoveFailure(previousState, error);
+			return false;
+		}
+		if (!applied) {
+			await this.#restoreAfterMoveFailure(previousState);
+			return false;
+		}
 
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();
 		this.ctx.ui.requestRender();
-
-		this.ctx.present([
-			new Spacer(1),
-			new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
-		]);
+		return true;
 	}
 
 	async handleRenameCommand(title: string): Promise<void> {
@@ -1026,6 +1317,12 @@ export class CommandController {
 
 	async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
 		const isDeferred = this.ctx.session.isStreaming;
+		const shouldPersistCwd = isPersistentShellCdCommand(command);
+		if (isDeferred && shouldPersistCwd) {
+			this.ctx.showWarning("Wait for the current response to finish or abort it before changing directories.");
+			return;
+		}
+
 		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
 
 		if (isDeferred) {
@@ -1044,15 +1341,34 @@ export class CommandController {
 						this.ctx.bashComponent.appendOutput(chunk);
 					}
 				},
-				{ excludeFromContext, useUserShell: true },
+				{
+					excludeFromContext,
+					useUserShell: true,
+					// User-shell zsh/fish `!` commands run on a headless PTY; raw
+					// bytes render through the component's vterm replay (color-safe).
+					pty: {
+						...bashPtyViewport(this.ctx.ui),
+						onChunk: chunk => this.ctx.bashComponent?.appendPtyChunk(chunk),
+					},
+				},
 			);
-
 			if (this.ctx.bashComponent) {
 				const meta = outputMeta().truncationFromSummary(result, { direction: "tail" }).get();
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
 					truncation: meta?.truncation,
+					images: result.images,
+					showImages: this.ctx.settings.get("terminal.showImages"),
 				});
+			}
+			try {
+				if (shouldPersistCwd) await this.#applyBashResultCwd(result);
+			} catch (error) {
+				this.ctx.showError(
+					`Bash command completed, but OMP failed to update its working directory: ${
+						error instanceof Error ? error.message : "Unknown error"
+					}`,
+				);
 			}
 		} catch (error) {
 			if (this.ctx.bashComponent) {
@@ -1063,6 +1379,43 @@ export class CommandController {
 
 		this.ctx.bashComponent = undefined;
 		this.ctx.ui.requestRender();
+	}
+
+	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
+		const previousState = this.ctx.sessionManager.captureState();
+		await this.ctx.sessionManager.moveTo(resolvedPath);
+		let applied = false;
+		try {
+			applied = await this.ctx.applyCwdChange(resolvedPath);
+		} catch (error) {
+			await this.#restoreAfterMoveFailure(previousState, error);
+			return;
+		}
+		if (!applied) {
+			await this.#restoreAfterMoveFailure(previousState);
+			return;
+		}
+
+		this.ctx.updateEditorBorderColor();
+		await this.ctx.reloadTodos();
+	}
+
+	async #applyBashResultCwd(result: BashResult): Promise<void> {
+		if (result.cancelled || result.exitCode !== 0 || !result.workingDir) return;
+		if (!path.isAbsolute(result.workingDir)) return;
+
+		const resolvedPath = path.resolve(result.workingDir);
+		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return;
+
+		let isDirectory = false;
+		try {
+			isDirectory = (await fs.stat(resolvedPath)).isDirectory();
+		} catch {
+			isDirectory = false;
+		}
+		if (!isDirectory) return;
+
+		await this.#moveInteractiveCwd(resolvedPath);
 	}
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
@@ -1133,8 +1486,9 @@ export class CommandController {
 	}
 
 	/**
-	 * TUI handler for `/shake`. `elide` drops heavy structural content and
-	 * `images` strips image blocks. Rebuilds the chat and reports counts.
+	 * TUI handler for `/shake`. `elide` drops heavy structural content,
+	 * `images` strips image blocks, and `thinking` drops all thinking blocks.
+	 * Rebuilds the chat and reports counts.
 	 */
 	async handleShakeCommand(mode: ShakeMode): Promise<void> {
 		let result: ShakeResult;
@@ -1145,7 +1499,11 @@ export class CommandController {
 			return;
 		}
 
-		const dropped = result.toolResultsDropped + result.blocksDropped + (result.imagesDropped ?? 0);
+		const dropped =
+			result.toolResultsDropped +
+			result.blocksDropped +
+			(result.imagesDropped ?? 0) +
+			(result.thinkingBlocksDropped ?? 0);
 		if (dropped === 0) {
 			this.ctx.showStatus("Nothing to shake.");
 			return;
@@ -1197,7 +1555,7 @@ export class CommandController {
 
 			compactingLoader.stop();
 			this.ctx.statusContainer.disposeChildren();
-			this.ctx.rebuildChatFromMessages();
+			this.ctx.rebuildChatFromMessages({ reuseSettledComponents: true });
 
 			this.ctx.statusLine.invalidate();
 			// Same as the auto-compaction rebuild: a collapsed transcript is an
@@ -1262,7 +1620,8 @@ export class CommandController {
 		this.ctx.ui.requestRender();
 
 		try {
-			// Handoff generation runs as a oneshot request; the new session is shown after it completes.
+			// Handoff generation runs as a oneshot request; the document is then
+			// committed as a compaction entry on this session.
 			const result = await this.ctx.session.handoff(customInstructions);
 
 			if (!result) {
@@ -1270,25 +1629,35 @@ export class CommandController {
 				return;
 			}
 
-			// Rebuild chat from the new session (which now contains the handoff document).
+			// Rebuild chat from the session, which now shows the handoff compaction divider.
 			this.ctx.clearTransientSessionUi();
-			this.ctx.renderInitialMessages();
+			await this.ctx.renderInitialMessages();
 			this.ctx.statusLine.invalidate();
 			this.ctx.updateEditorBorderColor();
 			await this.ctx.reloadTodos();
 
 			this.ctx.present([
 				new Spacer(1),
-				new Text(`${theme.fg("accent", `${theme.status.success} New session started with handoff context`)}`, 1, 1),
+				new Text(
+					`${theme.fg("accent", `${theme.status.success} Context handed off and compacted in place`)}`,
+					1,
+					1,
+				),
 			]);
 			if (result.savedPath) {
 				this.ctx.showStatus(`Handoff document saved to: ${result.savedPath}`);
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			if (message === "Handoff cancelled" || (error instanceof Error && error.name === "AbortError")) {
+			// `session.handoff()` normalizes genuine cancellations to this exact message; a
+			// provider error (even one named AbortError) is re-thrown verbatim so it surfaces
+			// as a real failure instead of a false "cancelled".
+			if (message === "Handoff cancelled") {
 				this.ctx.showError("Handoff cancelled");
 			} else {
+				// Persist the real failure so it is debuggable after the transient
+				// TUI error clears (#7993).
+				logger.error("Handoff failed", { error: message });
 				this.ctx.showError(`Handoff failed: ${message}`);
 			}
 		} finally {
@@ -1300,7 +1669,7 @@ export class CommandController {
 }
 
 const BAR_WIDTH_MAX = 24;
-const BAR_WIDTH_MIN = 4;
+const COLUMN_WIDTH_MIN = 4;
 
 function renderJobLine(job: AsyncJobSnapshotItem, now: number): string {
 	const duration = formatDuration(Math.max(0, now - job.startTime));
@@ -1327,13 +1696,6 @@ function truncateJobLabel(label: string, maxWidth: number): string {
 	}
 
 	return `${out}…`;
-}
-
-function formatProviderName(provider: string): string {
-	return provider
-		.split(/[-_]/g)
-		.map(part => (part ? part[0].toUpperCase() + part.slice(1) : ""))
-		.join(" ");
 }
 
 function formatNumber(value: number, maxFractionDigits = 1): string {
@@ -1388,14 +1750,22 @@ function formatWindowSuffix(label: string, windowLabel: string, uiTheme: typeof 
 	return uiTheme.fg("dim", `(${windowLabel})`);
 }
 
+/** ` (org)` suffix when the report is org-attributed — two subscriptions can share one email. */
+function orgSuffix(report: UsageReport): string {
+	const orgName = report.metadata?.orgName;
+	const orgId = report.metadata?.orgId;
+	const org = typeof orgName === "string" && orgName ? orgName : typeof orgId === "string" ? orgId : undefined;
+	return org ? ` (${org})` : "";
+}
+
 function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
 	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
+	if (typeof email === "string" && email) return `${email}${orgSuffix(report)}`;
 	const accountId =
 		typeof report.metadata?.accountId === "string" && report.metadata.accountId
 			? report.metadata.accountId
 			: limit.scope.accountId || undefined;
-	if (accountId) return accountId;
+	if (accountId) return `${accountId}${orgSuffix(report)}`;
 	const projectId =
 		typeof report.metadata?.projectId === "string" && report.metadata.projectId
 			? report.metadata.projectId
@@ -1406,9 +1776,9 @@ function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: numbe
 
 function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
 	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
+	if (typeof email === "string" && email) return `${email}${orgSuffix(report)}`;
 	const accountId = report.metadata?.accountId;
-	if (typeof accountId === "string" && accountId) return accountId;
+	if (typeof accountId === "string" && accountId) return `${accountId}${orgSuffix(report)}`;
 	const projectId = report.metadata?.projectId;
 	if (typeof projectId === "string" && projectId) return projectId;
 	return `account ${index + 1}`;
@@ -1471,11 +1841,28 @@ function padColumn(text: string, width: number): string {
 	return `${text}${padding(width - visible)}`;
 }
 
-function resolveAggregateStatus(limits: UsageLimit[]): UsageLimit["status"] {
+type AggregateDisplayStatus = NonNullable<UsageLimit["status"]> | "neutral";
+
+function isUsedOnlyAbsoluteAmount(limit: UsageLimit): boolean {
+	const amount = limit.amount;
+	return (
+		amount.unit !== "percent" &&
+		amount.unit !== "unknown" &&
+		amount.used !== undefined &&
+		Number.isFinite(amount.used) &&
+		amount.limit === undefined &&
+		amount.remaining === undefined &&
+		resolveUsedFraction(limit) === undefined
+	);
+}
+
+function resolveAggregateStatus(limits: UsageLimit[]): AggregateDisplayStatus {
 	const hasOk = limits.some(limit => limit.status === "ok");
 	const hasWarning = limits.some(limit => limit.status === "warning");
 	const hasExhausted = limits.some(limit => limit.status === "exhausted");
-	if (!hasOk && !hasWarning && !hasExhausted) return "unknown";
+	if (!hasOk && !hasWarning && !hasExhausted) {
+		return limits.length > 0 && limits.every(isUsedOnlyAbsoluteAmount) ? "neutral" : "unknown";
+	}
 	if (hasOk) {
 		return hasWarning || hasExhausted ? "warning" : "ok";
 	}
@@ -1503,6 +1890,8 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 		return `${formatNumber(remainingPct)}% free`;
 	}
 
+	if (limits.length > 0 && limits.every(isUsedOnlyAbsoluteAmount)) return "";
+
 	// Count unique accounts from limit scopes — not limits.length.
 	const uniqueAccountIds = new Set(
 		limits.map(limit => limit.scope.accountId).filter((id): id is string => typeof id === "string" && id.length > 0),
@@ -1514,20 +1903,79 @@ function formatAggregateAmount(limits: UsageLimit[]): string {
 }
 
 function resolveResetRange(limits: UsageLimit[], nowMs: number): string | null {
-	const absolute = limits
-		.map(limit => limit.window?.resetsAt)
-		.filter((value): value is number => value !== undefined && Number.isFinite(value) && value > nowMs);
-	if (absolute.length === 0) return null;
-	const offsets = absolute.map(value => value - nowMs);
+	const windows = limits
+		.map(limit => limit.window)
+		.filter(
+			(window): window is NonNullable<UsageLimit["window"]> =>
+				window?.resetsAt !== undefined && Number.isFinite(window.resetsAt) && window.resetsAt > nowMs,
+		);
+	if (windows.length === 0) return null;
+	// Use the shared verb when every contributing window agrees (e.g. all "tick");
+	// mixed or absent labels fall back to the generic "resets".
+	const labels = new Set(windows.map(window => window.resetLabel ?? "resets"));
+	const verb = labels.size === 1 ? [...labels][0]! : "resets";
+	const offsets = windows.map(window => window.resetsAt! - nowMs);
 	const minReset = Math.min(...offsets);
 	const maxReset = Math.max(...offsets);
 	if (maxReset - minReset > 60_000) {
-		return `resets in ${formatDuration(minReset)}–${formatDuration(maxReset)}`;
+		return `${verb} in ${formatDuration(minReset)}–${formatDuration(maxReset)}`;
 	}
-	return `resets in ${formatDuration(minReset)}`;
+	return `${verb} in ${formatDuration(minReset)}`;
+}
+/**
+ * Compact one-line quota summary for a single advisor's provider.
+ * Returns `null` when the provider has no usage data.
+ * When `activeAccount` is provided, only limits matching that credential
+ * are shown (mirrors `renderUsageReports`'s account-stickiness filtering).
+ * Example output: `Quota: 7d window · 67% used · resets in 3.2d`
+ */
+export function formatCompactQuota(
+	provider: string,
+	reports: UsageReport[],
+	nowMs: number,
+	activeAccount?: OAuthAccountIdentity,
+): string | null {
+	const providerReports = reports.filter(r => r.provider === provider);
+	if (providerReports.length === 0) return null;
+	// Group limits by window id so we show BOTH the 5-hour and 7-day windows
+	// (or any other distinct windows the provider exposes). Within each window,
+	// pick the highest used fraction across accounts — that's the most pressing.
+	const byWindow = new Map<string, { limit: UsageLimit; fraction: number }>();
+	for (const report of providerReports) {
+		for (const limit of report.limits) {
+			// Skip limits that belong to a different credential than the one
+			// the advisor is actually using, so we don't alarm the user with
+			// an exhausted account that isn't theirs.
+			if (activeAccount && !limitMatchesActiveAccount(report, limit, activeAccount)) continue;
+			const fraction = resolveUsedFraction(limit);
+			if (fraction === undefined) continue;
+			const key = limit.window?.id ?? limit.scope.windowId ?? "—";
+			const existing = byWindow.get(key);
+			if (!existing || fraction > existing.fraction) byWindow.set(key, { limit, fraction });
+		}
+	}
+	if (byWindow.size === 0) return null;
+	// Sort windows by urgency (highest fraction first) so the most pressing
+	// quota is always the first thing the user sees.
+	const entries = [...byWindow.values()].sort((a, b) => b.fraction - a.fraction);
+	const lines: string[] = [];
+	for (const { limit, fraction } of entries) {
+		const pct = Math.round(fraction * 100);
+		const windowLabel = limit.window?.label ?? limit.scope.windowId ?? "—";
+		// Include the limit label (account/tier) when it carries identity beyond
+		// the window name, so the user can tell which credential's quota is shown.
+		const identity = limit.label.trim();
+		const header = identity && identity !== windowLabel ? `${windowLabel} (${identity})` : windowLabel;
+		const parts = [`${header}: ${pct}% used`];
+		const reset = resolveResetRange([limit], nowMs);
+		if (reset) parts.push(reset);
+		lines.push(parts.join(" · "));
+	}
+	return `Quota: ${lines.join(" │ ")}`;
 }
 
-function resolveStatusIcon(status: UsageLimit["status"], uiTheme: typeof theme): string {
+function resolveStatusIcon(status: AggregateDisplayStatus, uiTheme: typeof theme): string {
+	if (status === "neutral") return uiTheme.fg("dim", uiTheme.status.info);
 	if (status === "exhausted") return uiTheme.fg("error", uiTheme.status.error);
 	if (status === "warning") return uiTheme.fg("warning", uiTheme.status.warning);
 	if (status === "ok") return uiTheme.fg("success", uiTheme.status.success);
@@ -1542,6 +1990,14 @@ function resolveStatusColor(status: UsageLimit["status"]): "success" | "warning"
 }
 
 function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: number): string {
+	const usedAmount = limit.amount.used;
+	if (usedAmount !== undefined && isUsedOnlyAbsoluteAmount(limit)) {
+		const used =
+			limit.amount.unit === "usd"
+				? `$${usedAmount.toFixed(2)}`
+				: `${formatNumber(usedAmount, 2)} ${limit.amount.unit}`;
+		return uiTheme.fg("dim", truncateJobLabel(`${used} used`, barWidth));
+	}
 	const fraction = resolveUsedFraction(limit);
 	if (fraction === undefined) {
 		return uiTheme.fg("dim", "·".repeat(barWidth));
@@ -1560,7 +2016,7 @@ function renderUsageBar(limit: UsageLimit, uiTheme: typeof theme, barWidth: numb
 }
 
 /**
- * Pick a per-column width so n bars + a trailing amount string fit in `available` columns.
+ * Pick a per-account column width so the columns and trailing amount fit in `available`.
  * Falls back to the minimum when the terminal is too narrow rather than wrapping.
  */
 function resolveColumnWidth(count: number, available: number, trailing: number): number {
@@ -1569,10 +2025,7 @@ function resolveColumnWidth(count: number, available: number, trailing: number):
 	const gaps = count - 1;
 	const spaceForBars = available - indent - gaps - (trailing > 0 ? trailing + 1 : 0);
 	const ideal = Math.floor(spaceForBars / count);
-	const min = BAR_WIDTH_MIN;
-	const max = BAR_WIDTH_MAX;
-	if (ideal < min) return min;
-	if (ideal > max) return max;
+	if (ideal < COLUMN_WIDTH_MIN) return COLUMN_WIDTH_MIN;
 	return ideal;
 }
 
@@ -1582,6 +2035,7 @@ export function renderUsageReports(
 	nowMs: number,
 	availableWidth: number,
 	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,
+	usageModelSelectors: readonly string[] = [],
 ): string {
 	const lines: string[] = [];
 	const latestFetchedAt = Math.max(...reports.map(report => report.fetchedAt ?? 0));
@@ -1631,9 +2085,16 @@ export function renderUsageReports(
 		}
 
 		lines.push(uiTheme.bold(uiTheme.fg("accent", providerName)));
-		const activeAccountLabel = activeAccount?.email ?? activeAccount?.accountId ?? activeAccount?.projectId;
+		const activeAccountLabel = formatActiveAccountLabel(activeAccount);
 		if (activeAccountLabel) {
 			lines.push(`  ${uiTheme.fg("accent", "in use by this session:")} ${activeAccountLabel}`);
+		}
+		const reportingModels = usageModelSelectors.filter(selector => selector.startsWith(`${provider}/`));
+		if (reportingModels.length > 0) {
+			lines.push(`  ${uiTheme.fg("accent", "Models with usage data")}`);
+			for (const selector of reportingModels) {
+				lines.push(`    ${replaceTabs(truncateToWidth(sanitizeText(selector), availableWidth - 4))}`);
+			}
 		}
 
 		// Provider-wide disclaimers (e.g. "OMP-observed spend only") render once
@@ -1687,17 +2148,34 @@ export function renderUsageReports(
 			for (const line of resetAccountLines) lines.push(uiTheme.fg("dim", line));
 		}
 
+		// Order account columns ONCE per provider (worst-first), then apply that
+		// same order to every window group. Sorting each group independently by
+		// its own used fraction (issue #6067) desynchronized the columns: an
+		// account exhausted on its 5h window but light on the weekly window would
+		// land in different column positions on each row, so the positional
+		// `account N` labels denoted different credentials per row and an
+		// exhausted limit appeared under a sibling that still had quota.
+		const accountRank = new Map<UsageReport, number>();
+		providerReports.forEach((report, position) => {
+			const worst = report.limits.reduce((max, limit) => {
+				const fraction = resolveUsedFraction(limit) ?? -1;
+				return fraction > max ? fraction : max;
+			}, -1);
+			// Encode worst-first primary key with the stable position as tiebreak
+			// so accounts tied on pressure keep their discovery order.
+			accountRank.set(report, -worst * 1000 + position);
+		});
+
 		const renderableGroups = Array.from(limitGroups.values()).map(group => {
 			const entries = group.limits.map((limit, index) => ({
 				limit,
 				report: group.reports[index],
-				fraction: resolveUsedFraction(limit),
 				index,
 			}));
 			entries.sort((a, b) => {
-				const aFraction = a.fraction ?? -1;
-				const bFraction = b.fraction ?? -1;
-				if (aFraction !== bFraction) return bFraction - aFraction;
+				const aRank = accountRank.get(a.report) ?? a.index;
+				const bRank = accountRank.get(b.report) ?? b.index;
+				if (aRank !== bRank) return aRank - bRank;
 				return a.index - b.index;
 			});
 			const sortedLimits = entries.map(entry => entry.limit);
@@ -1708,6 +2186,7 @@ export function renderUsageReports(
 		const sectionCount = renderableGroups.reduce((max, g) => Math.max(max, g.sortedLimits.length), 0);
 		const sectionTrailing = renderableGroups.reduce((max, g) => Math.max(max, visibleWidth(g.amountText)), 0);
 		const sectionColumnWidth = resolveColumnWidth(sectionCount, availableWidth, sectionTrailing);
+		const sectionBarWidth = Math.min(sectionColumnWidth, BAR_WIDTH_MAX);
 
 		for (const { group, sortedLimits, sortedReports, amountText } of renderableGroups) {
 			const status = resolveAggregateStatus(sortedLimits);
@@ -1725,7 +2204,7 @@ export function renderUsageReports(
 			);
 			lines.push(`  ${accountLabels.join(" ")}`.trimEnd());
 			const bars = sortedLimits.map(limit =>
-				padColumn(renderUsageBar(limit, uiTheme, sectionColumnWidth), sectionColumnWidth),
+				padColumn(renderUsageBar(limit, uiTheme, sectionBarWidth), sectionColumnWidth),
 			);
 			lines.push(`  ${bars.join(" ")} ${amountText}`.trimEnd());
 			const resetText = sortedLimits.length <= 1 ? resolveResetRange(sortedLimits, nowMs) : null;

@@ -13,6 +13,19 @@ export interface GalleryResult {
 
 export type GalleryFixtureState = "streaming" | "progress" | "success" | "error";
 
+/** One named preview inside a composer or status-segment gallery section. */
+export interface GalleryPreviewVariant {
+	label: string;
+	render(width: number, expanded: boolean): readonly string[] | Promise<readonly string[]>;
+}
+
+/** Registry-derived gallery entry rendered through the shared section layout. */
+export interface GalleryPreviewEntry {
+	id: string;
+	heading: string;
+	variants: readonly GalleryPreviewVariant[];
+}
+
 export interface GalleryFixture {
 	/** Display label for the tool header (defaults to the tool name). */
 	label?: string;
@@ -38,7 +51,7 @@ export interface GalleryFixture {
 	customRendered?: boolean;
 	/**
 	 * Renderer-registry key to use when the fixture key is a variant of a tool
-	 * (e.g. `irc_wait` → `irc`). Defaults to the fixture key.
+	 * (e.g. `hub_wait` → `hub`). Defaults to the fixture key.
 	 */
 	renderer?: string;
 	/**

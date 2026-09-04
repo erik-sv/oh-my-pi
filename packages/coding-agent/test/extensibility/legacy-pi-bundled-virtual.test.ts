@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import * as url from "node:url";
 import {
 	__getLegacyPiBundledModulesGlobal,
 	__synthesizeLegacyPiBundledSourceWithModules,
+	resolveBundledVirtualSpecifier,
 } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
+import { TempDir } from "@oh-my-pi/pi-utils";
+import type { BunPlugin } from "bun";
 
 // Regression for issue #3423: Bun 1.3.14 made `--compile` extras unreachable
 // via every filesystem-style API. The compat layer now routes canonical
@@ -91,5 +95,61 @@ describe("legacy-pi bundled virtual module synthesizer (issue #3423)", () => {
 		} finally {
 			Reflect.deleteProperty(globalThis, globalKey);
 		}
+	});
+
+	it("routes Bun plugin resolution through the bundled namespace so onLoad can serve extension imports", async () => {
+		using tempDir = TempDir.createSync("@omp-legacy-pi-bundled-virtual-");
+		const entryPath = tempDir.join("extension-entry.ts");
+		const bundlePath = tempDir.join("extension-entry.bundle.mjs");
+
+		await Bun.write(
+			entryPath,
+			['export { legacyAnswer } from "omp-legacy-pi-bundled:@oh-my-pi/pi-utils";', ""].join("\n"),
+		);
+
+		expect(resolveBundledVirtualSpecifier("@oh-my-pi/pi-utils")).toEqual({
+			namespace: "omp-legacy-pi-bundled",
+			path: "@oh-my-pi/pi-utils",
+		});
+		expect(resolveBundledVirtualSpecifier("omp-legacy-pi-bundled:@oh-my-pi/pi-utils")).toEqual({
+			namespace: "omp-legacy-pi-bundled",
+			path: "@oh-my-pi/pi-utils",
+		});
+
+		const onLoadPaths: string[] = [];
+		const plugin: BunPlugin = {
+			name: "omp-legacy-pi-bundled-virtual-regression",
+			setup(build) {
+				build.onResolve({ filter: /^omp-legacy-pi-bundled:.+$/, namespace: "file" }, args =>
+					resolveBundledVirtualSpecifier(args.path),
+				);
+				build.onResolve({ filter: /.*/, namespace: "omp-legacy-pi-bundled" }, args =>
+					resolveBundledVirtualSpecifier(args.path),
+				);
+				build.onLoad({ filter: /.*/, namespace: "omp-legacy-pi-bundled" }, args => {
+					onLoadPaths.push(args.path);
+					return {
+						contents: `export const legacyAnswer = ${JSON.stringify(`served:${args.path}`)};`,
+						loader: "js",
+					};
+				});
+			},
+		};
+
+		const buildResult = await Bun.build({
+			entrypoints: [entryPath],
+			external: ["bun"],
+			format: "esm",
+			plugins: [plugin],
+			target: "bun",
+		});
+		const buildLogs = buildResult.logs.map(log => log.message).join("\n");
+		expect(buildResult.success, buildLogs).toBe(true);
+		await Bun.write(bundlePath, await buildResult.outputs[0]!.text());
+		expect(onLoadPaths).toEqual(["@oh-my-pi/pi-utils"]);
+
+		// The generated bundle has a runtime-selected temp path; importing it is the loading boundary under test.
+		const bundledModule = (await import(url.pathToFileURL(bundlePath).href)) as { legacyAnswer: string };
+		expect(bundledModule.legacyAnswer).toBe("served:@oh-my-pi/pi-utils");
 	});
 });

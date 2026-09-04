@@ -11,7 +11,8 @@
 // fractions and `\binom`, stretch delimiters (`\left…\right`, tall bare parens,
 // matrix brackets), render matrix/cases/array environments as baseline-aligned
 // grids, place big-operator limits (`\sum`, `\lim`, `\int\limits`) above and
-// below the symbol, draw radicals, raise/lower block scripts, and
+// below the symbol, draw radicals, raise/lower block scripts, draw labeled
+// horizontal braces (`\underbrace{x}_{lbl}`), stack `\overset`/`\underset`, and
 // align `&` columns in `align`-family environments. Flat runs — symbols, fonts,
 // colors, inline scripts — are delegated to `latexToUnicode`.
 //
@@ -125,6 +126,35 @@ const INTEGRAL_OPERATORS: Record<string, true> = {
 	intop: true,
 	smallint: true,
 };
+
+// Horizontal brace/bracket decorations drawn as a rule row beside the content,
+// with an optional limits-style label beyond the rule (`\underbrace{x}_{lbl}`).
+interface HBraceSpec {
+	left: string;
+	mid: string;
+	center: string;
+	right: string;
+	over: boolean;
+}
+
+const HBRACE_COMMANDS: Record<string, HBraceSpec> = {
+	overbrace: { left: "╭", mid: "─", center: "┴", right: "╮", over: true },
+	underbrace: { left: "╰", mid: "─", center: "┬", right: "╯", over: false },
+	overbracket: { left: "┌", mid: "─", center: "─", right: "┐", over: true },
+	underbracket: { left: "└", mid: "─", center: "─", right: "┘", over: false },
+	overparen: { left: "╭", mid: "─", center: "─", right: "╮", over: true },
+	underparen: { left: "╰", mid: "─", center: "─", right: "╯", over: false },
+};
+
+/**
+ * Number of required arguments each display command consumes. Shared by
+ * {@link readArg} and {@link splitLines} so nested command atoms consume exactly
+ * their own arguments while preserving any outer command's pending arity.
+ */
+const COMMAND_ARITY: Record<string, number> = { overset: 2, underset: 2, stackrel: 2, sqrt: 1 };
+for (const name in FRAC_COMMANDS) COMMAND_ARITY[name] = 2;
+for (const name in BINOM_COMMANDS) COMMAND_ARITY[name] = 2;
+for (const name in HBRACE_COMMANDS) COMMAND_ARITY[name] = 1;
 
 // Vertical delimiter piece characters: `only` for single-line content, then
 // top/mid/bot columns for stretched forms; `axis` replaces `mid` at the
@@ -364,6 +394,31 @@ function limitsBox(glyph: Box, sub: Box | null, sup: Box | null): Box {
 }
 
 /**
+ * `\underbrace{content}_{label}` / `\overbrace{content}^{label}`: the content
+ * with a drawn horizontal brace beside it and the label centered beyond the
+ * brace. The baseline stays on the content so neighbors align with it.
+ */
+function hbraceBox(content: Box, spec: HBraceSpec, label: Box | null): Box {
+	const braceWidth = Math.max(content.width, 3);
+	const width = Math.max(braceWidth, label?.width ?? 0);
+	const lead = (braceWidth - 3) >> 1;
+	const brace = center(
+		spec.left + spec.mid.repeat(lead) + spec.center + spec.mid.repeat(braceWidth - 3 - lead) + spec.right,
+		width,
+	);
+	const contentLines = content.lines.map(line => center(line, width));
+	const labelLines = label === null ? [] : label.lines.map(line => center(line, width));
+	if (spec.over) {
+		return {
+			lines: [...labelLines, brace, ...contentLines],
+			baseline: labelLines.length + 1 + content.baseline,
+			width,
+		};
+	}
+	return { lines: [...contentLines, brace, ...labelLines], baseline: content.baseline, width };
+}
+
+/**
  * Attach block scripts to `base` as one shared right-hand column: the
  * superscript ends level with the base's top row (raised one row above a
  * single-line base), the subscript starts level with its bottom row (lowered
@@ -405,6 +460,7 @@ function gridBox(rows: Box[][], align: (col: number) => CellAlign, gap: (col: nu
 	let ncols = 0;
 	for (const row of rows) ncols = Math.max(ncols, row.length);
 	if (ncols === 0 || rows.length === 0) return textBox("");
+	// oxlint-disable-next-line unicorn/no-new-array -- grid-width allocation
 	const widths = new Array<number>(ncols).fill(0);
 	for (const row of rows) {
 		row.forEach((cell, j) => {
@@ -471,11 +527,13 @@ function readBraceGroup(src: string, i: number): Span {
 
 /**
  * Read one command argument: a `{…}` group, a single char, or a `\command`
- * together with its attached `[…]`/`{…}` arguments (or whole `\begin…\end`
- * block), so e.g. `\frac\sqrt{a}{b}` reads `\sqrt{a}` as the numerator.
+ * together with its arguments (or whole `\begin…\end` block). Commands whose
+ * arity is known consume exactly that many arguments, including across source
+ * whitespace, so `\frac\sqrt {a} {b}` reads `\sqrt {a}` as the numerator and
+ * leaves `{b}` for the denominator.
  */
 function readArg(src: string, i: number): Span {
-	while (src[i] === " ") i++;
+	while (src[i] === " " || src[i] === "\t" || src[i] === "\n") i++;
 	if (i >= src.length) return { text: "", end: i };
 	if (src[i] === "{") return readBraceGroup(src, i);
 	if (src[i] !== "\\") return { text: src[i], end: i + 1 };
@@ -490,6 +548,22 @@ function readArg(src: string, i: number): Span {
 		if (env) return env;
 	}
 	if (!name) return { text: src.slice(i, i + 2), end: i + 2 }; // non-letter command (\,, \{, …)
+
+	const arity = COMMAND_ARITY[name];
+	if (arity !== undefined) {
+		let end = j;
+		// Optional command arguments (e.g. the degree in `\sqrt[3]{x}`) do not
+		// consume a required-argument slot.
+		for (;;) {
+			while (src[end] === " " || src[end] === "\t" || src[end] === "\n") end++;
+			if (src[end] !== "[") break;
+			const close = src.indexOf("]", end);
+			end = close === -1 ? src.length : close + 1;
+		}
+		for (let arg = 0; arg < arity; arg++) end = readArg(src, end).end;
+		return { text: src.slice(i, end), end };
+	}
+
 	let end = j;
 	while (src[end] === "[" || src[end] === "{") {
 		if (src[end] === "{") end = readBraceGroup(src, end).end;
@@ -878,6 +952,59 @@ function parseExpr(src: string, ctx: Ctx = ROOT_CTX): Box {
 				i = bottom.end;
 				continue;
 			}
+			if (name && HBRACE_COMMANDS[name]) {
+				flush();
+				const spec = HBRACE_COMMANDS[name];
+				const arg = readArg(src, j);
+				// Limits-style scripts: the brace-side script is the label; an
+				// opposite-side script attaches as a regular corner script.
+				let subText: string | null = null;
+				let supText: string | null = null;
+				let m = arg.end;
+				for (;;) {
+					let n = m;
+					while (src[n] === " ") n++;
+					if (src[n] === "_" && subText === null) {
+						const s = readArg(src, n + 1);
+						subText = s.text;
+						m = s.end;
+						continue;
+					}
+					if (src[n] === "^" && supText === null) {
+						const s = readArg(src, n + 1);
+						supText = s.text;
+						m = s.end;
+						continue;
+					}
+					break;
+				}
+				const labelText = spec.over ? supText : subText;
+				const otherText = spec.over ? subText : supText;
+				let box = hbraceBox(
+					parseExpr(arg.text, inner()),
+					spec,
+					labelText === null ? null : parseExpr(labelText, inner()),
+				);
+				if (otherText !== null) {
+					const other = parseExpr(otherText, inner());
+					box = attachScripts(box, spec.over ? other : null, spec.over ? null : other);
+				}
+				boxes.push(paint(box));
+				i = m;
+				continue;
+			}
+			if (name === "overset" || name === "underset" || name === "stackrel") {
+				flush();
+				const anno = readArg(src, j);
+				const base = readArg(src, anno.end);
+				const annoBox = parseExpr(anno.text, inner());
+				const baseBox = parseExpr(base.text, inner());
+				boxes.push(
+					paint(limitsBox(baseBox, name === "underset" ? annoBox : null, name === "underset" ? null : annoBox)),
+				);
+				i = base.end;
+				continue;
+			}
 			if (name === "sqrt") {
 				let k = j;
 				while (src[k] === " ") k++;
@@ -1108,8 +1235,18 @@ function parseExpr(src: string, ctx: Ctx = ROOT_CTX): Box {
 				const flat = latexToUnicode(raw);
 				return flat.startsWith("^") || flat.startsWith("_");
 			};
+			// Multi-letter script words (`N_{turns}`) would convert per-char into
+			// Unicode glyphs of uneven height and read ragged; box them too.
+			// Commands are stripped: their output (`\prime` → ′) is not letters.
+			const ragged = (raw: string | undefined): boolean => {
+				if (raw === undefined) return false;
+				const letters = scriptArgOf(raw)
+					.replace(/\\[A-Za-z]+/g, "")
+					.match(/[A-Za-z]/g);
+				return letters !== null && letters.length >= 2;
+			};
 			const tall = (supBox !== null && supBox.lines.length > 1) || (subBox !== null && subBox.lines.length > 1);
-			if (tall || unconvertible(supText) || unconvertible(subText)) {
+			if (tall || unconvertible(supText) || unconvertible(subText) || ragged(supText) || ragged(subText)) {
 				// Block script (`x^{\frac{1}{2}}`, `x^q`): raise/lower the boxes
 				// against the run or box they follow.
 				flush();
@@ -1163,6 +1300,80 @@ function parseExpr(src: string, ctx: Ctx = ROOT_CTX): Box {
 	return hconcat(boxes);
 }
 
+/**
+ * Count the command arguments still owed at the end of `seg` — non-zero when
+ * the row ends mid-construct (`\frac{a}` awaiting its denominator, or
+ * `\frac`/`x^` awaiting any argument). Pending arities form a stack: an
+ * unbraced nested command consumes one outer argument, then retains its own
+ * pending arguments without discarding the outer command's remaining arity.
+ * Used to keep a command joined to an argument written on the next source line
+ * while still treating an ordinary next row (`a\n{b+c}`) as a real row break.
+ */
+function bracesOwed(seg: string): number {
+	const pending: number[] = [];
+	const consumeArg = (): void => {
+		const top = pending.length - 1;
+		if (top < 0) return;
+		if (pending[top] === 1) pending.pop();
+		else pending[top]--;
+	};
+
+	let i = 0;
+	while (i < seg.length) {
+		const c = seg[i];
+		if (c === "\\") {
+			let j = i + 1;
+			let name = "";
+			while (j < seg.length && /[A-Za-z]/.test(seg[j])) name += seg[j++];
+			// A command plus its immediately attached `[…]`/`{…}` groups is one
+			// atom for an enclosing argument, matching readArg. Consume that outer
+			// argument first, then retain only the command's own missing arguments
+			// in a nested frame. Attached groups beyond the known arity still stay
+			// part of the atom and cannot consume another outer argument.
+			consumeArg();
+			const arity = name ? (COMMAND_ARITY[name] ?? 0) : 0;
+			let attached = 0;
+			if (name) {
+				while (seg[j] === "[" || seg[j] === "{") {
+					if (seg[j] === "{") {
+						j = readBraceGroup(seg, j).end;
+						if (attached < arity) attached++;
+					} else {
+						const close = seg.indexOf("]", j);
+						j = close === -1 ? seg.length : close + 1;
+					}
+				}
+			} else {
+				j = i + 2; // non-letter command (`\,`, `\{`, …)
+			}
+			const missing = arity - attached;
+			if (missing > 0) pending.push(missing);
+			i = j;
+			continue;
+		}
+		if (c === "{") {
+			i = readBraceGroup(seg, i).end;
+			consumeArg();
+			continue;
+		}
+		if (c === "^" || c === "_") {
+			pending.push(1);
+			i++;
+			continue;
+		}
+		if (c === " " || c === "\t" || c === "\n") {
+			i++;
+			continue;
+		}
+		consumeArg(); // a bare atom satisfies one pending argument
+		i++;
+	}
+
+	let owed = 0;
+	for (const remaining of pending) owed += remaining;
+	return owed;
+}
+
 /** Split on top-level `\n` and `\\` row separators (outside braces and environments). */
 function splitLines(src: string): string[] {
 	const lines: string[] = [];
@@ -1200,8 +1411,16 @@ function splitLines(src: string): string[] {
 		if (c === "{") braceDepth++;
 		else if (c === "}") braceDepth--;
 		else if (c === "\n" && braceDepth === 0 && envDepth === 0) {
-			lines.push(src.slice(last, i));
-			last = i + 1;
+			// A top-level newline is a row break UNLESS the current row ends with a
+			// command still awaiting an argument (e.g. `\frac{num}\n{den}`,
+			// `\frac{num}\n\sqrt{x}`, or `x^\n2`). Splitting there would sever the
+			// command from its argument, so keep both in one segment; latexToBlock
+			// collapses the interior newline to a space before parsing. A row that
+			// merely opens with a braced group (`a\n{b+c}`) stays a break.
+			if (bracesOwed(src.slice(last, i)) === 0) {
+				lines.push(src.slice(last, i));
+				last = i + 1;
+			}
 		}
 		i++;
 	}
@@ -1219,7 +1438,7 @@ function splitLines(src: string): string[] {
 export function latexToBlock(src: string): string[] {
 	if (typeof src !== "string" || src.trim() === "") return [];
 	const rows = splitLines(src.trim())
-		.map(line => line.trim())
+		.map(line => line.replace(/[ \t]*\n[ \t]*/g, " ").trim())
 		.filter(line => line !== "")
 		.map(line => parseExpr(line));
 	if (rows.length === 0) return [];

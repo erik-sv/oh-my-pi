@@ -19,12 +19,12 @@ const BUNDLED_PACKAGES: readonly BundledPackage[] = [
 	{ dir: "ai", identifier: "PiAi", rootShim: "legacy-pi-ai-shim.ts" },
 	{ dir: "coding-agent", identifier: "PiCodingAgent", rootShim: "legacy-pi-coding-agent-shim.ts" },
 	{ dir: "natives", identifier: "PiNatives", rootShim: null },
-	{ dir: "tui", identifier: "PiTui", rootShim: null },
+	{ dir: "tui", identifier: "PiTui", rootShim: "legacy-pi-tui-shim.ts" },
 	{ dir: "utils", identifier: "PiUtils", rootShim: null },
 ];
 
 const TYPEBOX_MODULE_KEY = "typebox";
-const TYPEBOX_SHIM = "typebox.ts";
+const TYPEBOX_COMPAT_MODULE = "legacy-typebox.ts";
 const SKIPPED_WILDCARD_BASENAMES = new Set(["index"]);
 const MAIN_THREAD_UNSAFE_WILDCARD_BASENAMES = new Set(["worker-entry"]);
 
@@ -142,16 +142,29 @@ export async function collectBundledPiEntries(): Promise<BundledPiEntry[]> {
 
 			const sourceDir = path.join(packageRoot, pattern.sourcePrefix);
 			try {
-				const glob = new Bun.Glob(`*${pattern.sourceSuffix}`);
+				// Recursive on purpose: Node matches `*` in an `exports` pattern across
+				// `/`, so `./slash-commands/*` genuinely serves
+				// `slash-commands/helpers/active-oauth-account`. Enumerating only the
+				// top level left every nested key out of the compiled registry, where
+				// it fell through to `Bun.resolveSync` and died under bunfs — so such
+				// an import worked from source and failed inside a binary.
+				const glob = new Bun.Glob(`**/*${pattern.sourceSuffix}`);
 				const matches: string[] = [];
 				for await (const match of glob.scan({ cwd: sourceDir, onlyFiles: true })) {
-					matches.push(match);
+					// Bun.Glob yields host separators; the export keys and generated
+					// identifiers below are `/`-shaped. Same normalization as
+					// `generate-docs-index.ts`.
+					matches.push(match.split(path.sep).join("/"));
 				}
 				matches.sort();
 				for (const match of matches) {
 					if (!match.endsWith(pattern.sourceSuffix)) continue;
 					const basename = match.slice(0, match.length - pattern.sourceSuffix.length);
-					if (!isSafeWildcardBasename(basename) || basename.includes("/")) continue;
+					const segments = basename.split("/");
+					// Every directory on the way has to be importable too: a private or
+					// hidden folder is no more exported than a private file.
+					if (segments.some(segment => segment.startsWith(".") || segment.startsWith("_"))) continue;
+					if (!isSafeWildcardBasename(segments.at(-1) ?? "")) continue;
 					const subpath = `${pattern.exportPrefix}${basename}${pattern.exportSuffix}`;
 					const key = `${manifest.name}/${subpath}`;
 					addEntry(key, bindingForSubpath(pkg.identifier, subpath), key);
@@ -162,23 +175,26 @@ export async function collectBundledPiEntries(): Promise<BundledPiEntry[]> {
 		}
 	}
 
-	addEntry(TYPEBOX_MODULE_KEY, "bundledTypeBoxShim", shimSpecifier(TYPEBOX_SHIM));
+	addEntry(TYPEBOX_MODULE_KEY, "bundledTypeBoxShim", shimSpecifier(TYPEBOX_COMPAT_MODULE));
 	return entries;
 }
 
-function renderVirtualModule(entries: readonly BundledPiEntry[]): string {
-	const imports = entries.map(entry => `import * as ${entry.binding} from ${JSON.stringify(entry.importSpecifier)};`);
+/** Render the lazy loader registry; exported so tests can execute the generated module. */
+export function __renderLegacyPiVirtualModule(entries: readonly BundledPiEntry[]): string {
+	const loaders = entries.map(
+		entry => `const ${entry.binding} = () => import(${JSON.stringify(entry.importSpecifier)});`,
+	);
 	const modules = entries.map(entry => `\t${JSON.stringify(entry.key)}: ${entry.binding},`);
-	return [...imports, "", "export const BUNDLED_PI_MODULES = {", ...modules, "};", ""].join("\n");
+	return [...loaders, "", "export const BUNDLED_PI_MODULE_LOADERS = {", ...modules, "};", ""].join("\n");
 }
 
 /**
- * Build plugin that materializes the legacy Pi module graph entirely in
- * memory. Bun still needs static import edges at compile time, but no generated
- * source or key-list file is written to the repository.
+ * Build plugin that materializes lazy legacy Pi module loaders entirely in
+ * memory. Literal dynamic imports retain every compile-time edge without
+ * evaluating unrelated host modules during extension bootstrap.
  */
 export async function createLegacyPiVirtualModulePlugin(): Promise<Bun.BunPlugin> {
-	const source = renderVirtualModule(await collectBundledPiEntries());
+	const source = __renderLegacyPiVirtualModule(await collectBundledPiEntries());
 	return {
 		name: "omp:legacy-pi-modules",
 		setup(build) {

@@ -16,7 +16,7 @@ import { SQL } from "bun";
 
 async function createSqlite(): Promise<{ client: InstanceType<typeof SQL>; storage: SqlSessionStorage }> {
 	const client = new SQL("sqlite::memory:");
-	const storage = await SqlSessionStorage.create({ client });
+	const storage = await SqlSessionStorage.create({ client, sessionRoot: "/sessions" });
 	return { client, storage };
 }
 
@@ -328,7 +328,7 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-sql-delete-"));
 		const client = new SQL("sqlite::memory:");
 		try {
-			const storage = await SqlSessionStorage.create({ client });
+			const storage = await SqlSessionStorage.create({ client, sessionRoot: path.join(tempDir, "project") });
 			const sessionPath = path.join(tempDir, "project", "delete-me.jsonl");
 			const artifactsDir = sessionPath.slice(0, -6);
 			await storage.writeText(sessionPath, "first chunk\nsecond chunk\n");
@@ -340,6 +340,36 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 			expect(storage.existsSync(sessionPath)).toBe(false);
 			expect(await listChunkPaths(client)).toEqual([]);
 			expect(fs.existsSync(artifactsDir)).toBe(false);
+		} finally {
+			await client.end();
+			await fsp.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects destructive paths outside the configured session root or without a filename", async () => {
+		const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-sql-delete-guard-"));
+		const client = new SQL("sqlite::memory:");
+		try {
+			const sessionRoot = path.join(tempDir, "sessions");
+			const storage = await SqlSessionStorage.create({ client, sessionRoot });
+			const rootPath = path.join(sessionRoot, ".jsonl");
+			const rootSentinel = path.join(sessionRoot, "keep.txt");
+			await storage.writeText(rootPath, "attacker-controlled root row\n");
+			await Bun.write(rootSentinel, "keep root");
+
+			await expect(storage.deleteSessionWithArtifacts(rootPath)).rejects.toThrow("Invalid session path");
+			expect(await Bun.file(rootSentinel).text()).toBe("keep root");
+			expect(storage.existsSync(rootPath)).toBe(true);
+
+			const outsidePath = path.join(tempDir, "outside.jsonl");
+			const outsideArtifacts = outsidePath.slice(0, -".jsonl".length);
+			const outsideSentinel = path.join(outsideArtifacts, "keep.txt");
+			await storage.writeText(outsidePath, "attacker-controlled outside row\n");
+			await Bun.write(outsideSentinel, "keep outside");
+
+			await expect(storage.deleteSessionWithArtifacts(outsidePath)).rejects.toThrow("outside the configured root");
+			expect(await Bun.file(outsideSentinel).text()).toBe("keep outside");
+			expect(storage.existsSync(outsidePath)).toBe(true);
 		} finally {
 			await client.end();
 			await fsp.rm(tempDir, { recursive: true, force: true });
@@ -358,6 +388,20 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		expect(storage.statSync("/sessions/p/b.jsonl").mtimeMs).toBe(originalMtime);
 		expect(await listChunkPaths(client)).toEqual(["/sessions/p/b.jsonl"]);
 		expect(await readChunks(client, "/sessions/p/b.jsonl")).toBe("from-a\n");
+		await client.end();
+	});
+
+	it("does not delete the destination when the indexed source disappeared out of band", async () => {
+		const { client, storage } = await createSqlite();
+		const source = "/sessions/p/stale-source.jsonl";
+		const destination = "/sessions/p/keep-destination.jsonl";
+		await storage.writeText(source, "source\n");
+		await storage.writeText(destination, "destination\n");
+		await client.unsafe("DELETE FROM omp_session_chunks WHERE path = ?", [source]);
+
+		await expect(storage.rename(source, destination)).rejects.toMatchObject({ code: "ENOENT" });
+
+		expect(await storage.readText(destination)).toBe("destination\n");
 		await client.end();
 	});
 

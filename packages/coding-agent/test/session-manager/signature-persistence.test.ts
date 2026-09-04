@@ -101,14 +101,20 @@ describe("SessionManager signature persistence", () => {
 	it("externalizes and restores tool result image blocks across reload", async () => {
 		using tempDir = TempDir.createSync("@pi-session-tool-image-persistence-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		const pngBytes = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+			"base64",
+		);
+		const contentData = Buffer.concat([pngBytes, Buffer.alloc(2048)]).toString("base64");
+		const detailData = Buffer.concat([pngBytes, Buffer.alloc(2048, 1)]).toString("base64");
 		const contentImage: ImageContent = {
 			type: "image",
-			data: Buffer.from("read-image-payload".repeat(100)).toString("base64"),
+			data: contentData,
 			mimeType: "image/png",
 		};
 		const detailImage: ImageContent = {
 			type: "image",
-			data: Buffer.from("eval-detail-image-payload".repeat(100)).toString("base64"),
+			data: detailData,
 			mimeType: "image/png",
 		};
 
@@ -275,6 +281,77 @@ describe("SessionManager signature persistence", () => {
 		expect(assistant.providerPayload?.type).toBe("openaiResponsesHistory");
 		const items = assistant.providerPayload?.type === "openaiResponsesHistory" ? assistant.providerPayload.items : [];
 		expect(items[0]?.encrypted_content).toBe(encrypted);
+		await reloaded.close();
+	}, 15_000);
+
+	it("preserves oversized Anthropic server-tool results byte-for-byte across reload", async () => {
+		using tempDir = TempDir.createSync("@pi-session-anthropic-server-tool-persistence-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		const oversizedPayload = "W".repeat(600_000);
+		const serverToolContent: AssistantMessage["content"] = [
+			{
+				type: "anthropicServerTool",
+				block: {
+					type: "server_tool_use",
+					id: "srvtoolu_web_search",
+					name: "web_search",
+					input: { query: "current UTC date" },
+				},
+			},
+			{
+				type: "anthropicServerTool",
+				block: {
+					type: "web_search_tool_result",
+					tool_use_id: "srvtoolu_web_search",
+					content: [{ type: "web_search_result", encrypted_content: `ENCRYPTED_WEB_SEARCH_${oversizedPayload}` }],
+				},
+			},
+			{
+				type: "anthropicServerTool",
+				block: {
+					type: "server_tool_use",
+					id: "srvtoolu_tool_search",
+					name: "tool_search_tool_bm25",
+					input: { query: "read" },
+				},
+			},
+			{
+				type: "anthropicServerTool",
+				block: {
+					type: "tool_search_tool_result",
+					tool_use_id: "srvtoolu_tool_search",
+					content: {
+						type: "tool_search_tool_search_result",
+						tool_references: [{ type: "tool_reference", tool_name: `READ_TOOL_${oversizedPayload}` }],
+					},
+				},
+			},
+		];
+
+		session.appendMessage({
+			role: "assistant",
+			content: serverToolContent,
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-opus",
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: 1,
+		});
+		await session.flush();
+		const sessionFile = session.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		await session.close();
+
+		const reloaded = await SessionManager.open(sessionFile);
+		expect(getAssistantMessage(reloaded).content).toEqual(serverToolContent);
 		await reloaded.close();
 	}, 15_000);
 });

@@ -2515,6 +2515,14 @@ export interface ResponseFunctionToolCall {
 	 */
 	namespace?: string;
 	/**
+	 * Plaintext-argument marker for collaboration tool calls (codex-rs
+	 * `encrypted_function_args`, #35845): an empty array marks the arguments as
+	 * plaintext agent-message payloads rather than encrypted blobs. Preserved
+	 * verbatim across history replay so the backend keeps treating them as
+	 * plaintext; omitted entirely for ordinary function calls.
+	 */
+	encrypted_function_args?: string[];
+	/**
 	 * The status of the item. One of `in_progress`, `completed`, or `incomplete`.
 	 * Populated when items are returned via API.
 	 */
@@ -2884,6 +2892,8 @@ export interface ResponseInputFile {
 	 * The name of the file to be sent to the model.
 	 */
 	filename?: string;
+	/** Explicit OpenAI prompt-cache breakpoint. */
+	prompt_cache_breakpoint?: { mode: "explicit" };
 }
 /**
  * A file input to the model.
@@ -2939,6 +2949,8 @@ export interface ResponseInputImage {
 	 * encoded image in a data URL.
 	 */
 	image_url?: string | null;
+	/** Explicit OpenAI prompt-cache breakpoint. */
+	prompt_cache_breakpoint?: { mode: "explicit" };
 }
 /**
  * An image input to the model. Learn about
@@ -3001,6 +3013,7 @@ export type ResponseInputItem =
 	| ResponseCustomToolCallOutput
 	| ResponseCustomToolCall
 	| ResponseInputItem.CompactionTrigger
+	| ResponseInputItem.ConfigurationUpdate
 	| ResponseInputItem.ItemReference;
 export declare namespace ResponseInputItem {
 	/**
@@ -3588,6 +3601,20 @@ export declare namespace ResponseInputItem {
 		type: "compaction_trigger";
 	}
 	/**
+	 * Changes reasoning effort for subsequent responses without touching the
+	 * request-level `reasoning.effort` (GPT-6 Astra). Must not be adjacent to
+	 * another `configuration_update`.
+	 */
+	interface ConfigurationUpdate {
+		/**
+		 * The type of the item. Always `configuration_update`.
+		 */
+		type: "configuration_update";
+		reasoning: {
+			effort: string;
+		};
+	}
+	/**
 	 * An internal identifier for an item to reference.
 	 */
 	interface ItemReference {
@@ -3642,6 +3669,8 @@ export interface ResponseInputText {
 	 * The type of the input item. Always `input_text`.
 	 */
 	type: "input_text";
+	/** Explicit OpenAI prompt-cache breakpoint. */
+	prompt_cache_breakpoint?: { mode: "explicit" };
 }
 /**
  * A text input to the model.
@@ -5922,6 +5951,8 @@ export interface ResponseCreateParamsBase {
 	 *   `prompt_cache_retention` is not specified.
 	 */
 	prompt_cache_retention?: "in_memory" | "24h" | null;
+	/** Explicit prompt-cache mode and minimum lifetime for GPT-5.6+ models. */
+	prompt_cache_options?: { mode: "implicit" | "explicit"; ttl?: "30m" } | null;
 	/**
 	 * **gpt-5 and o-series models only**
 	 *

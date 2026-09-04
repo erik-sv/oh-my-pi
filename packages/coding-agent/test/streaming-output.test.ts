@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	enforceInlineByteCap,
 	formatHeadTruncationNotice,
 	formatMiddleElisionMarker,
 	formatTailTruncationNotice,
@@ -15,6 +16,7 @@ import {
 	truncateTail,
 	truncateTailBytes,
 } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
+import { formatOutputNotice, outputMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const createdTempDirs: string[] = [];
@@ -32,6 +34,7 @@ function byteLength(text: string): number {
 }
 
 afterEach(async () => {
+	vi.useRealTimers();
 	for (const dir of createdTempDirs.splice(0)) {
 		await removeWithRetries(dir);
 	}
@@ -151,6 +154,17 @@ describe("truncateTail", () => {
 		expect(result.truncatedBy).toBe("bytes");
 		expect(result.lastLinePartial).toBe(true);
 	});
+
+	test("fills the remaining byte budget from a giant line before smaller trailing lines", () => {
+		const result = truncateTail("abcdefghijk\n}\n```", { maxLines: 10, maxBytes: 10 });
+
+		expect(result.content).toBe("hijk\n}\n```");
+		expect(result.truncatedBy).toBe("bytes");
+		expect(result.outputLines).toBe(3);
+		expect(result.outputBytes).toBe(10);
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.lastLinePartial).toBe(false);
+	});
 });
 
 describe("truncateLine", () => {
@@ -223,6 +237,20 @@ describe("OutputSink", () => {
 		await sink.push("abc");
 		await sink.push("def");
 		expect(chunks).toEqual(["abc", "def"]);
+	});
+
+	test("normalizes carriage-return progress frames across chunk boundaries", async () => {
+		const chunks: string[] = [];
+		const sink = new OutputSink({ onChunk: chunk => chunks.push(chunk) });
+
+		sink.push("start\r");
+		sink.push("one\r");
+		sink.push("two\r");
+		sink.push("\n");
+		const dumped = await sink.dump();
+
+		expect(chunks.join("")).toBe("start\none\ntwo\n");
+		expect(dumped.output).toBe("start\none\ntwo\n");
 	});
 
 	test("preserves SIXEL chunks when passthrough gates are enabled", async () => {
@@ -315,6 +343,48 @@ describe("OutputSink", () => {
 		// First push fires immediately; dump flushes the coalesced remainder.
 		expect(chunks).toEqual(["a", "bc"]);
 		expect(dumped.output).toBe("abc");
+	});
+
+	test("throttled onChunk emits a quiet tail at the throttle boundary", () => {
+		vi.useFakeTimers();
+		const chunks: string[] = [];
+		const sink = new OutputSink({ onChunk: chunk => chunks.push(chunk), chunkThrottleMs: 20 });
+
+		sink.push("a");
+		sink.push("b");
+		expect(chunks).toEqual(["a"]);
+
+		vi.advanceTimersByTime(20);
+
+		expect(chunks).toEqual(["a", "b"]);
+	});
+
+	test("dump flushes a throttled tail once and cancels its timer", async () => {
+		vi.useFakeTimers();
+		const chunks: string[] = [];
+		const sink = new OutputSink({ onChunk: chunk => chunks.push(chunk), chunkThrottleMs: 20 });
+
+		sink.push("a");
+		sink.push("b");
+		expect((await sink.dump()).output).toBe("ab");
+		expect(chunks).toEqual(["a", "b"]);
+
+		vi.advanceTimersByTime(20);
+
+		expect(chunks).toEqual(["a", "b"]);
+	});
+
+	test("replace cancels a throttled tail and discards its pending preview", () => {
+		vi.useFakeTimers();
+		const chunks: string[] = [];
+		const sink = new OutputSink({ onChunk: chunk => chunks.push(chunk), chunkThrottleMs: 20 });
+
+		sink.push("a");
+		sink.push("superseded");
+		sink.replace("replacement");
+		vi.advanceTimersByTime(20);
+
+		expect(chunks).toEqual(["a"]);
 	});
 
 	test("caps artifact-on-disk size: head + notice + tail when stream exceeds cap", async () => {
@@ -485,7 +555,7 @@ describe("truncation notice formatting", () => {
 		expect(formatTailTruncationNotice(truncation)).toBe("");
 	});
 
-	test("formatTailTruncationNotice supports partial-line and complete-line notices", () => {
+	test("formatTailTruncationNotice distinguishes partial leading and final lines", () => {
 		const partialLineTruncation = truncateTail("abcdefghij", { maxLines: 10, maxBytes: 4 });
 		const partialLineNotice = formatTailTruncationNotice(partialLineTruncation, {
 			fullOutputPath: "/tmp/full.log",
@@ -501,6 +571,11 @@ describe("truncation notice formatting", () => {
 
 		const byteTruncation = truncateTail("aaa\nbbbb\ncc", { maxLines: 10, maxBytes: 6 });
 		expect(formatTailTruncationNotice(byteTruncation)).toBe("\n\n[Showing lines 3-3 of 3]");
+
+		const leadingPartialTruncation = truncateTail("abcdefghijk\n}\n```", { maxLines: 10, maxBytes: 10 });
+		expect(formatTailTruncationNotice(leadingPartialTruncation)).toBe(
+			"\n\n[Showing last 10B across lines 1-3 of 3; line 1 is partial]",
+		);
 	});
 
 	test("formatHeadTruncationNotice returns empty string for non-truncated results", () => {
@@ -548,17 +623,65 @@ describe("truncateMiddle", () => {
 		expect(result.elidedBytes).toBeGreaterThan(0);
 	});
 
-	test("falls back to tail-only when head budget cannot accept the first line", () => {
+	test("uses non-overlapping byte windows when the first line exceeds the head budget", () => {
 		const giantFirstLine = `${"x".repeat(200)}\nshort-2\nshort-3`;
 		const result = truncateMiddle(giantFirstLine, {
 			maxBytes: 40,
 			maxLines: 10,
-			maxHeadBytes: 8, // first line is 200 bytes — exceeds head budget
+			maxHeadBytes: 8,
 			maxHeadLines: 1,
 		});
 		expect(result.truncated).toBe(true);
-		// Should not contain the elision marker; it's a regular tail truncation.
-		expect(result.content).not.toContain("elided");
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.content.startsWith("xxxxxxxx")).toBe(true);
+		expect(result.content.endsWith("short-3")).toBe(true);
+		expect(result.content).toContain("elided");
+		expect(result.elidedBytes).toBeGreaterThan(0);
+		expect(result.headLines).toBe(1);
+		expect(result.tailLines).toBe(3);
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.lastLinePartial).toBe(false);
+	});
+
+	test("does not duplicate overlapping fallback windows", () => {
+		const content = `${"x".repeat(5000)}\n${Array.from({ length: 100 }, (_, i) => `line-${i}`).join("\n")}`;
+		const result = truncateMiddle(content, { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.elidedBytes).toBeGreaterThan(0);
+		expect(result.content).not.toContain("[…0B elided…]");
+		expect(result.headLines).toBe(1);
+		expect(result.tailLines).toBeLessThanOrEqual(40);
+		expect(result.outputBytes).toBeLessThanOrEqual(8192 + 64);
+	});
+
+	test("marks multi-line partial byte windows so exact ranges are omitted", () => {
+		const content = `${"x".repeat(20_000)}\n${"y".repeat(20_000)}`;
+		const result = truncateMiddle(content, { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.elidedBytes).toBeGreaterThan(0);
+	});
+
+	test("keeps a giant trailing line within budget", () => {
+		const content = `label\n${"x".repeat(20_000)}`;
+		const result = truncateMiddle(content, { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncated).toBe(true);
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.content.startsWith("label\n")).toBe(true);
+		expect(result.content).toContain("elided");
+		expect(result.outputBytes).toBeLessThanOrEqual(8192 + 64);
+	});
+
+	test("marks single-line byte windows so line ranges can be omitted", () => {
+		const result = truncateMiddle("x".repeat(20_000), { maxBytes: 8192, maxLines: 80 });
+
+		expect(result.truncatedBy).toBe("middle");
+		expect(result.partialByteWindows).toBe(true);
+		expect(result.headLines).toBe(1);
+		expect(result.tailLines).toBe(1);
 	});
 
 	test("formatMiddleElisionMarker uses lines, falling back to bytes for <=1 line", () => {
@@ -628,6 +751,36 @@ describe("OutputSink head-retain mode", () => {
 		// Counters realign to the authoritative buffer + the subsequent push.
 		expect(dumped.totalBytes).toBe(byteLength("OK\n[raw output: artifact://8]\n"));
 	});
+
+	test("middle-elided dump body fits the inline budget (no double truncation)", async () => {
+		// Regression: the head and tail windows each had their own full budget,
+		// so an elided dump body could reach headBytes + spillThreshold and
+		// re-trip enforceInlineByteCap at the tool-result boundary — truncating
+		// a second time and saving a duplicate artifact whose id disagreed with
+		// the truncation notice's `Read artifact://N for full output`.
+		const spillThreshold = 1000;
+		const sink = new OutputSink({ spillThreshold, headBytes: 400 });
+		const lines = Array.from({ length: 400 }, (_, i) => `line ${i}`).join("\n");
+		sink.push(lines);
+
+		const dumped = await sink.dump();
+		expect(dumped.truncated).toBe(true);
+		expect(dumped.elidedLines ?? 0).toBeGreaterThan(0);
+		// Head window + elision marker + tail window share the one budget
+		// (small slack for the marker and separators).
+		expect(byteLength(dumped.output)).toBeLessThanOrEqual(spillThreshold + 64);
+
+		let saved: string | undefined;
+		const capped = await enforceInlineByteCap(dumped.output, {
+			maxBytes: spillThreshold + 2048,
+			saveArtifact: full => {
+				saved = full;
+				return "duplicate";
+			},
+		});
+		expect(capped).toBe(dumped.output);
+		expect(saved).toBeUndefined();
+	});
 });
 
 describe("OutputSink maxColumns (per-line cap)", () => {
@@ -636,7 +789,11 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		await sink.push(`short\n${"x".repeat(50)}\nfooter`);
 
 		const dumped = await sink.dump();
-		expect(dumped.truncated).toBe(true);
+		// A per-line column cap trims individual lines but does not truncate the
+		// output window: every line is still present, so `truncated` stays false.
+		// (Regression: column-cap-only output was misreported as a byte-window
+		// truncation, producing a bogus "Showing lines X-Y … limit" footer — #4735.)
+		expect(dumped.truncated).toBe(false);
 		expect(dumped.output).toContain("short\n");
 		expect(dumped.output).toContain("\nfooter");
 		expect(dumped.output).toContain("…");
@@ -644,8 +801,30 @@ describe("OutputSink maxColumns (per-line cap)", () => {
 		expect(dumped.output).not.toContain("x".repeat(50));
 		expect(dumped.columnTruncatedLines).toBe(1);
 		expect(dumped.columnDroppedBytes ?? 0).toBeGreaterThan(0);
+		expect(dumped.columnMax).toBe(8);
 		// totalBytes still reflects the raw stream, not the post-cap view.
 		expect(dumped.totalBytes).toBe(byteLength(`short\n${"x".repeat(50)}\nfooter`));
+	});
+
+	test("column-cap-only output surfaces a column notice, not a window/byte truncation footer", async () => {
+		// Regression for #4735: fully-shown output whose only trimming was the
+		// per-line column cap must not emit "Showing lines X-Y of Z (…B limit).
+		// Read artifact://… for full output" — every line is present.
+		const sink = new OutputSink({ maxColumns: 8, spillThreshold: 100_000 });
+		const lines = ["a", "b", "c", "x".repeat(50), "d"];
+		await sink.push(`${lines.join("\n")}\n`);
+		const dumped = await sink.dump();
+
+		const meta = outputMeta().truncationFromSummary(dumped, { direction: "tail" }).get();
+		// No window truncation → no styled TUI warning and no range/limit footer.
+		expect(meta?.truncation).toBeUndefined();
+		expect(meta?.limits?.columnTruncated).toEqual({ maxColumn: 8 });
+
+		const notice = formatOutputNotice(meta);
+		expect(notice).toContain("Some lines truncated to 8 chars");
+		expect(notice).not.toContain("Showing lines");
+		expect(notice).not.toContain("limit");
+		expect(notice).not.toContain("artifact://");
 	});
 
 	test("persists per-line state across chunk boundaries", async () => {

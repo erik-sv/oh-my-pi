@@ -1,18 +1,16 @@
-// Peer-cap counting tests. The scratch subnet dir is supplied via
-// OMP_PEER_COMS_DIR in the test invocation so the extension module (which
-// captures PEER_COMS_DIR at import time) and this test agree on one location
-// without a dynamic import.
-import { expect, test } from "bun:test";
+import { afterAll, expect, test } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { countLiveOtherPeers } from "./peer-coms.ts";
 
-const DIR = process.env.OMP_PEER_COMS_DIR;
-if (!DIR) throw new Error("run with OMP_PEER_COMS_DIR set to a scratch dir");
+const DIR = fs.mkdtempSync(path.join(os.tmpdir(), "omp-peer-cap-"));
+
+afterAll(() => fs.rmSync(DIR, { recursive: true, force: true }));
 
 function writeEntry(project: string, sessionId: string, pid: number): void {
-	const agentsDir = path.join(DIR as string, "projects", project, "agents");
+	const agentsDir = path.join(DIR, "projects", project, "agents");
 	fs.mkdirSync(agentsDir, { recursive: true });
 	const now = new Date().toISOString();
 	const entry = {
@@ -20,7 +18,7 @@ function writeEntry(project: string, sessionId: string, pid: number): void {
 		name: sessionId,
 		model: "test",
 		pid,
-		endpoint: path.join(DIR as string, `${sessionId}.sock`),
+		endpoint: path.join(DIR, `${sessionId}.sock`),
 		cwd: "/tmp",
 		project,
 		explicit: false,
@@ -40,5 +38,5 @@ test("counts live non-self peers, prunes dead pids, excludes own pid", () => {
 	// An entry carrying our own pid is the caller -> excluded from "other".
 	writeEntry("agentdesk", "self", process.pid);
 
-	expect(countLiveOtherPeers("*", undefined)).toBe(2);
+	expect(countLiveOtherPeers("*", undefined, DIR)).toBe(2);
 });

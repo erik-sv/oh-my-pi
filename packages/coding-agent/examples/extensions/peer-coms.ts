@@ -447,16 +447,16 @@ function renderAgentPrompt(definition: PeerAgentDefinition | undefined): string 
 	return definition?.body;
 }
 
-function projectDir(project: string): string {
-	return path.join(PEER_COMS_DIR, "projects", safeName(project));
+function projectDir(project: string, root = PEER_COMS_DIR): string {
+	return path.join(root, "projects", safeName(project));
 }
 
-function registryDir(project: string): string {
-	return path.join(projectDir(project), "agents");
+function registryDir(project: string, root = PEER_COMS_DIR): string {
+	return path.join(projectDir(project, root), "agents");
 }
 
-function registryPath(project: string, sessionId: string): string {
-	return path.join(registryDir(project), `${sessionId}.json`);
+function registryPath(project: string, sessionId: string, root = PEER_COMS_DIR): string {
+	return path.join(registryDir(project, root), `${sessionId}.json`);
 }
 
 function endpointPath(sessionId: string): string {
@@ -473,25 +473,25 @@ function writeRegistry(entry: RegistryEntry): void {
 	fs.renameSync(tmpPath, finalPath);
 }
 
-function removeRegistry(project: string, sessionId: string): void {
+function removeRegistry(project: string, sessionId: string, root = PEER_COMS_DIR): void {
 	try {
-		fs.unlinkSync(registryPath(project, sessionId));
+		fs.unlinkSync(registryPath(project, sessionId, root));
 	} catch {
 		// Best effort during shutdown and stale pruning.
 	}
 }
 
-function listProjects(): string[] {
-	const root = path.join(PEER_COMS_DIR, "projects");
+function listProjects(root = PEER_COMS_DIR): string[] {
+	const projectsRoot = path.join(root, "projects");
 	try {
-		return fs.readdirSync(root).filter(name => fs.statSync(path.join(root, name)).isDirectory());
+		return fs.readdirSync(projectsRoot).filter(name => fs.statSync(path.join(projectsRoot, name)).isDirectory());
 	} catch {
 		return [];
 	}
 }
 
-function readRegistryEntries(project: string): RegistryEntry[] {
-	const dir = registryDir(project);
+function readRegistryEntries(project: string, root = PEER_COMS_DIR): RegistryEntry[] {
+	const dir = registryDir(project, root);
 	try {
 		return fs
 			.readdirSync(dir)
@@ -545,15 +545,15 @@ function probeStaleSocket(endpoint: string): Promise<"in_use" | "stale"> {
 	});
 }
 
-function pruneRegistry(project: string): RegistryEntry[] {
+function pruneRegistry(project: string, root = PEER_COMS_DIR): RegistryEntry[] {
 	const cutoff = Date.now() - PEER_STALE_MS;
 	const live: RegistryEntry[] = [];
-	for (const entry of readRegistryEntries(project)) {
+	for (const entry of readRegistryEntries(project, root)) {
 		const fresh = Date.parse(entry.heartbeat_at) >= cutoff;
 		if (fresh && processIsLive(entry.pid)) {
 			live.push(entry);
 		} else {
-			removeRegistry(project, entry.session_id);
+			removeRegistry(project, entry.session_id, root);
 		}
 	}
 	return live;
@@ -572,9 +572,15 @@ function uniquePeerName(project: string, desiredName: string): string {
 // Live peers in this subnet other than the caller, across one project or all
 // ("*"). Mirrors what the AgentDesk reaper folds into the RSS ceiling, so the
 // cap and the ceiling agree on what counts as "a peer".
-export function countLiveOtherPeers(project: string, identity: RegistryEntry | undefined): number {
-	const projects = project === "*" ? listProjects() : [project];
-	return projects.flatMap(pruneRegistry).filter(entry => !isOwnRegistryEntry(entry, identity)).length;
+export function countLiveOtherPeers(
+	project: string,
+	identity: RegistryEntry | undefined,
+	root = PEER_COMS_DIR,
+): number {
+	const projects = project === "*" ? listProjects(root) : [project];
+	return projects
+		.flatMap(project => pruneRegistry(project, root))
+		.filter(entry => !isOwnRegistryEntry(entry, identity)).length;
 }
 
 function resolveExecutableOnPath(command: string, pathValue = process.env.PATH): string | undefined {
@@ -765,12 +771,11 @@ function sendFrame(endpoint: string, envelope: Envelope): Promise<unknown> {
 	return new Promise((resolve, reject) => {
 		const socket = net.createConnection({ path: endpoint });
 		let settled = false;
-		let timer: NodeJS.Timeout | undefined;
 
 		const fail = (err: Error) => {
 			if (settled) return;
 			settled = true;
-			if (timer) clearTimeout(timer);
+			clearTimeout(timer);
 			try {
 				socket.destroy();
 			} catch {
@@ -779,7 +784,7 @@ function sendFrame(endpoint: string, envelope: Envelope): Promise<unknown> {
 			reject(err);
 		};
 
-		timer = setTimeout(() => fail(new Error("peer-coms frame timed out")), FRAME_TIMEOUT_MS);
+		const timer = setTimeout(() => fail(new Error("peer-coms frame timed out")), FRAME_TIMEOUT_MS);
 		timer.unref?.();
 
 		socket.once("error", fail);
@@ -852,9 +857,9 @@ export function assistantTextFromEntries(entries: Iterable<unknown>, startIndex 
 				.filter((part): part is { type: "text"; text: string } => {
 					return Boolean(
 						part &&
-							typeof part === "object" &&
-							(part as { type?: unknown }).type === "text" &&
-							typeof (part as { text?: unknown }).text === "string",
+						typeof part === "object" &&
+						(part as { type?: unknown }).type === "text" &&
+						typeof (part as { text?: unknown }).text === "string",
 					);
 				})
 				.map(part => part.text)
@@ -866,6 +871,38 @@ export function assistantTextFromEntries(entries: Iterable<unknown>, startIndex 
 
 function lastAssistantText(ctx: ExtensionContext, startIndex = 0): { text: string; found: boolean } {
 	return assistantTextFromEntries(ctx.sessionManager.getBranch(), startIndex);
+}
+
+interface PeerListParams {
+	project?: string;
+	include_explicit?: boolean;
+}
+
+interface PeerSpawnParams {
+	name: string;
+	purpose?: string;
+	project?: string;
+	model?: string;
+	agent?: string;
+	launch_mode?: "terminal" | "detached";
+	initial_prompt?: string;
+	wait_ms?: number;
+}
+
+interface PeerSendParams {
+	target: string;
+	prompt: string;
+	response_schema?: unknown;
+}
+
+interface PeerMessageParams {
+	msg_id: string;
+	timeout_ms?: number;
+}
+
+interface PeerShutdownParams {
+	target: string;
+	reason?: string;
 }
 
 export default function peerComs(pi: ExtensionAPI) {
@@ -940,7 +977,7 @@ export default function peerComs(pi: ExtensionAPI) {
 	function peers(project: string, includeExplicit: boolean): RegistryEntry[] {
 		const projects = project === "*" ? listProjects() : [project];
 		return projects
-			.flatMap(pruneRegistry)
+			.flatMap(project => pruneRegistry(project))
 			.filter(entry => !isOwnRegistryEntry(entry, identity))
 			.filter(entry => includeExplicit || !entry.explicit);
 	}
@@ -961,11 +998,11 @@ export default function peerComs(pi: ExtensionAPI) {
 	function isPong(value: unknown): value is PongEnvelope {
 		return Boolean(
 			value &&
-				typeof value === "object" &&
-				(value as { type?: unknown }).type === "pong" &&
-				typeof (value as { msg_id?: unknown }).msg_id === "string" &&
-				(value as { agent_card?: unknown }).agent_card !== null &&
-				typeof (value as { agent_card?: unknown }).agent_card === "object",
+			typeof value === "object" &&
+			(value as { type?: unknown }).type === "pong" &&
+			typeof (value as { msg_id?: unknown }).msg_id === "string" &&
+			(value as { agent_card?: unknown }).agent_card !== null &&
+			typeof (value as { agent_card?: unknown }).agent_card === "object",
 		);
 	}
 
@@ -1307,7 +1344,8 @@ export default function peerComs(pi: ExtensionAPI) {
 				.describe('Project namespace, or "*" for all projects. Defaults to this peer project.'),
 			include_explicit: z.boolean().optional().describe("Include peers launched with --peer-explicit."),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as PeerListParams;
 			const project = params.project ?? identity?.project ?? "default";
 			const entries = peers(project, params.include_explicit === true);
 			const pings = await Promise.allSettled(entries.map(entry => pingPeer(entry)));
@@ -1364,7 +1402,8 @@ export default function peerComs(pi: ExtensionAPI) {
 				.describe("Optional startup instructions appended to the spawned peer's system prompt."),
 			wait_ms: z.number().min(0).max(30_000).optional().describe("How long to wait for peer registration."),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, rawParams, _signal, _onUpdate, ctx) {
+			const params = rawParams as PeerSpawnParams;
 			const project = params.project ?? identity?.project ?? "default";
 			if (MAX_PEERS > 0) {
 				const liveOthers = countLiveOtherPeers("*", identity);
@@ -1484,7 +1523,8 @@ export default function peerComs(pi: ExtensionAPI) {
 				.optional()
 				.describe("Optional JSON schema. If provided, the peer response must be JSON."),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as PeerSendParams;
 			if (!identity) throw new Error("peer-coms is not initialized");
 			const target = resolveTarget(params.target);
 			if (!target) throw new Error(`No live peer-coms agent found for ${params.target}`);
@@ -1550,7 +1590,8 @@ export default function peerComs(pi: ExtensionAPI) {
 		parameters: z.object({
 			msg_id: z.string().describe("msg_id returned by peer_send."),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as PeerMessageParams;
 			const pending = pendingReplies.get(params.msg_id);
 			if (!pending) {
 				return {
@@ -1591,7 +1632,8 @@ export default function peerComs(pi: ExtensionAPI) {
 			msg_id: z.string().describe("msg_id returned by peer_send."),
 			timeout_ms: z.number().positive().optional().describe("Maximum wait in milliseconds."),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as PeerMessageParams;
 			const pending = pendingReplies.get(params.msg_id);
 			if (!pending) {
 				return {
@@ -1635,7 +1677,8 @@ export default function peerComs(pi: ExtensionAPI) {
 			target: z.string().describe("Peer name or session_id to shut down."),
 			reason: z.string().optional().describe("Short reason recorded in the peer-coms audit log."),
 		}),
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, rawParams) {
+			const params = rawParams as PeerShutdownParams;
 			if (!identity) throw new Error("peer-coms is not initialized");
 			const target = resolveTarget(params.target);
 			if (!target) throw new Error(`No live peer-coms agent found for ${params.target}`);

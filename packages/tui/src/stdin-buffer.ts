@@ -56,11 +56,55 @@ const PARTIAL_HOLD_MAX_MS = 150;
 // so the string-terminator cap is generous.
 const MAX_CSI_BYTES = 4096;
 const MAX_STRING_SEQ_BYTES = 16 * 1024 * 1024;
+// Torn-string discard bounds. When a capped or timeout-expired OSC/DCS/APC
+// partial is dropped, the bytes that follow are mid-string payload (base64
+// clipboard data, Sixel, …) up to the next ST/BEL. Replaying them as
+// keystrokes types kilobytes of garbage into the focused component (kitty
+// OSC 5522 image paste spam), so discard mode swallows the tail until a
+// terminator — bounded by a byte budget for a terminator-less stream and an
+// inactivity watchdog for a stream that simply stops.
+const STRING_DISCARD_MAX_BYTES = 2 * MAX_STRING_SEQ_BYTES;
+const STRING_DISCARD_INACTIVITY_MS = 1000;
+// Partial that can only be the head of an OSC/DCS/APC string sequence.
+const STRING_SEQ_PARTIAL = /^\x1b[\]P_]/;
 
 // SGR mouse report bodies live between `<` and the terminating `M`/`m`.
 // Matched only when the trailing byte is a valid terminator, so the regex
 // runs at most once per resolved report — never inside the growth loop.
 const SGR_MOUSE_COMPLETE = /^<\d+;\d+;\d+[Mm]$/;
+
+// Raw-paste classification holds CR/LF-bearing, ESC-free input briefly so
+// adjacent stdin reads from one unmarked paste can be considered together.
+// Fixed from the first break-bearing read (not an inactivity debounce): normal
+// Enter latency and candidate memory remain bounded even under a continuous
+// stream. Ten milliseconds spans adjacent PTY reads without becoming perceptible.
+const RAW_PASTE_CLASSIFICATION_TIMEOUT_MS = 10;
+
+/**
+ * Whether `text` has two completed logical line breaks (three line segments).
+ *
+ * A single Enter may be batched with surrounding keystrokes in one stdin read,
+ * so one break is ambiguous and must stay on the key path. CRLF counts as one
+ * logical break. Content after the second break completes the third segment;
+ * until then the classification window keeps buffering.
+ */
+function isRawMultilineBurst(text: string): boolean {
+	let breaks = 0;
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code === 0x0d) {
+			breaks++;
+			if (text.charCodeAt(i + 1) === 0x0a) i++;
+			continue;
+		}
+		if (code === 0x0a) {
+			breaks++;
+			continue;
+		}
+		if (breaks >= 2) return true;
+	}
+	return false;
+}
 
 /**
  * Resolve the exclusive-end index of the escape sequence starting at `pos`
@@ -77,7 +121,8 @@ const SGR_MOUSE_COMPLETE = /^<\d+;\d+;\d+[Mm]$/;
  *   `end > pos`  — complete sequence, exclusive end index.
  *   `-1`         — incomplete, still under the per-type cap; buffer for more.
  *   `-2`         — incomplete and the prefix already spans the per-type cap;
- *                  the caller flushes it as raw bytes to guarantee progress.
+ *                  the caller cap-flushes CSI as raw bytes; string types
+ *                  (OSC/DCS/APC) are dropped and their tail discarded.
  */
 function resolveEscapeEnd(buffer: string, pos: number, length: number, resumeSearchFrom: number): number {
 	if (pos + 1 >= length) return -1;
@@ -87,88 +132,85 @@ function resolveEscapeEnd(buffer: string, pos: number, length: number, resumeSea
 		case 0x1b /* ESC */:
 			// Meta-ESC handled by the caller.
 			return -1;
-		case 0x5b /* [ */:
-			{
-				// CSI: ESC [ ... final byte in 0x40-0x7E.
-				if (pos + 2 >= length) return -1;
-				// Old-style X10 mouse: ESC [ M + 3 arbitrary bytes.
-				if (buffer.charCodeAt(pos + 2) === 0x4d /* M */) {
-					if (pos + 6 <= length) return pos + 6;
-					// Fewer than 6 bytes buffered is always under MAX_CSI_BYTES,
-					// so this is a plain "wait for more", never a cap flush.
-					return -1;
-				}
-				const capEnd = Math.min(length, pos + MAX_CSI_BYTES);
-				const isSgrMouse = buffer.charCodeAt(pos + 2) === 0x3c /* < */;
-				// No resume hint for CSI: `extractCompleteSequences` records
-				// hints only for OSC/DCS/APC. A partial CSI rescans from its
-				// head, bounded by the tight MAX_CSI_BYTES cap.
-				let i = pos + 2;
-				while (i < capEnd) {
-					const code = buffer.charCodeAt(i);
-					if (code >= 0x40 && code <= 0x7e) {
-						if (isSgrMouse) {
-							// SGR mouse only terminates on M/m. Any other final
-							// byte would be a malformed body — keep scanning to
-							// match the prior `isCompleteCsiSequence` semantics.
-							if (code !== 0x4d && code !== 0x6d) {
-								i++;
-								continue;
-							}
-							const payload = buffer.slice(pos + 2, i + 1);
-							if (SGR_MOUSE_COMPLETE.test(payload)) return i + 1;
-							// Malformed body ending in M/m — keep scanning for a
-							// real terminator. Bounded by capEnd.
+		case 0x5b /* [ */: {
+			// CSI: ESC [ ... final byte in 0x40-0x7E.
+			if (pos + 2 >= length) return -1;
+			// Old-style X10 mouse: ESC [ M + 3 arbitrary bytes.
+			if (buffer.charCodeAt(pos + 2) === 0x4d /* M */) {
+				if (pos + 6 <= length) return pos + 6;
+				// Fewer than 6 bytes buffered is always under MAX_CSI_BYTES,
+				// so this is a plain "wait for more", never a cap flush.
+				return -1;
+			}
+			const capEnd = Math.min(length, pos + MAX_CSI_BYTES);
+			const isSgrMouse = buffer.charCodeAt(pos + 2) === 0x3c; /* < */
+			// No resume hint for CSI: `extractCompleteSequences` records
+			// hints only for OSC/DCS/APC. A partial CSI rescans from its
+			// head, bounded by the tight MAX_CSI_BYTES cap.
+			let i = pos + 2;
+			while (i < capEnd) {
+				const code = buffer.charCodeAt(i);
+				if (code >= 0x40 && code <= 0x7e) {
+					if (isSgrMouse) {
+						// SGR mouse only terminates on M/m. Any other final
+						// byte would be a malformed body — keep scanning to
+						// match the prior `isCompleteCsiSequence` semantics.
+						if (code !== 0x4d && code !== 0x6d) {
 							i++;
 							continue;
 						}
-						return i + 1;
+						const payload = buffer.slice(pos + 2, i + 1);
+						if (SGR_MOUSE_COMPLETE.test(payload)) return i + 1;
+						// Malformed body ending in M/m — keep scanning for a
+						// real terminator. Bounded by capEnd.
+						i++;
+						continue;
 					}
-					i++;
+					return i + 1;
 				}
-				return length - pos >= MAX_CSI_BYTES ? -2 : -1;
+				i++;
 			}
-		case 0x5d /* ] */:
-			{
-				// OSC: ESC ] ... BEL or ST (ESC \). Scan is bounded to
-				// [searchFrom, scanLimit): `String#indexOf` has no end bound, so
-				// an unterminated payload delivered as one huge chunk would
-				// otherwise be scanned to the end of the buffer — past the cap
-				// this function exists to enforce. `resumeSearchFrom - 1` keeps
-				// the one-byte overlap so an `ESC \` split across chunks is
-				// still found (the prior call's trailing ESC is re-inspected).
-				const searchFrom = Math.max(pos + 2, resumeSearchFrom - 1);
-				const scanLimit = Math.min(length, pos + MAX_STRING_SEQ_BYTES);
-				for (let i = searchFrom; i < scanLimit; i++) {
-					const code = buffer.charCodeAt(i);
-					if (code === 0x07 /* BEL */) return i + 1;
-					if (code === 0x1b /* ESC */) {
-						// `ESC \` (ST) must end within the cap; a lone trailing
-						// ESC at the buffer edge stays incomplete and is
-						// re-examined next call via the resume overlap.
-						if (i + 1 < scanLimit && buffer.charCodeAt(i + 1) === 0x5c /* \ */) return i + 2;
-					}
+			return length - pos >= MAX_CSI_BYTES ? -2 : -1;
+		}
+		case 0x5d /* ] */: {
+			// OSC: ESC ] ... BEL or ST (ESC \). Scan is bounded to
+			// [searchFrom, scanLimit): `String#indexOf` has no end bound, so
+			// an unterminated payload delivered as one huge chunk would
+			// otherwise be scanned to the end of the buffer — past the cap
+			// this function exists to enforce. `resumeSearchFrom - 1` keeps
+			// the one-byte overlap so an `ESC \` split across chunks is
+			// still found (the prior call's trailing ESC is re-inspected).
+			const searchFrom = Math.max(pos + 2, resumeSearchFrom - 1);
+			const scanLimit = Math.min(length, pos + MAX_STRING_SEQ_BYTES);
+			for (let i = searchFrom; i < scanLimit; i++) {
+				const code = buffer.charCodeAt(i);
+				if (code === 0x07 /* BEL */) return i + 1;
+				if (code === 0x1b /* ESC */) {
+					// `ESC \` (ST) must end within the cap; a lone trailing
+					// ESC at the buffer edge stays incomplete and is
+					// re-examined next call via the resume overlap.
+					if (i + 1 < scanLimit && buffer.charCodeAt(i + 1) === 0x5c /* \ */) return i + 2;
 				}
-				return length - pos >= MAX_STRING_SEQ_BYTES ? -2 : -1;
 			}
+			return length - pos >= MAX_STRING_SEQ_BYTES ? -2 : -1;
+		}
 		case 0x50 /* P */:
-		case 0x5f /* _ */:
-			{
-				// DCS / APC: ESC P/_ ... ST (ESC \). Same bounded scan and
-				// split-ST overlap as the OSC branch, minus BEL.
-				const searchFrom = Math.max(pos + 2, resumeSearchFrom - 1);
-				const scanLimit = Math.min(length, pos + MAX_STRING_SEQ_BYTES);
-				for (let i = searchFrom; i < scanLimit; i++) {
-					if (
-						buffer.charCodeAt(i) === 0x1b /* ESC */ &&
-						i + 1 < scanLimit &&
-						buffer.charCodeAt(i + 1) === 0x5c /* \ */
-					) {
-						return i + 2;
-					}
+		case 0x5f /* _ */: {
+			// DCS / APC: ESC P/_ ... ST (ESC \). Same bounded scan and
+			// split-ST overlap as the OSC branch, minus BEL.
+			const searchFrom = Math.max(pos + 2, resumeSearchFrom - 1);
+			const scanLimit = Math.min(length, pos + MAX_STRING_SEQ_BYTES);
+			for (let i = searchFrom; i < scanLimit; i++) {
+				if (
+					buffer.charCodeAt(i) === 0x1b /* ESC */ &&
+					i + 1 < scanLimit &&
+					buffer.charCodeAt(i + 1) === 0x5c /* \ */
+				) {
+					return i + 2;
 				}
-				return length - pos >= MAX_STRING_SEQ_BYTES ? -2 : -1;
 			}
+			return length - pos >= MAX_STRING_SEQ_BYTES ? -2 : -1;
+		}
 		case 0x4f /* O */:
 			// SS3: ESC O + 1 char.
 			return pos + 3 <= length ? pos + 3 : -1;
@@ -176,17 +218,6 @@ function resolveEscapeEnd(buffer: string, pos: number, length: number, resumeSea
 			// Meta chord: ESC + 1 char.
 			return pos + 2;
 	}
-}
-
-/**
- * Per-type cap used to flush the incomplete prefix when `resolveEscapeEnd`
- * returns -2. The cap keeps issue-4073's malformed streamed CSI/OSC/…
- * bounded in both work and memory.
- */
-function escapeCapFor(next: number): number {
-	// OSC/DCS/APC carry the large payloads (image paste, Sixel); CSI stays
-	// tight because real CSI keys/mouse/responses fit comfortably below 4 KiB.
-	return next === 0x5d || next === 0x50 || next === 0x5f ? MAX_STRING_SEQ_BYTES : MAX_CSI_BYTES;
 }
 
 /**
@@ -203,7 +234,7 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
 function extractCompleteSequences(
 	buffer: string,
 	resumeSearchFrom: number,
-): { sequences: string[]; remainder: string; resumeSearchFrom: number } {
+): { sequences: string[]; remainder: string; resumeSearchFrom: number; discardFrom?: number } {
 	const sequences: string[] = [];
 	const length = buffer.length;
 	let pos = 0;
@@ -262,8 +293,8 @@ function extractCompleteSequences(
 				return { sequences, remainder: buffer.slice(pos), resumeSearchFrom: 0 };
 			}
 			if (innerEnd === -2) {
-				const cap = escapeCapFor(third);
-				const flushEnd = Math.min(length, pos + cap);
+				// `third` is CSI/SS3 here, never a string type.
+				const flushEnd = Math.min(length, pos + MAX_CSI_BYTES);
 				sequences.push(buffer.slice(pos, flushEnd));
 				pos = flushEnd;
 				hint = 0;
@@ -298,8 +329,14 @@ function extractCompleteSequences(
 		}
 		if (end === -2) {
 			const next = buffer.charCodeAt(pos + 1);
-			const cap = escapeCapFor(next);
-			const flushEnd = Math.min(length, pos + cap);
+			if (next === 0x5d || next === 0x50 || next === 0x5f) {
+				// Unterminated string sequence at the cap (issue #4073 case A):
+				// the head is junk and everything after it is mid-string
+				// payload. Hand both to the caller's discard mode instead of
+				// flushing the payload as per-character typed text.
+				return { sequences, remainder: "", resumeSearchFrom: 0, discardFrom: pos };
+			}
+			const flushEnd = Math.min(length, pos + MAX_CSI_BYTES);
 			sequences.push(buffer.slice(pos, flushEnd));
 			pos = flushEnd;
 			hint = 0;
@@ -338,9 +375,27 @@ export type StdinBufferOptions = {
 	pasteByteLimit?: number;
 };
 
+const KITTY_ENTER = /^\x1b\[13(?:;1)?u/u;
+
+/**
+ * The Enter keypress that immediately follows a bracketed-paste end marker in
+ * the same stdin read: legacy CR/LF, or the kitty CSI-u encoding with no
+ * modifier. Nothing else qualifies — any other trailing byte takes the normal
+ * data route.
+ */
+function leadingEnter(input: string): string | undefined {
+	if (input.startsWith("\r") || input.startsWith("\n")) return input[0];
+	return KITTY_ENTER.exec(input)?.[0];
+}
+
 export type StdinBufferEventMap = {
 	data: [string];
-	paste: [string];
+	/**
+	 * A completed bracketed paste. `enter` carries an Enter keypress that shared
+	 * the paste's stdin read, so the terminal can dispatch paste and submit to
+	 * the same focused component before a paste-triggered overlay can take focus.
+	 */
+	paste: [content: string, enter?: string];
 };
 
 /**
@@ -364,6 +419,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	#pendingKittyPrintableCodepoint: number | undefined;
 	#pendingKittyPrintableAtMs = 0;
 	#escapeSearchOffset = 0;
+	#rawPasteCandidate = "";
+	#rawPasteTimer?: NodeJS.Timeout;
+	#stringDiscardActive = false;
+	#stringDiscardBytes = 0;
+	#stringDiscardEscHeld = false;
+	#stringDiscardWatchdog?: NodeJS.Timeout;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -387,6 +448,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		} else {
 			str = data;
 		}
+		if (this.#stringDiscardActive) {
+			// Mid torn-string: swallow payload up to the terminator; only what
+			// follows the terminator re-enters normal parsing.
+			str = this.#consumeStringDiscard(str);
+			if (str.length === 0) return;
+		}
 
 		if (this.#flushDeferral && this.#isFreshEscapeAfterDeferredFlush(str)) {
 			// The buffered partial already hit its flush timeout. A new escape is
@@ -398,19 +465,48 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#clearFlushTimer();
 		}
 
-		if (str.length === 0 && this.#buffer.length === 0) {
+		if (str.length === 0 && this.#buffer.length === 0 && this.#rawPasteCandidate.length === 0) {
 			this.#emitDataSequence("");
 			return;
 		}
 
-		this.#buffer += str;
-
 		if (this.#pasteMode) {
-			const chunk = this.#buffer;
-			this.#buffer = "";
-			this.#consumePasteChunk(chunk);
+			this.#consumePasteChunk(str);
 			return;
 		}
+
+		if (this.#rawPasteCandidate.length > 0) {
+			if (str.indexOf(ESC) !== -1) {
+				// Escape-bearing input cannot belong to an unmarked raw paste.
+				// Replay the ambiguous prefix as keys before parsing the escape.
+				this.#flushRawPasteCandidate();
+			} else {
+				this.#rawPasteCandidate += str;
+				if (isRawMultilineBurst(this.#rawPasteCandidate)) {
+					this.#emitRawPasteCandidate();
+				}
+				return;
+			}
+		}
+
+		if (
+			this.#buffer.length === 0 &&
+			str.indexOf(ESC) === -1 &&
+			(str.indexOf("\r") !== -1 || str.indexOf("\n") !== -1)
+		) {
+			// Hold the first break-bearing read briefly. A split raw paste can
+			// then accumulate enough logical lines to classify; an ordinary
+			// Enter is replayed unchanged when the fixed window expires.
+			this.#rawPasteCandidate = str;
+			if (isRawMultilineBurst(str)) {
+				this.#emitRawPasteCandidate();
+			} else {
+				this.#armRawPasteTimer();
+			}
+			return;
+		}
+
+		this.#buffer += str;
 
 		const startIndex = this.#buffer.indexOf(BRACKETED_PASTE_START);
 		if (startIndex !== -1) {
@@ -436,6 +532,18 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		const result = extractCompleteSequences(this.#buffer, this.#escapeSearchOffset);
+		if (result.discardFrom !== undefined) {
+			const junk = this.#buffer.slice(result.discardFrom);
+			this.#buffer = "";
+			this.#escapeSearchOffset = 0;
+			for (const sequence of result.sequences) {
+				this.#emitDataSequence(sequence);
+			}
+			this.#enterStringDiscard();
+			const after = this.#consumeStringDiscard(junk);
+			if (after.length > 0) this.process(after);
+			return;
+		}
 		this.#buffer = result.remainder;
 		this.#escapeSearchOffset = result.resumeSearchFrom;
 
@@ -487,10 +595,15 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteBytes = 0;
 		this.#pendingKittyPrintableCodepoint = undefined;
 
-		this.emit("paste", pastedContent);
+		// A paste-and-Enter burst (automation, terminals that batch reads) must
+		// not split into two dispatches: the paste may open an overlay that
+		// would then swallow the Enter meant to submit it.
+		const enter = leadingEnter(remaining);
+		this.emit("paste", pastedContent, enter);
 
-		if (remaining.length > 0) {
-			this.process(remaining);
+		const rest = enter === undefined ? remaining : remaining.slice(enter.length);
+		if (rest.length > 0) {
+			this.process(rest);
 		}
 	}
 
@@ -526,6 +639,46 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.emit("paste", content);
 	}
 
+	/** Start one fixed window from the first break-bearing raw read. */
+	#armRawPasteTimer(): void {
+		if (this.#rawPasteTimer) return;
+		this.#rawPasteTimer = setTimeout(() => {
+			this.#rawPasteTimer = undefined;
+			this.#flushRawPasteCandidate();
+		}, RAW_PASTE_CLASSIFICATION_TIMEOUT_MS);
+	}
+
+	#clearRawPasteTimer(): void {
+		if (this.#rawPasteTimer) {
+			clearTimeout(this.#rawPasteTimer);
+			this.#rawPasteTimer = undefined;
+		}
+	}
+
+	#takeRawPasteCandidate(): string {
+		this.#clearRawPasteTimer();
+		const content = this.#rawPasteCandidate;
+		this.#rawPasteCandidate = "";
+		return content;
+	}
+
+	/** Emit a classified raw multiline burst through the paste channel. */
+	#emitRawPasteCandidate(): void {
+		const content = this.#takeRawPasteCandidate();
+		this.#pendingKittyPrintableCodepoint = undefined;
+		this.emit("paste", content);
+	}
+
+	/** Replay an ambiguous raw candidate as the original per-key data events. */
+	#flushRawPasteCandidate(): void {
+		const content = this.#takeRawPasteCandidate();
+		if (content.length === 0) return;
+		const result = extractCompleteSequences(content, 0);
+		for (const sequence of result.sequences) {
+			this.#emitDataSequence(sequence);
+		}
+	}
+
 	#emitDataSequence(sequence: string): void {
 		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
 		if (
@@ -558,7 +711,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.#timeout = undefined;
 			this.#flushDeferral = setTimeout(() => {
 				this.#flushDeferral = undefined;
-				this.#flushExpired();
+				this.#flushExpired(true);
 			});
 		}, this.#timeoutMs);
 	}
@@ -606,7 +759,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	/** Timeout-driven flush: hold unambiguous partials (bounded), else deliver. */
-	#flushExpired(): void {
+	#flushExpired(fromTimer = false): void {
 		if (this.#buffer.length === 0) {
 			this.#partialHoldStartMs = 0;
 			return;
@@ -619,16 +772,24 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			}
 		}
 		this.#partialHoldStartMs = 0;
-		for (const sequence of this.flush()) {
+		for (const sequence of this.#drainBuffered(fromTimer)) {
 			this.#emitDataSequence(sequence);
 		}
 	}
 
 	flush(): string[] {
+		return this.#drainBuffered(false);
+	}
+
+	#drainBuffered(discardTornString: boolean): string[] {
 		this.#clearFlushTimer();
 
+		const rawCandidate = this.#takeRawPasteCandidate();
+		const sequences = rawCandidate.length > 0 ? extractCompleteSequences(rawCandidate, 0).sequences : [];
+
 		if (this.#buffer.length === 0) {
-			return [];
+			this.#pendingKittyPrintableCodepoint = undefined;
+			return sequences;
 		}
 
 		const buffered = this.#buffer;
@@ -641,15 +802,96 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		// emission swallows the double-escape gesture (#3857). Mirror the inline
 		// split in `extractCompleteSequences` and deliver two ESC events.
 		if (buffered === `${ESC}${ESC}`) {
-			return [ESC, ESC];
+			sequences.push(ESC, ESC);
+		} else if (isKittyProtocolActive() && STRING_SEQ_PARTIAL.test(buffered)) {
+			// Torn OSC/DCS/APC head. Under the kitty keyboard protocol no key
+			// ever arrives as a bare `\x1b]`/`\x1bP`/`\x1b_`, so this is always
+			// terminal protocol data (kitty OSC 5522 clipboard read, graphics
+			// reply) whose tail is still in flight. Never deliver the head as a
+			// key; on a timeout flush also swallow the tail up to its
+			// terminator so kilobytes of base64 are not typed into the focused
+			// component (image paste spam).
+			if (discardTornString) this.#enterStringDiscard();
+		} else {
+			sequences.push(buffered);
 		}
-		return [buffered];
+		return sequences;
+	}
+
+	/** Enter torn-string discard: swallow mid-string bytes until ST/BEL. */
+	#enterStringDiscard(): void {
+		this.#stringDiscardActive = true;
+		this.#stringDiscardBytes = 0;
+		this.#stringDiscardEscHeld = false;
+		this.#armStringDiscardWatchdog();
+	}
+
+	#exitStringDiscard(): void {
+		this.#stringDiscardActive = false;
+		this.#stringDiscardBytes = 0;
+		this.#stringDiscardEscHeld = false;
+		if (this.#stringDiscardWatchdog) {
+			clearTimeout(this.#stringDiscardWatchdog);
+			this.#stringDiscardWatchdog = undefined;
+		}
+	}
+
+	/**
+	 * Swallow mid-string bytes; returns the input remaining after the string
+	 * terminator (empty while still inside the torn string). A trailing ESC is
+	 * held across calls so an `ESC \` split between reads is still detected.
+	 * The byte budget bounds a terminator-less stream; the inactivity watchdog
+	 * recovers a stream that stops without ever terminating.
+	 */
+	#consumeStringDiscard(str: string): string {
+		if (this.#stringDiscardEscHeld) {
+			this.#stringDiscardEscHeld = false;
+			if (str.charCodeAt(0) === 0x5c /* \ */) {
+				this.#exitStringDiscard();
+				return str.slice(1);
+			}
+		}
+		for (let i = 0; i < str.length; i++) {
+			const code = str.charCodeAt(i);
+			if (code === 0x07 /* BEL */) {
+				this.#exitStringDiscard();
+				return str.slice(i + 1);
+			}
+			if (code === 0x1b /* ESC */) {
+				if (i + 1 === str.length) {
+					this.#stringDiscardEscHeld = true;
+					break;
+				}
+				if (str.charCodeAt(i + 1) === 0x5c /* \ */) {
+					this.#exitStringDiscard();
+					return str.slice(i + 2);
+				}
+			}
+		}
+		this.#stringDiscardBytes += str.length;
+		if (this.#stringDiscardBytes > STRING_DISCARD_MAX_BYTES) {
+			this.#exitStringDiscard();
+			return "";
+		}
+		this.#armStringDiscardWatchdog();
+		return "";
+	}
+
+	#armStringDiscardWatchdog(): void {
+		if (this.#stringDiscardWatchdog) clearTimeout(this.#stringDiscardWatchdog);
+		this.#stringDiscardWatchdog = setTimeout(() => {
+			this.#stringDiscardWatchdog = undefined;
+			this.#exitStringDiscard();
+		}, STRING_DISCARD_INACTIVITY_MS);
 	}
 
 	clear(): void {
 		this.#clearFlushTimer();
 		this.#clearPasteWatchdog();
+		this.#clearRawPasteTimer();
+		this.#exitStringDiscard();
 		this.#buffer = "";
+		this.#rawPasteCandidate = "";
 		this.#pasteMode = false;
 		this.#pasteChunks = [];
 		this.#pasteOverlap = "";
@@ -660,7 +902,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	getBuffer(): string {
-		return this.#buffer;
+		return `${this.#rawPasteCandidate}${this.#buffer}`;
 	}
 
 	destroy(): void {

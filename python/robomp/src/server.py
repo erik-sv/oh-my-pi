@@ -8,19 +8,20 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import Body, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from robomp import github_events
+from robomp import github_events, issue_index
 from robomp.autoclose import AutocloseScheduler
 from robomp.config import Settings, get_settings
 from robomp.dashboard import render_index, static_dir, tail_jsonl
 from robomp.db import (
     INACTIVE_EVENT_STATES,
     Database,
+    ReleaseRow,
     get_database,
     iso_seconds_ago,
 )
@@ -29,6 +30,7 @@ from robomp.db import (
 )
 from robomp.github_backend import GitHubBackend
 from robomp.github_client import GitHubError, IssueSummary
+from robomp.issue_index import IssueIndexSync
 from robomp.manual_triage import (
     InvalidIssueRef,
     ManualTriageConflict,
@@ -42,6 +44,46 @@ from robomp.queue import WorkerPool
 from robomp.sandbox import SandboxManager
 
 log = logging.getLogger(__name__)
+
+
+class _AppPool(Protocol):
+    async def start(self) -> None: ...
+
+    async def stop(self, *, drain_timeout: float = 25.0, kill_timeout: float = 5.0) -> None: ...
+
+    def wake(self) -> None: ...
+
+    async def cancel_event(self, delivery_id: str) -> bool: ...
+
+    async def inflight_snapshot(self) -> list[str]: ...
+
+
+class _PoolFactory(Protocol):
+    def __call__(
+        self,
+        settings: Settings,
+        db: Database,
+        github: GitHubBackend,
+        sandbox: SandboxManager,
+        git_transport: ProxyGitTransport,
+    ) -> _AppPool: ...
+
+
+def _release_payload(row: ReleaseRow) -> dict[str, Any]:
+    return {
+        "key": row.key,
+        "repo": row.repo,
+        "tag": row.tag,
+        "version": row.version,
+        "state": row.state,
+        "current_sha": row.current_sha,
+        "last_failed_sha": row.last_failed_sha,
+        "rounds": row.rounds,
+        "last_error": row.last_error,
+        "session_dir": row.session_dir,
+        "created_at": row.created_at,
+        "updated_at": row.updated_at,
+    }
 
 
 @dataclass(slots=True)
@@ -235,7 +277,23 @@ def _build_orchestrator(cfg: Settings) -> tuple[GitHubBackend, ProxyGitTransport
     return github, transport
 
 
-def _build_state(settings: Settings) -> dict[str, Any]:
+def _build_worker_pool(
+    settings: Settings,
+    db: Database,
+    github: GitHubBackend,
+    sandbox: SandboxManager,
+    git_transport: ProxyGitTransport,
+) -> WorkerPool:
+    return WorkerPool(
+        settings=settings,
+        db=db,
+        github=github,
+        sandbox=sandbox,
+        git_transport=git_transport,
+    )
+
+
+def _build_state(settings: Settings, pool_factory: _PoolFactory) -> dict[str, Any]:
     db = get_database(settings.sqlite_path)
     github, git_transport = _build_orchestrator(settings)
     natives_cache: NativesCache | None = None
@@ -250,8 +308,9 @@ def _build_state(settings: Settings) -> dict[str, Any]:
         transport=git_transport,
         natives_cache=natives_cache,
     )
-    pool = WorkerPool(settings=settings, db=db, github=github, sandbox=sandbox, git_transport=git_transport)
+    pool = pool_factory(settings, db, github, sandbox, git_transport)
     autoclose = AutocloseScheduler(settings=settings, db=db, github=github)
+    index_sync = IssueIndexSync(settings=settings, db=db, github=github)
     return {
         "settings": settings,
         "db": db,
@@ -262,25 +321,29 @@ def _build_state(settings: Settings) -> dict[str, Any]:
         "pool": pool,
         "issue_browse_cache": _IssueBrowseCache(),
         "autoclose": autoclose,
+        "issue_index_sync": index_sync,
     }
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
-    """Build the FastAPI app. `settings` parameter is for tests."""
+def create_app(settings: Settings | None = None, *, pool_factory: _PoolFactory = _build_worker_pool) -> FastAPI:
+    """Build the FastAPI app, optionally using an injected worker-pool factory."""
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg = settings or get_settings()
         cfg.ensure_paths()
-        app.state.bag = _build_state(cfg)
+        app.state.bag = _build_state(cfg, pool_factory)
         app.state.bag["started_at"] = time.time()
-        pool: WorkerPool = app.state.bag["pool"]
+        pool: _AppPool = app.state.bag["pool"]
         await pool.start()
         autoclose: AutocloseScheduler = app.state.bag["autoclose"]
         await autoclose.start()
+        index_sync: IssueIndexSync = app.state.bag["issue_index_sync"]
+        await index_sync.start()
         try:
             yield
         finally:
+            await index_sync.stop()
             await autoclose.stop()
             await pool.stop(
                 drain_timeout=cfg.shutdown_drain_timeout_seconds,
@@ -328,6 +391,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             payload=payload,
             allowlist=cfg.repo_allowlist,
         )
+        # Keep the local search index fresh from every delivery that carries an
+        # issue/PR object — including ones the router will skip.
+        if x_github_event in ("issues", "issue_comment") or x_github_event.startswith("pull_request"):
+            repo_full = str((payload.get("repository") or {}).get("full_name") or "")
+            if repo_full and repo_full in cfg.repo_allowlist:
+                try:
+                    issue_index.ingest_webhook_payload(db, repo_full, x_github_event, payload)
+                except Exception:
+                    log.exception("issue index webhook ingest failed", extra={"repo": repo_full})
 
         def _resolve(repo_full: str, pr_number: int) -> str | None:
             row = db.find_issue_by_pr(repo_full, pr_number)
@@ -341,9 +413,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             maintainers=cfg.maintainer_logins,
             reviewer_bots=cfg.reviewer_bots,
             pr_review_enabled=cfg.pr_review_enabled,
-            pr_review_trigger=cfg.pr_review_trigger,
-            vouch_review_label=cfg.vouch_review_label,
-            vouch_review_labeler=cfg.vouch_review_labeler,
+            release_sentinel_enabled=cfg.release_sentinel_enabled,
+            release_commit_prefix=cfg.release_commit_prefix,
             resolve_issue_from_pr=_resolve,
         )
 
@@ -455,7 +526,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             state="queued",
         )
         if inserted:
-            pool: WorkerPool = bag["pool"]
+            pool: _AppPool = bag["pool"]
             pool.wake()
             log.info(
                 "queued", extra={"event": x_github_event, "delivery": x_github_delivery, "key": decision.issue_key}
@@ -567,7 +638,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         db: Database = bag["db"]
         github: GitHubBackend = bag["github"]
-        pool: WorkerPool = bag["pool"]
+        pool: _AppPool = bag["pool"]
 
         mode = str(payload.get("mode") or "").strip().lower()
         if mode not in ("triage", "retry"):
@@ -656,9 +727,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if event is None:
             raise HTTPException(404, f"unknown delivery {delivery_id}")
         if event.state != "running":
-            raise HTTPException(409, f"delivery {delivery_id} is {event.state}; only running deliveries can be cancelled")
+            raise HTTPException(
+                409, f"delivery {delivery_id} is {event.state}; only running deliveries can be cancelled"
+            )
 
-        pool: WorkerPool = bag["pool"]
+        pool: _AppPool = bag["pool"]
         fired = await pool.cancel_event(delivery_id)
         log.info(
             "manual cancel",
@@ -707,6 +780,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ]
         }
 
+    @app.get("/releases")
+    async def releases(request: Request, limit: int = 50) -> dict[str, Any]:
+        capped = max(1, min(int(limit), 500))
+        rows = request.app.state.bag["db"].list_releases(limit=capped)
+        return {"releases": [_release_payload(row) for row in rows]}
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         cfg: Settings = request.app.state.bag["settings"]
@@ -718,7 +797,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         bag = request.app.state.bag
         cfg: Settings = bag["settings"]
         db: Database = bag["db"]
-        pool: WorkerPool = bag["pool"]
+        pool: _AppPool = bag["pool"]
         started = float(bag.get("started_at") or time.time())
 
         def _collect() -> dict[str, Any]:
@@ -728,6 +807,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # would block the loop and stall every other endpoint — including
             # /healthz — which is how the dashboard ends up "never loading".
             issues_rows = db.list_issues(limit=200)
+            release_rows = db.list_releases(limit=50)
             latest_events = db.latest_events_for_issues(r.key for r in issues_rows)
 
             def _latest_event_payload(key: str) -> dict[str, Any] | None:
@@ -779,6 +859,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     }
                     for r in issues_rows
                 ],
+                "releases": [_release_payload(row) for row in release_rows],
                 "recent_events": [
                     {
                         "delivery_id": r.delivery_id,

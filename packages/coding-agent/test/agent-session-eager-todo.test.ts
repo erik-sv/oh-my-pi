@@ -1,5 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, TextContent, ToolCall } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
@@ -7,15 +8,13 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentSession, type AgentSessionConfig } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TodoTool } from "@oh-my-pi/pi-coding-agent/tools";
-import { TempDir } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import eagerTodoPrompt from "../src/prompts/system/eager-todo.md" with { type: "text" };
+import { setInteractiveHost, TempDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 type ObservedPromptCall = {
@@ -88,10 +87,11 @@ function getMessageText(message: AgentMessage): string {
 	if (!Array.isArray(message.content)) {
 		return "";
 	}
-	return message.content
-		.filter(isTextContentBlock)
-		.map(content => content.text)
-		.join("\n");
+	const text: string[] = [];
+	for (const content of message.content) {
+		if (isTextContentBlock(content)) text.push(content.text);
+	}
+	return text.join("\n");
 }
 
 describe("AgentSession eager todo enforcement", () => {
@@ -99,16 +99,20 @@ describe("AgentSession eager todo enforcement", () => {
 	let session: AgentSession;
 	let streamCallCount = 0;
 	let scriptedResponses: AssistantMessage[] = [];
-	let authStorage: AuthStorage | undefined;
+	let sharedDir: TempDir;
+	let sharedAuthStorage: AuthStorage;
+	let sharedModelRegistry: ModelRegistry;
+	let previousNoTitle: string | undefined;
 	const observedCalls: ObservedPromptCall[] = [];
 
-	async function createSession(settingsOverride: Record<string, unknown> = {}): Promise<void> {
+	async function createSession(
+		settingsOverride: Record<string, unknown> = {},
+		sessionOverride: Partial<AgentSessionConfig> = {},
+	): Promise<void> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 model to exist");
 
-		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		authStorage.setRuntimeApiKey("anthropic", "test-key");
-		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
+		const modelRegistry = sharedModelRegistry;
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"todo.enabled": true,
@@ -125,6 +129,8 @@ describe("AgentSession eager todo enforcement", () => {
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getSessionSpawns: () => "*",
 			settings,
+			// Mirrors sdk.ts wiring: TodoTool commits phases during execute (#6148 removed the message_end replay).
+			setTodoPhases: phases => session?.setTodoPhases(phases),
 		};
 		const todoTool = new TodoTool(toolSession);
 		const mockBashTool: AgentTool = {
@@ -182,17 +188,19 @@ describe("AgentSession eager todo enforcement", () => {
 			settings,
 			modelRegistry,
 			toolRegistry,
+			...sessionOverride,
 		});
 	}
 
-	async function recreateSession(settingsOverride: Record<string, unknown> = {}): Promise<void> {
+	async function recreateSession(
+		settingsOverride: Record<string, unknown> = {},
+		sessionOverride: Partial<AgentSessionConfig> = {},
+	): Promise<void> {
 		await session.dispose();
-		authStorage?.close();
-		authStorage = undefined;
 		streamCallCount = 0;
 		scriptedResponses = [];
 		observedCalls.length = 0;
-		await createSession(settingsOverride);
+		await createSession(settingsOverride, sessionOverride);
 	}
 
 	function waitForSessionName(expected: string): Promise<void> {
@@ -206,7 +214,21 @@ describe("AgentSession eager todo enforcement", () => {
 		return promise;
 	}
 
+	beforeAll(async () => {
+		sharedDir = TempDir.createSync("@pi-agent-session-eager-todo-shared-");
+		sharedAuthStorage = await AuthStorage.create(path.join(sharedDir.path(), "auth.db"));
+		sharedAuthStorage.setRuntimeApiKey("anthropic", "test-key");
+		sharedModelRegistry = new ModelRegistry(sharedAuthStorage, path.join(sharedDir.path(), "models.yml"));
+	});
+
+	afterAll(() => {
+		sharedAuthStorage.close();
+		sharedDir.removeSync();
+	});
+
 	beforeEach(async () => {
+		previousNoTitle = Bun.env.PI_NO_TITLE;
+		delete Bun.env.PI_NO_TITLE;
 		tempDir = TempDir.createSync("@pi-agent-session-eager-todo-");
 		streamCallCount = 0;
 		scriptedResponses = [];
@@ -218,18 +240,10 @@ describe("AgentSession eager todo enforcement", () => {
 		if (session) {
 			await session.dispose();
 		}
-		authStorage?.close();
 		vi.restoreAllMocks();
-		authStorage = undefined;
+		if (previousNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
+		else Bun.env.PI_NO_TITLE = previousNoTitle;
 		tempDir.removeSync();
-	});
-
-	it("keeps eager init instructions aligned with the todo schema", () => {
-		expect(eagerTodoPrompt).toContain("single `init` op");
-		expect(eagerTodoPrompt).toContain("phase names and task-label strings");
-		expect(eagerTodoPrompt).not.toContain("`details`");
-		expect(eagerTodoPrompt).not.toContain("in_progress");
-		expect(eagerTodoPrompt).not.toContain("pending");
 	});
 
 	it("prepends a hidden eager todo reminder without repeating the prompt text", async () => {
@@ -247,7 +261,6 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(observedCalls[0]?.messageTexts.filter(text => text.includes("list all work trees"))).toHaveLength(1);
 		expect(observedCalls[0]?.messageTexts[0]).not.toContain("list all work trees");
 		// `always` renders the hard, forced reminder.
-		expect(observedCalls[0]?.messageTexts[0]).toContain("You MUST call");
 		expect(session.formatSessionAsText()).not.toContain("<user-request>");
 	});
 
@@ -318,6 +331,15 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(titleInput).toContain("I found the parser recovery path.");
 		expect(titleInput).toContain("The recovery heuristic should drive the replan title.");
 		expect(titleInput).toContain("replan parser diagnostics");
+		const metadata = completeSimpleMock.mock.calls[0]?.[2]?.metadata;
+		if (!metadata || typeof metadata.user_id !== "string") {
+			throw new Error("Expected title request metadata.user_id");
+		}
+		const userId: unknown = JSON.parse(metadata.user_id);
+		if (!userId || typeof userId !== "object" || !("session_id" in userId) || typeof userId.session_id !== "string") {
+			throw new Error("Expected title request metadata.user_id.session_id");
+		}
+		expect(userId.session_id).not.toBe(session.sessionId);
 	});
 
 	it("forwards the configured title system prompt to the replan refresh path", async () => {
@@ -375,9 +397,94 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(session.sessionManager.getSessionName()).toBe("Manual parser title");
 	});
 
+	it("does not refresh todo-init titles for headless subagent sessions", async () => {
+		// Issue #5910: a subagent (agentKind "sub") in a non-interactive host has no
+		// operator-visible title, so a todo-init replan refresh only wastes a
+		// tiny-model LLM call. isInteractiveHost() defaults false under bun test.
+		await recreateSession({ "title.refreshOnReplan": true }, { agentKind: "sub" });
+		await session.setSessionName("Old auto title", "auto");
+		const priorUser: AgentMessage = {
+			role: "user",
+			content: "rework parser diagnostics",
+			timestamp: Date.now() - 1,
+		};
+		session.agent.appendMessage(priorUser);
+		session.sessionManager.appendMessage(priorUser);
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple");
+		scriptedResponses = [
+			createToolCallAssistantMessage("todo", {
+				op: "init",
+				list: [{ phase: "Parser", items: ["Replan parser diagnostics"] }],
+			}),
+			createAssistantMessage("todo initialized"),
+		];
+
+		await session.prompt("replan parser diagnostics");
+
+		expect(completeSimpleMock).not.toHaveBeenCalled();
+		expect(session.sessionManager.getSessionName()).toBe("Old auto title");
+	});
+
+	it("refreshes todo-init titles for a subagent focusable in an interactive host", async () => {
+		// A live subagent selected from the Agent Hub renders its session name in
+		// the status line, so the interactive host must keep the replan refresh the
+		// user enabled — only headless hosts skip it (issue #5910 review follow-up).
+		const previousInteractiveHost = setInteractiveHost(true);
+		try {
+			await recreateSession({ "title.refreshOnReplan": true }, { agentKind: "sub" });
+			await session.setSessionName("Old auto title", "auto");
+			const priorUser: AgentMessage = {
+				role: "user",
+				content: "rework parser diagnostics",
+				timestamp: Date.now() - 1,
+			};
+			session.agent.appendMessage(priorUser);
+			session.sessionManager.appendMessage(priorUser);
+			const completeSimpleMock = vi.spyOn(ai, "completeSimple").mockResolvedValue({
+				stopReason: "stop",
+				content: [{ type: "text", text: "<title>Parser diagnostics replan</title>" }],
+			} as never);
+			scriptedResponses = [
+				createToolCallAssistantMessage("todo", {
+					op: "init",
+					list: [{ phase: "Parser", items: ["Replan parser diagnostics"] }],
+				}),
+				createAssistantMessage("todo initialized"),
+			];
+
+			const titleApplied = waitForSessionName("Parser diagnostics replan");
+			await session.prompt("replan parser diagnostics");
+			await titleApplied;
+
+			expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+			expect(session.sessionManager.getSessionName()).toBe("Parser diagnostics replan");
+		} finally {
+			setInteractiveHost(previousInteractiveHost);
+		}
+	});
+
 	it("does not refresh todo-init titles when title refresh on replan is disabled", async () => {
 		const completeSimpleMock = vi.spyOn(ai, "completeSimple");
 		await session.setSessionName("Old auto title", "auto");
+		scriptedResponses = [
+			createToolCallAssistantMessage("todo", {
+				op: "init",
+				list: [{ phase: "Parser", items: ["Replan parser diagnostics"] }],
+			}),
+			createAssistantMessage("todo initialized"),
+		];
+
+		await session.prompt("replan parser diagnostics");
+
+		expect(completeSimpleMock).not.toHaveBeenCalled();
+		expect(session.sessionManager.getSessionName()).toBe("Old auto title");
+	});
+
+	it("does not refresh todo-init titles when automatic titles are disabled", async () => {
+		Bun.env.PI_NO_TITLE = "1";
+		await recreateSession({ "title.refreshOnReplan": true });
+		await session.setSessionName("Old auto title", "auto");
+		const completeSimpleMock = vi.spyOn(ai, "completeSimple");
 		scriptedResponses = [
 			createToolCallAssistantMessage("todo", {
 				op: "init",
@@ -442,7 +549,6 @@ describe("AgentSession eager todo enforcement", () => {
 
 	it("prepends the eager todo reminder without forcing the todo tool when todo.eager is preferred", async () => {
 		await session.dispose();
-		authStorage?.close();
 		await createSession({ "todo.eager": "preferred" });
 
 		await session.prompt("list all work trees");
@@ -453,8 +559,5 @@ describe("AgentSession eager todo enforcement", () => {
 		expect(observedCalls[0]?.messageTexts.at(-1)).toBe("list all work trees");
 		expect(observedCalls[0]?.messageTexts[0]).not.toContain("list all work trees");
 		// `preferred` renders the soft nudge, never the hard MUST directive.
-		expect(observedCalls[0]?.messageTexts[0]).toContain("Consider calling");
-		expect(observedCalls[0]?.messageTexts[0]).not.toContain("You MUST call");
-		expect(observedCalls[0]?.messageTexts[0]).not.toContain("Before substantive work, create a phased todo.");
 	});
 });

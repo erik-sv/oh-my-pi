@@ -1,5 +1,14 @@
 import { renderDemotedThinking } from "../dialect/demotion";
-import type { Api, AssistantMessage, Message, Model, ToolCall, ToolResultMessage, UserMessage } from "../types";
+import type {
+	Api,
+	AssistantMessage,
+	DeveloperMessage,
+	Message,
+	Model,
+	ToolCall,
+	ToolResultMessage,
+	UserMessage,
+} from "../types";
 import { isDemotedThinking, kDemotedThinking } from "../utils/block-symbols";
 
 const enum ToolCallStatus {
@@ -19,6 +28,104 @@ const enum ToolCallStatus {
  * MUST not push a normalized id past this bound.
  */
 const MAX_TOOL_CALL_ID_LENGTH = 64;
+
+/**
+ * OpenAI Responses-family APIs mint composite tool ids (`call_id|item_id`);
+ * opaque Chat Completions ids do not (openai-completions preserves same-model
+ * ids verbatim as provider correlation tokens), so ONLY these origins may be
+ * canonicalized to their `call_` component for pairing.
+ */
+function isResponsesFamilyApi(api: Api | undefined): boolean {
+	return api === "openai-responses" || api === "openai-codex-responses" || api === "azure-openai-responses";
+}
+
+/**
+ * The wire `call_id` component of a (possibly composite) Responses id: the
+ * FIRST segment before `|`. A degenerate `|itemId` (empty call half, pipe at
+ * index 0) keeps its full id so unrelated empty-half ids never collapse onto
+ * one empty-string bucket.
+ */
+function responsesCallComponent(id: string): string {
+	const pipe = id.indexOf("|");
+	return pipe <= 0 ? id : id.slice(0, pipe);
+}
+
+/**
+ * Origin classification for tool-call ids, tracked per CONCRETE id rather than
+ * by a global prefix set. Two facts drive whether an id may be canonicalized to
+ * its `call_` component for pairing:
+ *
+ *  - `responsesComponents`: the `call_` components of ids provably minted by a
+ *    Responses-family assistant turn (keyed off the source message `api`).
+ *  - `opaqueCompositeCallIds`: the FULL ids of pipe-bearing tool calls from a
+ *    NON-Responses (opaque Chat Completions) assistant turn. openai-completions
+ *    preserves these verbatim as provider correlation tokens; the `|` is
+ *    literal, so they must pair by raw equality even when their `call_` prefix
+ *    happens to collide with a Responses component seen elsewhere in history.
+ *
+ * Scoping by concrete id (not merely a shared prefix) is load-bearing (#10284):
+ * an earlier Responses `call_A` must not license canonicalizing later same-model
+ * Chat Completions ids `call_A|first` / `call_A|second` onto one `call_A`
+ * bucket, which would collapse two distinct opaque calls and steer a lone
+ * `call_A|second` result onto the wrong call.
+ */
+interface ToolCallOriginScope {
+	responsesComponents: ReadonlySet<string>;
+	opaqueCompositeCallIds: ReadonlySet<string>;
+}
+
+function collectToolCallOriginScope(messages: readonly Message[]): ToolCallOriginScope {
+	const responsesComponents = new Set<string>();
+	const opaqueCompositeCallIds = new Set<string>();
+	for (const msg of messages) {
+		if (msg.role !== "assistant") continue;
+		const responsesOrigin = isResponsesFamilyApi(msg.api);
+		for (const block of msg.content) {
+			if (block.type !== "toolCall") continue;
+			if (responsesOrigin) responsesComponents.add(responsesCallComponent(block.id));
+			else if (block.id.includes("|")) opaqueCompositeCallIds.add(block.id);
+		}
+	}
+	return { responsesComponents, opaqueCompositeCallIds };
+}
+
+/**
+ * Canonical key for pairing a tool result with its assistant tool call.
+ *
+ * The OpenAI Codex/Responses APIs store a tool result's id as a composite
+ * `<call_id>|<response_item_id>` (e.g. `call_ABC|fc_XYZ`), while the assistant
+ * `toolCall` that produced it carries the plain `call_ABC` (or a composite with
+ * a DIFFERENT item half). Keying both sides on the FIRST segment pairs them,
+ * while NOT collapsing two distinct parallel calls whose results happen to
+ * share a `response_item` (`fc_`) half.
+ *
+ * SCOPING (load-bearing, #10284): a pipe-bearing id is canonicalized to its
+ * `call_` component ONLY when it is not itself a concrete opaque-origin call id
+ * ({@link ToolCallOriginScope.opaqueCompositeCallIds}) and its component was
+ * minted by a Responses-family turn ({@link ToolCallOriginScope.responsesComponents}).
+ * A same-model Chat Completions id is an OPAQUE provider correlation token that
+ * may itself contain `|` (openai-completions.ts preserves it verbatim);
+ * splitting it would collapse two distinct opaque calls onto one bucket, so the
+ * real result never pairs and the call is back-filled with a synthetic stub.
+ * Opaque ids fall through to full-id keying, where the provider's own echoed
+ * `tool_call_id` already pairs result to call by raw equality.
+ *
+ * Pairing keys are used only for lookup; the messages' own ids are left intact
+ * so the provider encoder still receives the exact wire ids it expects.
+ *
+ * LOAD-BEARING INVARIANT: pairing correctness depends on the wire `call_id`
+ * being unique per distinct tool call. The Codex Responses wire guarantees this
+ * (distinct parallel calls carry distinct call_ids; only the `fc_` half varies),
+ * and genuine cross-turn id reuse is `_dup`-suffixed on the call_ segment by
+ * `deduplicateToolCallIds` (which this key preserves).
+ */
+function toolCallPairingKey(id: string, originScope: ToolCallOriginScope): string {
+	const pipe = id.indexOf("|");
+	if (pipe <= 0) return id;
+	if (originScope.opaqueCompositeCallIds.has(id)) return id;
+	const prefix = id.slice(0, pipe);
+	return originScope.responsesComponents.has(prefix) ? prefix : id;
+}
 
 function appendDuplicateSuffix(originalId: string, suffix: string, maxLength: number): string {
 	// Responses-family ids are composites (`callId|itemId`): the wire call_id is
@@ -45,6 +152,7 @@ type PendingToolResultRewrite = { replacementId: string } | undefined;
 
 function deduplicateToolCallIds(
 	messages: Message[],
+	originScope: ToolCallOriginScope,
 	maxToolCallIdLength = MAX_TOOL_CALL_ID_LENGTH,
 	duplicateSuffixPrefix = "_dup",
 ): Message[] {
@@ -53,11 +161,17 @@ function deduplicateToolCallIds(
 
 	return messages.map(msg => {
 		if (msg.role === "toolResult") {
-			const rewrites = pendingToolResultRewrites.get(msg.toolCallId);
+			// Pair on the call_ component: a composite result id
+			// (`call_X|fc_Y`) must find the rewrite enqueued under its assistant
+			// call's canonical id. Raw-string keying here misses the composite,
+			// so the `_dup` remap silently no-ops and a reused call_id's later
+			// result is dropped downstream.
+			const key = toolCallPairingKey(msg.toolCallId, originScope);
+			const rewrites = pendingToolResultRewrites.get(key);
 			if (!rewrites || rewrites.length === 0) return msg;
 
 			const rewrite = rewrites.shift();
-			if (rewrites.length === 0) pendingToolResultRewrites.delete(msg.toolCallId);
+			if (rewrites.length === 0) pendingToolResultRewrites.delete(key);
 			if (rewrite) return { ...msg, toolCallId: rewrite.replacementId };
 			return msg;
 		}
@@ -81,6 +195,13 @@ function deduplicateToolCallIds(
 		const content = msg.content.map(block => {
 			if (block.type !== "toolCall") return block;
 
+			// Route all dedup bookkeeping by the call_ component so a plain
+			// assistant id and a composite result id (`call_X` / `call_X|fc_Y`)
+			// share one counter + rewrite queue. The `_dup` SUFFIX still lands on
+			// the full wire id via `appendDuplicateSuffix` (below) — only the
+			// KEYING is canonical, so emitted ids are unchanged.
+			const blockKey = toolCallPairingKey(block.id, originScope);
+
 			// Drop any pending rewrites carried over from a prior assistant turn
 			// for this id on its first appearance this turn. When a later turn
 			// re-emits the same id, the older duplicate call's expected result
@@ -88,15 +209,15 @@ function deduplicateToolCallIds(
 			// "No result provided" for it, and the upcoming real result(id) must
 			// route to one of THIS turn's calls. Without this guard the older
 			// `_dup` id would steal the next result.
-			if (!idsTouchedInTurn.has(block.id)) {
-				pendingToolResultRewrites.delete(block.id);
-				idsTouchedInTurn.add(block.id);
+			if (!idsTouchedInTurn.has(blockKey)) {
+				pendingToolResultRewrites.delete(blockKey);
+				idsTouchedInTurn.add(blockKey);
 			}
 
-			const previousCount = seenToolCallIds.get(block.id) ?? 0;
+			const previousCount = seenToolCallIds.get(blockKey) ?? 0;
 			if (previousCount === 0) {
-				seenToolCallIds.set(block.id, 1);
-				enqueueToolResultRewrite(block.id, undefined);
+				seenToolCallIds.set(blockKey, 1);
+				enqueueToolResultRewrite(blockKey, undefined);
 				return block;
 			}
 
@@ -106,7 +227,7 @@ function deduplicateToolCallIds(
 				`${duplicateSuffixPrefix}${duplicateIndex}`,
 				maxToolCallIdLength,
 			);
-			while (seenToolCallIds.has(replacementId)) {
+			while (seenToolCallIds.has(toolCallPairingKey(replacementId, originScope))) {
 				duplicateIndex += 1;
 				replacementId = appendDuplicateSuffix(
 					block.id,
@@ -114,9 +235,9 @@ function deduplicateToolCallIds(
 					maxToolCallIdLength,
 				);
 			}
-			seenToolCallIds.set(block.id, duplicateIndex + 1);
-			seenToolCallIds.set(replacementId, 1);
-			enqueueToolResultRewrite(block.id, { replacementId });
+			seenToolCallIds.set(blockKey, duplicateIndex + 1);
+			seenToolCallIds.set(toolCallPairingKey(replacementId, originScope), 1);
+			enqueueToolResultRewrite(blockKey, { replacementId });
 			contentChanged = true;
 			return { ...block, id: replacementId };
 		});
@@ -286,6 +407,184 @@ function normalizeAnthropicTargetToolCallId<TApi extends Api>(
  * - Preserves tool call structure (unlike converting to text summaries)
  * - Injects synthetic "aborted" tool results
  */
+/**
+ * Credential-shaped token patterns scrubbed from outbound provider traffic when
+ * credential redaction is enabled. Exported so hosts can route the same shapes
+ * through reversible obfuscation (keyed placeholders restored before local tool
+ * execution) instead of the irreversible `[*_token_redacted]` rewrite below —
+ * an irreversible placeholder echoed back in edit-tool `old_string` can never
+ * match the real bytes on disk.
+ */
+export const SENSITIVE_TOKEN_RE =
+	/(?<![a-zA-Z0-9_*-])(gh[opusr]_[a-zA-Z0-9_*]{36,}|github_pat_[a-zA-Z0-9_*]{36,}|glpat-[a-zA-Z0-9_*-]{20,}|sk-proj-[a-zA-Z0-9_*-]{36,}|sk-ant-[a-zA-Z0-9_*-]{36,}|sk-[a-zA-Z0-9_*-]{48,})(?![a-zA-Z0-9_*-])/gi;
+
+function hasPlausibleCredentialEntropy(token: string): boolean {
+	const lower = token.toLowerCase();
+	const prefixLength = lower.startsWith("github_pat_")
+		? "github_pat_".length
+		: lower.startsWith("glpat-")
+			? "glpat-".length
+			: lower.startsWith("sk-proj-")
+				? "sk-proj-".length
+				: lower.startsWith("sk-ant-")
+					? "sk-ant-".length
+					: lower.startsWith("gh")
+						? 4
+						: 3;
+	const secret = token.slice(prefixLength);
+	if (/^\*+$/.test(secret)) return true;
+	return [/[a-z]/, /[A-Z]/, /\d/, /[_-]/].filter(pattern => pattern.test(secret)).length >= 2;
+}
+
+/**
+ * Whether outbound credential-pattern redaction is active. Off by default;
+ * hosts opt in explicitly (the coding agent wires this to the
+ * `secrets.enabled` setting).
+ */
+let credentialRedactionEnabled = false;
+
+/**
+ * Toggle outbound credential-pattern redaction. When disabled (the default),
+ * {@link redactSensitiveCredentials} and {@link redactSensitiveInObject} are
+ * pass-throughs and outbound messages/system prompts leave the process
+ * unmodified.
+ */
+export function configureCredentialRedaction(enabled: boolean): void {
+	credentialRedactionEnabled = enabled;
+}
+
+export function redactSensitiveCredentials(text: string): string {
+	if (!credentialRedactionEnabled) return text;
+	return text.replace(SENSITIVE_TOKEN_RE, match => {
+		if (!hasPlausibleCredentialEntropy(match)) return match;
+		const lower = match.toLowerCase();
+		if (lower.startsWith("gh")) {
+			return "[github_token_redacted]";
+		}
+		if (lower.startsWith("gl")) {
+			return "[gitlab_token_redacted]";
+		}
+		if (lower.startsWith("sk-ant-")) {
+			return "[anthropic_token_redacted]";
+		}
+		if (lower.startsWith("sk")) {
+			return "[openai_token_redacted]";
+		}
+		return "[token_redacted]";
+	});
+}
+
+export function redactSensitiveInObject(val: unknown): { result: unknown; changed: boolean } {
+	if (!credentialRedactionEnabled) return { result: val, changed: false };
+	if (typeof val === "string") {
+		const redacted = redactSensitiveCredentials(val);
+		return { result: redacted, changed: redacted !== val };
+	}
+	if (Array.isArray(val)) {
+		let changed = false;
+		const result = val.map(item => {
+			const res = redactSensitiveInObject(item);
+			if (res.changed) changed = true;
+			return res.result;
+		});
+		return { result, changed };
+	}
+	if (val !== null && typeof val === "object") {
+		let changed = false;
+		const res: Record<string, unknown> = {};
+		for (const [k, v] of Object.entries(val)) {
+			const sub = redactSensitiveInObject(v);
+			if (sub.changed) changed = true;
+			res[k] = sub.result;
+		}
+		return { result: res, changed };
+	}
+	return { result: val, changed: false };
+}
+
+function redactSensitiveCredentialsInMessages(messages: Message[]): Message[] {
+	if (!credentialRedactionEnabled) return messages;
+	return messages.map((msg): Message => {
+		if (msg.role === "user" || msg.role === "developer") {
+			const userMsg = msg as UserMessage | DeveloperMessage;
+			if (typeof userMsg.content === "string") {
+				const redacted = redactSensitiveCredentials(userMsg.content);
+				if (redacted === userMsg.content) return msg;
+				return { ...userMsg, content: redacted } as Message;
+			}
+			const contentArray = userMsg.content;
+			let changed = false;
+			const content = contentArray.map((block): UserMessage["content"][number] => {
+				if (block.type === "text") {
+					const redacted = redactSensitiveCredentials(block.text);
+					if (redacted !== block.text) {
+						changed = true;
+						return { ...block, text: redacted };
+					}
+				}
+				return block;
+			});
+			return (changed ? { ...userMsg, content } : userMsg) as Message;
+		}
+
+		if (msg.role === "toolResult") {
+			const toolResultMsg = msg as ToolResultMessage;
+			let changed = false;
+			const content = toolResultMsg.content.map((block): ToolResultMessage["content"][number] => {
+				if (block.type === "text") {
+					const redacted = redactSensitiveCredentials(block.text);
+					if (redacted !== block.text) {
+						changed = true;
+						return { ...block, text: redacted };
+					}
+				}
+				return block;
+			});
+			return (changed ? { ...toolResultMsg, content } : toolResultMsg) as Message;
+		}
+
+		if (msg.role === "assistant") {
+			const assistantMsg = msg as AssistantMessage;
+			let changed = false;
+			const content = assistantMsg.content.map((block): AssistantMessage["content"][number] => {
+				if (block.type === "text") {
+					const redacted = redactSensitiveCredentials(block.text);
+					if (redacted !== block.text) {
+						changed = true;
+						return { ...block, text: redacted };
+					}
+				} else if (block.type === "thinking") {
+					const redacted = redactSensitiveCredentials(block.thinking);
+					if (redacted !== block.thinking) {
+						changed = true;
+						return { ...block, thinking: redacted, thinkingSignature: undefined };
+					}
+				} else if (block.type === "toolCall") {
+					if (block.arguments) {
+						const { result: redactedArgs, changed: argsChanged } = redactSensitiveInObject(block.arguments);
+						if (argsChanged) {
+							changed = true;
+							const castArgs =
+								redactedArgs && typeof redactedArgs === "object" && !Array.isArray(redactedArgs)
+									? (redactedArgs as Record<string, unknown>)
+									: undefined;
+							return {
+								...block,
+								arguments: castArgs,
+								thoughtSignature: undefined,
+							} as AssistantMessage["content"][number];
+						}
+					}
+				}
+				return block;
+			});
+			return (changed ? { ...assistantMsg, content } : assistantMsg) as Message;
+		}
+
+		return msg;
+	});
+}
+
 export function transformMessages<TApi extends Api>(
 	messages: Message[],
 	model: Model<TApi>,
@@ -294,6 +593,11 @@ export function transformMessages<TApi extends Api>(
 	duplicateToolCallIdSuffixPrefix = "_dup",
 	targetCompat: Model<TApi>["compat"] = model.compat,
 ): Message[] {
+	// Redact sensitive credential-like patterns from all outbound messages when
+	// the host opted in via `configureCredentialRedaction` — prevents security
+	// block errors from LLM providers (e.g. invalid_prompt).
+	messages = redactSensitiveCredentialsInMessages(messages);
+
 	// Drop assistant `toolCall` blocks with empty/whitespace `id` or `name`
 	// (and their matched `toolResult` messages) before anything else looks at
 	// the history. Replays of these would 400 every provider — see
@@ -302,8 +606,36 @@ export function transformMessages<TApi extends Api>(
 
 	// Build a map of original tool call IDs to normalized IDs
 	const toolCallIdMap = new Map<string, string>();
+	// Responses-family assistant composite ids (`call_id|item_id`) normalized for
+	// a cross-provider target keyed by their `call_id` component, so a paired
+	// tool RESULT arriving with a DIFFERENT item half still resolves to the same
+	// normalized id. Only Responses-origin ids populate this (opaque Chat
+	// Completions ids pair by raw equality and must never be canonicalized).
+	const responsesCompositeIdMap = new Map<string, string>();
 
 	const latestSurvivingAssistantIndex = getLatestSurvivingAssistantIndex(messages);
+	const invalidBoundThinkingAssistantIndexes = new Set<number>();
+	if (model.thinking?.prefixBinding) {
+		let latestRewriteAt: number | undefined;
+		for (let index = 0; index < messages.length; index++) {
+			const message = messages[index]!;
+			if (message.role === "user" && message.historyRewriteAt !== undefined) {
+				latestRewriteAt =
+					latestRewriteAt === undefined
+						? message.historyRewriteAt
+						: Math.max(latestRewriteAt, message.historyRewriteAt);
+			} else if (message.role === "toolResult" && message.prunedAt !== undefined) {
+				latestRewriteAt =
+					latestRewriteAt === undefined ? message.prunedAt : Math.max(latestRewriteAt, message.prunedAt);
+			} else if (
+				message.role === "assistant" &&
+				latestRewriteAt !== undefined &&
+				message.timestamp <= latestRewriteAt
+			) {
+				invalidBoundThinkingAssistantIndexes.add(index);
+			}
+		}
+	}
 	// First pass: transform messages (thinking blocks, tool call ID normalization)
 	const normalizedMessages = messages.map((msg, index) => {
 		// User and developer messages pass through unchanged
@@ -313,7 +645,12 @@ export function transformMessages<TApi extends Api>(
 
 		// Handle toolResult messages - normalize toolCallId if we have a mapping
 		if (msg.role === "toolResult") {
-			const normalizedId = toolCallIdMap.get(msg.toolCallId);
+			const exactNormalizedId = toolCallIdMap.get(msg.toolCallId);
+			const normalizedId =
+				exactNormalizedId ??
+				(msg.toolCallId.includes("|")
+					? responsesCompositeIdMap.get(responsesCallComponent(msg.toolCallId))
+					: undefined);
 			if (normalizedId && normalizedId !== msg.toolCallId) {
 				return { ...msg, toolCallId: normalizedId };
 			}
@@ -339,21 +676,22 @@ export function transformMessages<TApi extends Api>(
 			// anthropic-messages providers configured via `models.yaml` and
 			// session-level model swaps (#2257).
 			const isAnthropicReplay = isAnthropicTarget && assistantMsg.api === "anthropic-messages";
+			const sameAnthropicDeployment =
+				isAnthropicReplay &&
+				assistantMsg.provider === model.provider &&
+				(model.compat.officialEndpoint || model.thinking?.prefixBinding === true);
 			const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
 			// Signature policy is a second axis. Anthropic cryptographically
-			// binds reasoning signatures to its key+session+model, so cross-model
-			// signatures must be stripped whenever a signing Anthropic endpoint
-			// is on either end of the replay:
+			// binds reasoning signatures to its deployment and model lineage.
+			// First-party deployments now accept same-deployment cross-model
+			// signatures and drop blocks the target model cannot read. Signatures
+			// still must be stripped when a signing endpoint boundary is crossed:
 			//   * official Anthropic (source): the 3p target can't reverify a
 			//     foreign signature and keeping it leaks continuation metadata
 			//     for no benefit.
-			//   * signing Anthropic (target): official Anthropic, GitHub Copilot,
-			//     ZenMux, Cloudflare AI Gateway `/anthropic`, and Google Vertex
-			//     `publishers/anthropic/…` all forward to signature-enforcing
-			//     Anthropic. Any stale/cross-model signature on the wire triggers
-			//     `400 Invalid signature in thinking block` — same failure class
-			//     whether `officialEndpoint` is true or the endpoint is one of
-			//     the known signing proxies (#4297).
+			//   * signing Anthropic (target): opaque signing proxies cannot prove
+			//     they share the source deployment. Foreign signatures can trigger
+			//     `400 Invalid signature in thinking block` (#4297).
 			// 3p ↔ 3p replays preserve signatures because compatible providers
 			// (Z.AI, DeepSeek, custom `models.yaml` providers) treat them as
 			// opaque continuation hints rather than verified material; stripping
@@ -429,6 +767,12 @@ export function transformMessages<TApi extends Api>(
 				!assistantMsg.content.some(anthropicVisibleThinkingSurvivesReplay);
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
+				if (
+					invalidBoundThinkingAssistantIndexes.has(index) &&
+					(block.type === "thinking" || block.type === "redactedThinking")
+				) {
+					return [];
+				}
 				if (block.type === "thinking") {
 					// Only an aborted/errored turn's final (mid-stream) block can hold a
 					// partial signature; abandoned tool-use turns strip all. Drop the
@@ -439,22 +783,30 @@ export function transformMessages<TApi extends Api>(
 							? { ...block, thinkingSignature: undefined }
 							: block;
 					if (isAnthropicReplay) {
+						// A signature is only replayable where its issuer can verify it.
+						// Same-provider replays (including cross-model-id switches within
+						// official Anthropic — pinned by the prefill suite) keep the
+						// latest turn byte-for-byte per Anthropic's rule for its own most
+						// recent response. A latest turn minted by a DIFFERENT provider
+						// is not "Anthropic's own response": its signature can never
+						// verify on a signing Anthropic target and wedges the session
+						// with `400 Invalid signature in thinking block` on every
+						// attempt until the poisoned turn ages out of the replay window
+						// (observed live: a kimi-code/k3 turn replayed to official
+						// Anthropic after a session-level model switch mid tool-loop).
+						const crossProviderSource = assistantMsg.provider !== model.provider;
 						// Latest abandoned turn: Anthropic's byte-for-byte rule forbids
-						// even stripping a signature on the latest message.
-						if (isLatestSurvivingAssistant && abandonedToolUse) return block;
-						// Cross-model prior turns crossing an official Anthropic endpoint
-						// must strip the source signature so the downstream encoder
-						// applies its `replayUnsignedThinking` policy (unsigned thinking
-						// is emitted natively on Anthropic-compatible reasoning endpoints
-						// and demoted to text on official Anthropic). 3p ↔ 3p replays
-						// keep the signature so the reasoning chain stays signed on
-						// continuation (#2265).
-						if (
-							!isLatestSurvivingAssistant &&
-							!isSameModel &&
-							signingAnthropicInvolved &&
-							sanitized.thinkingSignature
-						) {
+						// even stripping a signature on the latest message — but only
+						// for turns the target's own provider issued.
+						if (isLatestSurvivingAssistant && abandonedToolUse && !crossProviderSource) return block;
+						// Preserve same-deployment signatures and let Anthropic perform
+						// its one-way model compatibility check. Across deployments,
+						// strip stale signatures so the encoder applies the target's
+						// unsigned-thinking policy. 3p ↔ 3p replays keep opaque
+						// signatures as continuation metadata (#2265).
+						const staleSignature =
+							!sameAnthropicDeployment && (isLatestSurvivingAssistant ? crossProviderSource : !isSameModel);
+						if (staleSignature && signingAnthropicInvolved && sanitized.thinkingSignature) {
 							sanitized = { ...sanitized, thinkingSignature: undefined };
 						}
 						// Drop blocks with neither a signature anchor nor any text —
@@ -524,17 +876,34 @@ export function transformMessages<TApi extends Api>(
 
 				if (block.type === "redactedThinking") {
 					// Redacted thinking is native-only. Keep it for same-model
-					// signed replay, the latest byte-for-byte Anthropic turn, or
-					// compatible targets that will also emit sibling unsigned
-					// thinking natively. Drop it when the matching visible thinking
-					// was discarded, or when visible thinking was cross-model
-					// stripped and will be demoted to text.
+					// signed replay, for the latest byte-for-byte turn issued by the
+					// target's own provider, or for compatible targets that will
+					// also emit sibling unsigned thinking natively. Drop it when the
+					// matching visible thinking was discarded, or when visible
+					// thinking was stripped and will be demoted to text — a foreign
+					// redacted payload can no more verify on a signing target than a
+					// foreign visible signature can, even on the latest turn.
 					if (isAnthropicReplay) {
 						if (dropsAllSameModelVisibleThinking) return [];
-						if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
+						if (
+							isSameModel ||
+							sameAnthropicDeployment ||
+							(isLatestSurvivingAssistant && assistantMsg.provider === model.provider) ||
+							replaysUnsignedAnthropicThinking
+						) {
+							return block;
+						}
 						return [];
 					}
 					if (isSameModel) return block;
+					return [];
+				}
+
+				if (block.type === "anthropicServerTool") {
+					// Anthropic requires native server-tool calls and results to be
+					// replayed unchanged. They are meaningful only to the provider
+					// that produced them; every cross-provider target drops them.
+					if (isAnthropicReplay && assistantMsg.provider === model.provider) return block;
 					return [];
 				}
 
@@ -554,6 +923,13 @@ export function transformMessages<TApi extends Api>(
 					return [];
 				}
 
+				if (block.type === "image") {
+					// Assistant images are display artifacts. No provider accepts them
+					// in an assistant replay turn; the native Responses result remains
+					// in providerPayload for OpenAI replay.
+					return [];
+				}
+
 				if (block.type === "text") {
 					if (isSameModel) return block;
 					return {
@@ -570,22 +946,37 @@ export function transformMessages<TApi extends Api>(
 						normalizedToolCall = { ...toolCall, thoughtSignature: undefined };
 					}
 
+					let normalizedId: string | undefined;
 					if (isAnthropicTarget) {
-						const normalizedId = normalizeAnthropicTargetToolCallId(
-							toolCall.id,
-							model,
-							assistantMsg,
-							normalizeToolCallId,
-						);
+						// Custom same-model endpoints own opaque correlation IDs; official
+						// endpoints and cross-model replays require Anthropic-valid IDs.
+						if (!isSameModel || model.compat.officialEndpoint) {
+							normalizedId = normalizeAnthropicTargetToolCallId(
+								toolCall.id,
+								model,
+								assistantMsg,
+								normalizeToolCallId,
+							);
+						}
+					} else if (!isSameModel && normalizeToolCallId) {
+						normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
+					}
+
+					if (normalizedId !== undefined) {
 						if (normalizedId !== toolCall.id) {
 							toolCallIdMap.set(toolCall.id, normalizedId);
 							normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
 						}
-					} else if (!isSameModel && normalizeToolCallId) {
-						const normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
-						if (normalizedId !== toolCall.id) {
-							toolCallIdMap.set(toolCall.id, normalizedId);
-							normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
+						// Record the Responses call-component → emitted-id mapping
+						// EVEN WHEN the assistant id is plain and normalization is
+						// identity. A composite RESULT (`call_A|fc_R`) for a plain
+						// Responses call `call_A` still needs this mapping to resolve
+						// onto the emitted id; without it the result stays composite
+						// and the target sees a call `call_A` beside a result
+						// `call_A|fc_R`, breaking call/result correspondence (and, on
+						// Anthropic, the id char rules).
+						if (isResponsesFamilyApi(assistantMsg.api)) {
+							responsesCompositeIdMap.set(responsesCallComponent(toolCall.id), normalizedId);
 						}
 					}
 
@@ -614,8 +1005,13 @@ export function transformMessages<TApi extends Api>(
 		}
 		return msg;
 	});
+	// Per-concrete-id origin classification — the only scope `toolCallPairingKey`
+	// consults to decide whether a pipe-bearing id is a canonicalizable Responses
+	// composite or an opaque Chat Completions token that pairs by raw equality.
+	const originScope = collectToolCallOriginScope(normalizedMessages);
 	const transformed = deduplicateToolCallIds(
 		normalizedMessages,
+		originScope,
 		maxNormalizedToolCallIdLength,
 		duplicateToolCallIdSuffixPrefix,
 	);
@@ -631,13 +1027,14 @@ export function transformMessages<TApi extends Api>(
 		const msg = transformed[index];
 		if (msg.role === "toolResult") {
 			const entry: IndexedToolResult = { index, msg, consumed: false };
-			const entries = realToolResultsById.get(msg.toolCallId);
+			const key = toolCallPairingKey(msg.toolCallId, originScope);
+			const entries = realToolResultsById.get(key);
 			if (entries) entries.push(entry);
-			else realToolResultsById.set(msg.toolCallId, [entry]);
+			else realToolResultsById.set(key, [entry]);
 		}
 	}
 	const takeRealToolResult = (id: string, afterIndex: number): ToolResultMessage | undefined => {
-		const entries = realToolResultsById.get(id);
+		const entries = realToolResultsById.get(toolCallPairingKey(id, originScope));
 		if (!entries) return undefined;
 		for (const entry of entries) {
 			if (entry.consumed || entry.index <= afterIndex) continue;
@@ -656,7 +1053,7 @@ export function transformMessages<TApi extends Api>(
 	for (const msg of transformed) {
 		if (msg.role !== "assistant") continue;
 		for (const block of msg.content) {
-			if (block.type === "toolCall") validToolUseIds.add(block.id);
+			if (block.type === "toolCall") validToolUseIds.add(toolCallPairingKey(block.id, originScope));
 		}
 	}
 
@@ -677,11 +1074,12 @@ export function transformMessages<TApi extends Api>(
 	const flushPendingToolCalls = (timestamp: number): void => {
 		if (pendingToolCalls.length === 0) return;
 		for (const tc of pendingToolCalls) {
-			if (toolCallStatus.has(tc.id)) continue;
+			const statusKey = toolCallPairingKey(tc.id, originScope);
+			if (toolCallStatus.has(statusKey)) continue;
 			const realToolResult = takeRealToolResult(tc.id, pendingToolCallsStartIndex);
 			if (realToolResult) {
 				result.push(realToolResult);
-				toolCallStatus.set(tc.id, ToolCallStatus.Resolved);
+				toolCallStatus.set(statusKey, ToolCallStatus.Resolved);
 				continue;
 			}
 			result.push({
@@ -692,7 +1090,7 @@ export function transformMessages<TApi extends Api>(
 				isError: true,
 				timestamp,
 			} as ToolResultMessage);
-			toolCallStatus.set(tc.id, ToolCallStatus.Resolved);
+			toolCallStatus.set(statusKey, ToolCallStatus.Resolved);
 		}
 		pendingToolCalls = [];
 	};
@@ -700,11 +1098,12 @@ export function transformMessages<TApi extends Api>(
 	const flushPendingAbortedToolCalls = (): void => {
 		if (pendingAbortedTimestamp === undefined) return;
 		for (const tc of pendingAbortedToolCalls.values()) {
-			if (toolCallStatus.has(tc.id)) continue;
+			const statusKey = toolCallPairingKey(tc.id, originScope);
+			if (toolCallStatus.has(statusKey)) continue;
 			const realToolResult = takeRealToolResult(tc.id, pendingAbortedStartIndex);
 			if (realToolResult) {
 				result.push(realToolResult);
-				toolCallStatus.set(tc.id, ToolCallStatus.Resolved);
+				toolCallStatus.set(statusKey, ToolCallStatus.Resolved);
 				continue;
 			}
 			result.push({
@@ -715,7 +1114,7 @@ export function transformMessages<TApi extends Api>(
 				isError: true,
 				timestamp: pendingAbortedTimestamp,
 			} as ToolResultMessage);
-			toolCallStatus.set(tc.id, ToolCallStatus.Aborted);
+			toolCallStatus.set(statusKey, ToolCallStatus.Aborted);
 		}
 		pendingAbortedToolCalls = new Map();
 		pendingAbortedTimestamp = undefined;
@@ -755,7 +1154,9 @@ export function transformMessages<TApi extends Api>(
 				// emitted immediately if available; otherwise synthesize aborted results
 				// before the next turn boundary.
 				result.push(msg);
-				pendingAbortedToolCalls = new Map(toolCalls.map(toolCall => [toolCall.id, toolCall] as const));
+				pendingAbortedToolCalls = new Map(
+					toolCalls.map(toolCall => [toolCallPairingKey(toolCall.id, originScope), toolCall] as const),
+				);
 				pendingAbortedTimestamp = assistantMsg.timestamp;
 				pendingAbortedStartIndex = i;
 				continue;
@@ -768,22 +1169,23 @@ export function transformMessages<TApi extends Api>(
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
-			if (toolCallStatus.has(msg.toolCallId)) continue;
+			const resultKey = toolCallPairingKey(msg.toolCallId, originScope);
+			if (toolCallStatus.has(resultKey)) continue;
 
-			if (pendingAbortedToolCalls.has(msg.toolCallId)) {
-				pendingAbortedToolCalls.delete(msg.toolCallId);
-				toolCallStatus.set(msg.toolCallId, ToolCallStatus.Resolved);
+			if (pendingAbortedToolCalls.has(resultKey)) {
+				pendingAbortedToolCalls.delete(resultKey);
+				toolCallStatus.set(resultKey, ToolCallStatus.Resolved);
 				result.push(msg);
 				continue;
 			}
 
-			if (pendingToolCalls.some(tc => tc.id === msg.toolCallId)) {
-				toolCallStatus.set(msg.toolCallId, ToolCallStatus.Resolved);
+			if (pendingToolCalls.some(tc => toolCallPairingKey(tc.id, originScope) === resultKey)) {
+				toolCallStatus.set(resultKey, ToolCallStatus.Resolved);
 				result.push(msg);
 				continue;
 			}
 
-			if (!validToolUseIds.has(msg.toolCallId)) {
+			if (!validToolUseIds.has(resultKey)) {
 				// Orphan `tool_result`: the originating `tool_use` is not present in the
 				// transformed history (typically because handoff/compaction folded the
 				// assistant message into a summary string while the user-side result
@@ -802,7 +1204,10 @@ export function transformMessages<TApi extends Api>(
 				//
 				// Drop the orphan silently in that case; the pending calls will be
 				// resolved in their own contiguous result window or at the next boundary.
-				if (pendingToolCalls.some(tc => !toolCallStatus.has(tc.id)) || pendingAbortedToolCalls.size > 0) {
+				if (
+					pendingToolCalls.some(tc => !toolCallStatus.has(toolCallPairingKey(tc.id, originScope))) ||
+					pendingAbortedToolCalls.size > 0
+				) {
 					continue;
 				}
 				// No pending tool-call window: safe to preserve the text payload so the

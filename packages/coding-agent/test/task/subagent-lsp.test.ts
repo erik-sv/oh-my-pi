@@ -59,6 +59,7 @@ function createYieldingSession(): AgentSession {
 			appendSessionInit: () => {},
 		},
 		getActiveToolNames: () => ["yield"],
+		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
 		subscribe: (listener: (event: AgentSessionEvent) => void) => {
 			listeners.push(listener);
@@ -84,12 +85,14 @@ function createYieldingSession(): AgentSession {
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
 		abort: async () => {},
 		dispose: async () => {},
+		setIrcWakeTurnObserver: () => {},
+		subscribeRunState: () => () => {},
 	} as unknown as AgentSession;
 }
 
 function createSession(
 	options: {
-		isolationMode?: "none" | "auto";
+		isolationEnabled?: boolean;
 		parentEnableLsp?: boolean;
 		planMode?: PlanModeState;
 		sessionFile?: string | null;
@@ -109,7 +112,7 @@ function createSession(
 		enableLsp: options.parentEnableLsp,
 		settings: Settings.isolated({
 			"async.enabled": false,
-			"task.isolation.mode": options.isolationMode ?? "none",
+			"task.isolation.enabled": options.isolationEnabled ?? false,
 			...(options.taskEnableLsp !== undefined ? { "task.enableLsp": options.taskEnableLsp } : {}),
 		}),
 		getSessionFile: () => options.sessionFile ?? null,
@@ -154,7 +157,7 @@ function mockIsolation(): void {
 	};
 	const isolationHandle: IsolationHandle = {
 		mergedDir: "/tmp/isolated-subagent",
-		backend: worktreeModule.parseIsolationMode("rcopy")!,
+		backend: worktreeModule.parseIsolationBackend("rcopy")!,
 		fellBack: false,
 		fallbackReason: null,
 	};
@@ -231,7 +234,7 @@ describe("subagent LSP availability", () => {
 		mockIsolation();
 		const { getOptions } = mockCreateAgentSession();
 
-		const tool = await TaskTool.create(createSession({ isolationMode: "auto" }));
+		const tool = await TaskTool.create(createSession({ isolationEnabled: true }));
 		await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
 
 		expect(getOptions()?.cwd).toBe("/tmp/isolated-subagent");
@@ -251,7 +254,7 @@ describe("subagent LSP availability", () => {
 		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-isolated-session-cwd-"));
 		try {
 			const parentSessionFile = path.join(tempDir, "parent.jsonl");
-			const tool = await TaskTool.create(createSession({ isolationMode: "auto", sessionFile: parentSessionFile }));
+			const tool = await TaskTool.create(createSession({ isolationEnabled: true, sessionFile: parentSessionFile }));
 			await tool.execute("tool-call", { ...TEST_TASK, isolated: true });
 
 			const sessionManager = getOptions()?.sessionManager as { getCwd?: () => string } | undefined;
@@ -262,13 +265,13 @@ describe("subagent LSP availability", () => {
 		}
 	});
 
-	it("applies plan-mode subagent tools, preserves read-only agent tools, and honors task.enableLsp", async () => {
+	it("clamps plan-mode mixed-capability tools despite ordinary settings", async () => {
 		mockAgents({
 			name: "task",
 			description: "Reviewer-like task agent",
 			systemPrompt: "Review with read-only specialty tools.",
 			source: "bundled",
-			tools: ["bash", "ast_grep", "report_finding", "memory_edit", "retain", "todo"],
+			tools: ["bash", "ast_grep", "memory_edit", "retain", "todo"],
 		});
 		const { getOptions } = mockCreateAgentSession();
 		const planMode = { enabled: true, planFilePath: "local://PLAN.md" };
@@ -276,12 +279,16 @@ describe("subagent LSP availability", () => {
 		const tool = await TaskTool.create(createSession({ planMode, taskEnableLsp: true }));
 		await tool.execute("tool-call", TEST_TASK);
 
-		const toolNames = getOptions()?.toolNames;
-		expect(getOptions()?.enableLsp).toBe(true);
-		expect(toolNames).toEqual(["read", "grep", "glob", "lsp", "web_search", "ast_grep", "report_finding", "irc"]);
-		expect(toolNames).not.toContain("bash");
-		expect(toolNames).not.toContain("memory_edit");
-		expect(toolNames).not.toContain("retain");
-		expect(toolNames).not.toContain("todo");
+		const options = getOptions();
+		expect(options?.enableLsp).toBe(false);
+		expect(options?.enableIrc).toBe(false);
+		expect(options?.restrictToolNames).toBe(true);
+		expect(options?.toolNames).toEqual(["read", "grep", "glob", "web_search", "ast_grep"]);
+		expect(options?.toolNames).not.toContain("lsp");
+		expect(options?.toolNames).not.toContain("hub");
+		expect(options?.toolNames).not.toContain("bash");
+		expect(options?.toolNames).not.toContain("memory_edit");
+		expect(options?.toolNames).not.toContain("retain");
+		expect(options?.toolNames).not.toContain("todo");
 	});
 });

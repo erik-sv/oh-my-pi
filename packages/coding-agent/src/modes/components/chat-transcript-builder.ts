@@ -13,14 +13,16 @@
  */
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import type { Usage } from "@oh-my-pi/pi-ai";
-import type { TUI } from "@oh-my-pi/pi-tui";
+import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
 import { settings } from "../../config/settings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
+import { LAUNCH_COMPLETION_MESSAGE_TYPE } from "../../session/launch-completion";
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
 	type CustomMessage,
+	isUserTurnInitiator,
 	LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
@@ -33,8 +35,10 @@ import {
 	buildAsyncResultBlock,
 	buildFileMentionBlock,
 	buildIrcMessageCard,
+	buildLaunchCompletionBlock,
 	normalizeToolArgs,
 	resolveAssistantErrorPresentation,
+	splitAssistantMessageToolTimeline,
 } from "../utils/transcript-render-helpers";
 import { createAdvisorMessageCard } from "./advisor-message";
 import { AssistantMessageComponent } from "./assistant-message";
@@ -50,20 +54,24 @@ import {
 import { CustomMessageComponent } from "./custom-message";
 import { EvalExecutionComponent } from "./eval-execution";
 import { type LateDiagnosticsFile, LateDiagnosticsMessageComponent } from "./late-diagnostics-message";
-import { ReadToolGroupComponent, readArgsHaveTarget, readArgsTargetInternalUrl } from "./read-tool-group";
+import { groupedReadUsageCallIds, ReadToolGroupComponent, readArgsCollapseIntoGroup } from "./read-tool-group";
 import { SkillMessageComponent } from "./skill-message";
 import { ToolExecutionComponent } from "./tool-execution";
 import { TranscriptContainer } from "./transcript-container";
-import { createUsageRowBlock } from "./usage-row";
-import { UserMessageComponent } from "./user-message";
+import { createUsageRowBlock, turnElapsedMs } from "./usage-row";
+import { CollapsedSyntheticMessageComponent, UserMessageComponent } from "./user-message";
 
 export interface ChatTranscriptBuilderDeps {
 	ui: TUI;
 	getTool?: (name: string) => AgentTool | undefined;
+	/** Whether the active registry entry came from a built-in factory. */
+	isBuiltInTool?: (name: string) => boolean;
 	getMessageRenderer?: (customType: string) => MessageRenderer | undefined;
 	cwd: string;
 	hideThinkingBlock?: () => boolean;
 	proseOnlyThinking?: () => boolean;
+	/** Session-scoped resolved destinations for model-authored Markdown links. */
+	linkTargets?: ReadonlyMap<string, string>;
 	requestRender: () => void;
 }
 
@@ -84,13 +92,20 @@ export class ChatTranscriptBuilder {
 	#pendingUsage: Usage | undefined;
 	#pendingUsageDuration: number | undefined;
 	#pendingUsageTtft: number | undefined;
+	#pendingUsageTimestamp: number | undefined;
+	#pendingReadUsageCallIds: string[] | undefined;
+	#pendingUsageElapsedMs: number | undefined;
+	#turnStartedAt: number | undefined;
 	#lastAssistantUsage: Usage | undefined;
 	#waitingPoll: ToolExecutionComponent | null = null;
 	#todoSnapshot: ToolExecutionComponent | null = null;
 	#expandables: Array<{ setExpanded(expanded: boolean): void }> = [];
 	#expanded = false;
+	#entryComponents = new Map<string, Component[]>();
 
-	constructor(private readonly deps: ChatTranscriptBuilderDeps) {}
+	constructor(private readonly deps: ChatTranscriptBuilderDeps) {
+		this.container.setToolActivityVisible(!settings.get("display.hideToolActivity"));
+	}
 
 	/** Whether the transcript currently holds any rendered rows. */
 	get isEmpty(): boolean {
@@ -100,7 +115,7 @@ export class ChatTranscriptBuilder {
 	/** Discard all components and rebuild the whole transcript from `entries`. */
 	rebuild(entries: SessionMessageEntry[]): void {
 		this.reset();
-		for (const entry of entries) this.#appendChatMessage(entry.message);
+		for (const entry of entries) this.#appendEntry(entry);
 		// Flush the trailing turn's usage row only once its tools are materialized
 		// (a read whose result has not arrived stays pending); otherwise the row
 		// would sit above its tools. The drain happens here at the end of the pass.
@@ -109,7 +124,7 @@ export class ChatTranscriptBuilder {
 
 	/** Append newly persisted entries without rebuilding already rendered rows. */
 	append(entries: SessionMessageEntry[]): void {
-		for (const entry of entries) this.#appendChatMessage(entry.message);
+		for (const entry of entries) this.#appendEntry(entry);
 		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
 	}
 
@@ -123,6 +138,15 @@ export class ChatTranscriptBuilder {
 		return this.#expanded;
 	}
 
+	/** Rendered row where a persisted entry begins, after the container has painted once. */
+	rowForEntry(entryId: string): number | undefined {
+		for (const component of this.#entryComponents.get(entryId) ?? []) {
+			const row = this.container.getChildStartRow(component);
+			if (row !== undefined) return row;
+		}
+		return undefined;
+	}
+
 	/** Tear down components (sealing pending spinners) and clear build state. */
 	reset(): void {
 		for (const pending of this.#pendingTools.values()) pending.seal();
@@ -132,10 +156,15 @@ export class ChatTranscriptBuilder {
 		this.#pendingUsage = undefined;
 		this.#pendingUsageDuration = undefined;
 		this.#pendingUsageTtft = undefined;
+		this.#pendingUsageTimestamp = undefined;
+		this.#pendingReadUsageCallIds = undefined;
+		this.#pendingUsageElapsedMs = undefined;
+		this.#turnStartedAt = undefined;
 		this.#lastAssistantUsage = undefined;
 		this.#waitingPoll = null;
 		this.#todoSnapshot = null;
 		this.#expandables = [];
+		this.#entryComponents.clear();
 		this.container.dispose();
 		this.container.clear();
 	}
@@ -144,17 +173,24 @@ export class ChatTranscriptBuilder {
 		this.reset();
 	}
 
+	#appendEntry(entry: SessionMessageEntry): void {
+		const before = this.container.children.length;
+		this.#appendChatMessage(entry.message);
+		const components = this.container.children.slice(before);
+		if (components.length > 0) this.#entryComponents.set(entry.id, components);
+	}
+
 	#trackExpandable(component: { setExpanded(expanded: boolean): void }): void {
 		component.setExpanded(this.#expanded);
 		this.#expandables.push(component);
 	}
 
-	/** A `job` poll showing all-running is displaced by the next `job` call. */
+	/** A `hub` wait showing all-running is displaced by the next `hub` call. */
 	#resolveWaitingPoll(nextToolName?: string): void {
 		const previous = this.#waitingPoll;
 		if (!previous) return;
 		this.#waitingPoll = null;
-		if (nextToolName === "job" && previous.isDisplaceableBlock() && this.container.isBlockUncommitted(previous)) {
+		if (nextToolName === "hub" && previous.isDisplaceableBlock() && this.container.canRemoveBlock(previous)) {
 			this.container.removeChild(previous);
 		}
 		previous.seal();
@@ -169,7 +205,7 @@ export class ChatTranscriptBuilder {
 		}
 		if (previous.canBeDisplacedBy(nextToolName)) {
 			this.#todoSnapshot = null;
-			if (this.container.isBlockUncommitted(previous)) {
+			if (this.container.canRemoveBlock(previous)) {
 				this.container.removeChild(previous);
 			}
 			previous.seal();
@@ -191,24 +227,49 @@ export class ChatTranscriptBuilder {
 		return this.#readGroup;
 	}
 
-	// The per-turn token-usage row must land below the turn's tool blocks, but
-	// normal `read` calls only materialize their group in #appendToolResult. Defer
-	// the row: stash it on the assistant message and flush once the turn's tools
-	// are placed, sealing the read run so the row sits under it.
+	// Defer per-turn metrics until the turn's tool results have materialized.
+	// Read-only invisible turns attach the metrics to their shared compact
+	// group; every other turn keeps the standalone row below its tool blocks.
 	#flushPendingUsage(): void {
 		if (!this.#pendingUsage) return;
-		this.#readGroup?.seal();
-		this.#readGroup = null;
-		this.container.addChild(
-			createUsageRowBlock(this.#pendingUsage, this.#pendingUsageDuration, this.#pendingUsageTtft),
-		);
+		const usageAttached =
+			this.#pendingReadUsageCallIds !== undefined &&
+			(this.#readGroup?.attachUsage(
+				this.#pendingReadUsageCallIds,
+				this.#pendingUsage,
+				this.#pendingUsageDuration,
+				this.#pendingUsageTtft,
+				this.#pendingUsageTimestamp,
+				this.#pendingUsageElapsedMs,
+			) ??
+				false);
+		if (!usageAttached) {
+			this.#readGroup?.seal();
+			this.#readGroup = null;
+			this.container.addChild(
+				createUsageRowBlock(
+					this.#pendingUsage,
+					this.#pendingUsageDuration,
+					this.#pendingUsageTtft,
+					this.#pendingUsageTimestamp,
+					this.#pendingUsageElapsedMs,
+				),
+			);
+		}
 		this.#pendingUsage = undefined;
 		this.#pendingUsageDuration = undefined;
 		this.#pendingUsageTtft = undefined;
+		this.#pendingUsageTimestamp = undefined;
+		this.#pendingReadUsageCallIds = undefined;
+		this.#pendingUsageElapsedMs = undefined;
 	}
 
 	#appendChatMessage(message: AgentMessage): void {
 		if (message.role !== "toolResult") this.#flushPendingUsage();
+		if (message.role !== "assistant" && message.role !== "toolResult") {
+			this.#readGroup?.seal();
+			this.#readGroup = null;
+		}
 		switch (message.role) {
 			case "assistant":
 				this.#appendAssistantMessage(message);
@@ -218,20 +279,51 @@ export class ChatTranscriptBuilder {
 				break;
 			case "user":
 			case "developer": {
+				// Only genuinely user-attributed prompts anchor the delta; a mid-run
+				// agent-attributed `user` message (advisor tool-loop redirect) must not.
+				if (message.role === "user" && message.attribution !== "agent") {
+					this.#turnStartedAt = message.timestamp;
+				} else if (message.role === "developer" && message.synthetic) {
+					// A synthetic developer message initiates a fresh run (auto-
+					// continue, /goal, approved plan): replay must not inherit the
+					// preceding user prompt's timestamp, mirroring the live
+					// agent_start clear. Same-turn continuation reminders (todo, plan)
+					// are persisted developer messages WITHOUT the synthetic marker,
+					// so their anchor survives the rebuild.
+					// A deliberate operator action (`.`, `c` continue shortcut) is the turn's
+					// own prompt: anchor the delta to it instead of clearing.
+					if (message.userInitiated) this.#turnStartedAt = message.timestamp;
+					else this.#turnStartedAt = undefined;
+				}
 				// A user prompt closes the poll-displacement window, same as the live path.
 				if (message.role === "user") this.#resolveWaitingPoll();
 				if (message.role === "user") this.#resolveTodoSnapshot();
 				const textContent = message.role === "user" ? userMessageText(message) : "";
 				if (textContent) {
 					const isSynthetic = message.role === "developer" ? true : (message.synthetic ?? false);
-					this.container.addChild(new UserMessageComponent(textContent, isSynthetic));
+					// Synthetic (agent-attributed) inputs — chiefly the advisor's `Session
+					// update` replay dumps — can be hundreds of KiB of Markdown each.
+					// Rendering their full body on cold open blocked the TUI (issue #6308);
+					// collapse them behind a compact summary that builds Markdown only on
+					// ctrl+o expand. Real user prompts stay fully rendered.
+					if (isSynthetic) {
+						const collapsed = new CollapsedSyntheticMessageComponent(textContent);
+						this.#trackExpandable(collapsed);
+						this.container.addChild(collapsed);
+					} else {
+						this.container.addChild(new UserMessageComponent(textContent, false));
+					}
 				}
 				break;
 			}
 			case "bashExecution": {
 				const component = new BashExecutionComponent(message.command, this.deps.ui, message.excludeFromContext);
 				if (message.output) component.appendOutput(message.output);
-				component.setComplete(message.exitCode, message.cancelled, { truncation: message.meta?.truncation });
+				component.setComplete(message.exitCode, message.cancelled, {
+					truncation: message.meta?.truncation,
+					images: message.images,
+					showImages: settings.get("terminal.showImages"),
+				});
 				this.container.addChild(component);
 				break;
 			}
@@ -244,6 +336,12 @@ export class ChatTranscriptBuilder {
 			}
 			case "hookMessage":
 			case "custom":
+				// A directly-invoked `/skill:` custom prompt is the run's initiator
+				// (user attribution), so it seeds the prompt→yield delta like a user
+				// message does.
+				if (message.role === "custom" && isUserTurnInitiator(message as CustomMessage)) {
+					this.#turnStartedAt = message.timestamp;
+				}
 				this.#appendCustomMessage(message);
 				break;
 			case "compactionSummary": {
@@ -270,17 +368,28 @@ export class ChatTranscriptBuilder {
 		}
 	}
 
+	/** Prompt→yield wall time for the current turn, or undefined when unknown. */
+	#turnElapsedMs(message: Extract<AgentMessage, { role: "assistant" }>): number | undefined {
+		return turnElapsedMs(this.#turnStartedAt, message);
+	}
+
 	#appendAssistantMessage(message: Extract<AgentMessage, { role: "assistant" }>): void {
 		const hideThinkingBlock = this.deps.hideThinkingBlock?.() ?? false;
 		const proseOnlyThinking = this.deps.proseOnlyThinking ? this.deps.proseOnlyThinking() : true;
+		const timeline = splitAssistantMessageToolTimeline(message);
 		const assistantComponent = new AssistantMessageComponent(
-			message,
+			timeline.beforeTools,
 			hideThinkingBlock,
 			() => this.deps.requestRender(),
 			this.deps.getMessageRenderer ? undefined : [], // placeholder for thinkingRenderers
-			undefined, // placeholder for imageBudget
+			this.deps.ui.imageBudget,
 			proseOnlyThinking,
+			this.deps.linkTargets,
 		);
+		assistantComponent.setImagesVisible(settings.get("terminal.showImages"));
+		assistantComponent.setToolResultImagesVisible(!settings.get("display.hideToolActivity"));
+		this.#trackExpandable(assistantComponent);
+		assistantComponent.pickReactionTarget(this.container.children);
 		this.container.addChild(assistantComponent);
 
 		if (settings.get("display.cacheMissMarker")) {
@@ -301,16 +410,29 @@ export class ChatTranscriptBuilder {
 		const errorPresentation = resolveAssistantErrorPresentation(message);
 		const hasErrorStop = errorPresentation.kind === "full";
 		const errorMessage = hasErrorStop ? errorPresentation.text : null;
+		const appendAssistantSegment = (segment: Extract<AgentMessage, { role: "assistant" }> | undefined) => {
+			if (!segment || !assistantHasVisibleContent(segment)) return;
+			const component = new AssistantMessageComponent(
+				segment,
+				hideThinkingBlock,
+				() => this.deps.requestRender(),
+				this.deps.getMessageRenderer ? undefined : [],
+				undefined,
+				proseOnlyThinking,
+				this.deps.linkTargets,
+			);
+			component.setImagesVisible(settings.get("terminal.showImages"));
+			component.setToolResultImagesVisible(!settings.get("display.hideToolActivity"));
+			this.#trackExpandable(component);
+			this.container.addChild(component);
+		};
 
 		for (const content of message.content) {
 			if (content.type !== "toolCall") continue;
 			this.#resolveWaitingPoll(content.name);
 
-			if (
-				content.name === "read" &&
-				readArgsHaveTarget(content.arguments) &&
-				!readArgsTargetInternalUrl(content.arguments)
-			) {
+			const afterToolSegment = timeline.afterToolCalls.get(content.id);
+			if (content.name === "read" && readArgsCollapseIntoGroup(content.arguments)) {
 				if (hasErrorStop && errorMessage) {
 					const group = this.#ensureReadGroup();
 					group.updateArgs(content.arguments, content.id);
@@ -319,10 +441,15 @@ export class ChatTranscriptBuilder {
 						false,
 						content.id,
 					);
+				} else if (afterToolSegment) {
+					const group = this.#ensureReadGroup();
+					group.updateArgs(content.arguments, content.id);
+					this.#pendingTools.set(content.id, group);
 				} else {
 					const normalizedArgs = normalizeToolArgs(content.arguments);
 					this.#readArgs.set(content.id, normalizedArgs);
 				}
+				appendAssistantSegment(afterToolSegment);
 				continue;
 			}
 
@@ -332,11 +459,10 @@ export class ChatTranscriptBuilder {
 				content.name,
 				content.arguments,
 				{
-					// Images can't be sliced through the scroll viewport; keep them off.
-					showImages: false,
-					editFuzzyThreshold: settings.get("edit.fuzzyThreshold"),
-					editAllowFuzzy: settings.get("edit.fuzzyMatch"),
-					liveRegion: this.container,
+					useBuiltInRenderer: this.deps.isBuiltInTool?.(content.name) ?? true,
+					// Stable ids and Kitty placeholder cells keep images anchored
+					// while the transcript viewport scrolls and reflows.
+					showImages: settings.get("terminal.showImages"),
 				},
 				this.deps.getTool?.(content.name),
 				this.deps.ui,
@@ -355,12 +481,17 @@ export class ChatTranscriptBuilder {
 			} else {
 				this.#pendingTools.set(content.id, component);
 			}
+			appendAssistantSegment(afterToolSegment);
 		}
 
 		this.#pendingUsage =
 			settings.get("display.showTokenUsage") && assistantUsageIsBilled(message.usage) ? message.usage : undefined;
 		this.#pendingUsageDuration = message.duration;
 		this.#pendingUsageTtft = message.ttft;
+		this.#pendingUsageTimestamp = message.timestamp;
+		this.#pendingReadUsageCallIds = this.#pendingUsage ? groupedReadUsageCallIds(message) : undefined;
+		this.#pendingUsageElapsedMs =
+			this.#pendingUsage && settings.get("display.showTurnTime") ? this.#turnElapsedMs(message) : undefined;
 	}
 
 	#appendToolResult(message: Extract<AgentMessage, { role: "toolResult" }>): void {
@@ -382,7 +513,7 @@ export class ChatTranscriptBuilder {
 		if (!pending) return;
 		pending.updateResult(message, false, message.toolCallId);
 		this.#pendingTools.delete(message.toolCallId);
-		if (message.toolName === "job" && pending instanceof ToolExecutionComponent && pending.isDisplaceableBlock()) {
+		if (message.toolName === "hub" && pending instanceof ToolExecutionComponent && pending.isDisplaceableBlock()) {
 			this.#waitingPoll = pending;
 		} else if (
 			message.toolName === "todo" &&
@@ -396,11 +527,11 @@ export class ChatTranscriptBuilder {
 			this.#todoSnapshot = pending;
 		}
 	}
-
 	#appendCustomMessage(message: Extract<AgentMessage, { role: "custom" | "hookMessage" }>): void {
 		if (!message.display) return;
 		if (message.customType === "async-result") {
-			this.container.addChild(buildAsyncResultBlock(message));
+			const component = buildAsyncResultBlock(message);
+			this.container.addChild(component);
 			return;
 		}
 		if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -423,7 +554,8 @@ export class ChatTranscriptBuilder {
 		if (
 			message.customType === "irc:incoming" ||
 			message.customType === "irc:autoreply" ||
-			message.customType === "irc:relay"
+			message.customType === "irc:relay" ||
+			message.customType === "irc:workpool"
 		) {
 			this.container.addChild(buildIrcMessageCard(message, () => this.#expanded));
 			return;
@@ -431,6 +563,10 @@ export class ChatTranscriptBuilder {
 		if (message.customType === "advisor") {
 			const details = (message as CustomMessage<AdvisorMessageDetails>).details;
 			this.container.addChild(createAdvisorMessageCard(details, () => this.#expanded, theme));
+			return;
+		}
+		if (message.customType === LAUNCH_COMPLETION_MESSAGE_TYPE) {
+			this.container.addChild(buildLaunchCompletionBlock(message));
 			return;
 		}
 		if (message.customType === BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE) {

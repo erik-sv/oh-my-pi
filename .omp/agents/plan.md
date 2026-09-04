@@ -3,12 +3,12 @@ name: plan
 description: "Software architect for complex multi-file architectural decisions. NOT for simple tasks, single-file changes, or tasks completable in <5 tool calls."
 tools:
   - read
-  - search
-  - find
+  - grep
+  - glob
   - bash
   - lsp
   - web_search
-  - ast_grep
+  - ast_edit
   - yield
 spawns:
   - explore
@@ -25,7 +25,7 @@ Analyze the codebase and the user's request. Produce a detailed implementation p
 2. Identify ambiguities; list assumptions
 
 ## Phase 2: Explore
-1. Find existing patterns via `search`/`find`
+1. Find existing patterns via `grep`/`glob`
 2. Read key files; understand architecture
 3. Trace data flow through relevant paths
 4. Identify types, interfaces, contracts

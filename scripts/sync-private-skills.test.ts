@@ -64,7 +64,7 @@ function createPrivateRemote(root: string, name: string) {
 			': "${SYNC_STUB_LOG:?SYNC_STUB_LOG is required}"',
 			'printf \'%s\\n\' "$@" > "$SYNC_STUB_LOG"',
 			'if [ -n "${SYNC_STUB_ERROR_TEXT:-}" ]; then',
-			'  printf \'%s\\n\' "$SYNC_STUB_ERROR_TEXT" >&2',
+			"  printf '%s\\n' \"$SYNC_STUB_ERROR_TEXT\" >&2",
 			"fi",
 			'exit "${SYNC_STUB_EXIT:-0}"',
 			"",
@@ -86,11 +86,7 @@ function cloneCheckout(root: string, remote: string, checkout: string) {
 	runGit(root, ["clone", remote, checkout]);
 }
 
-function runBootstrap(
-	root: string,
-	args: string[],
-	extraEnv: NodeJS.ProcessEnv = {},
-) {
+function runBootstrap(root: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}) {
 	return spawnSync("sh", [bootstrapScript, ...args], {
 		cwd: root,
 		env: isolatedEnv(root, extraEnv),
@@ -106,8 +102,8 @@ function expectTargetDelegation(args: string[], target: string) {
 	const targetFlag = args.indexOf("--target");
 	expect(targetFlag).toBeGreaterThanOrEqual(0);
 	expect(args[targetFlag + 1]).toBe(target);
-	expect(args.filter((arg) => arg === "--target")).toHaveLength(1);
-	expect(args.filter((arg) => arg === "--adopt-identical")).toHaveLength(1);
+	expect(args.filter(arg => arg === "--target")).toHaveLength(1);
+	expect(args.filter(arg => arg === "--adopt-identical")).toHaveLength(1);
 }
 
 beforeAll(() => {
@@ -133,11 +129,9 @@ describe("scripts/sync-private-skills.sh", () => {
 		const target = path.join(root, "skill-target");
 		const log = path.join(root, "delegated-args.log");
 
-		const result = runBootstrap(
-			root,
-			["--repo", remote, "--dir", checkout, "--target", target],
-			{ SYNC_STUB_LOG: log },
-		);
+		const result = runBootstrap(root, ["--repo", remote, "--dir", checkout, "--target", target], {
+			SYNC_STUB_LOG: log,
+		});
 
 		expect(result.status).toBe(0);
 		expect(runGit(root, ["rev-parse", "--is-inside-work-tree"], checkout)).toBe("true");
@@ -153,11 +147,9 @@ describe("scripts/sync-private-skills.sh", () => {
 		const log = path.join(root, "delegated-args.log");
 		cloneCheckout(root, remote, checkout);
 
-		const result = runBootstrap(
-			root,
-			["--repo", remote, "--dir", checkout, "--target", target],
-			{ SYNC_STUB_LOG: log },
-		);
+		const result = runBootstrap(root, ["--repo", remote, "--dir", checkout, "--target", target], {
+			SYNC_STUB_LOG: log,
+		});
 
 		expect(result.status).toBe(0);
 		expectTargetDelegation(readDelegatedArgs(log), target);
@@ -172,11 +164,9 @@ describe("scripts/sync-private-skills.sh", () => {
 		const log = path.join(root, "delegated-args.log");
 		cloneCheckout(root, actualRemote, checkout);
 
-		const result = runBootstrap(
-			root,
-			["--repo", requestedRemote, "--dir", checkout, "--target", target],
-			{ SYNC_STUB_LOG: log },
-		);
+		const result = runBootstrap(root, ["--repo", requestedRemote, "--dir", checkout, "--target", target], {
+			SYNC_STUB_LOG: log,
+		});
 
 		expect(result.status).not.toBe(0);
 		expect(fs.existsSync(log)).toBe(false);
@@ -192,16 +182,14 @@ describe("scripts/sync-private-skills.sh", () => {
 		cloneCheckout(root, remote, checkout);
 		fs.rmSync(remote, { recursive: true, force: true });
 
-		const result = runBootstrap(
-			root,
-			["--repo", remote, "--dir", checkout, "--target", target, "--offline"],
-			{ SYNC_STUB_LOG: log },
-		);
+		const result = runBootstrap(root, ["--repo", remote, "--dir", checkout, "--target", target, "--offline"], {
+			SYNC_STUB_LOG: log,
+		});
 
 		expect(result.status).toBe(0);
 		const delegatedArgs = readDelegatedArgs(log);
 		expectTargetDelegation(delegatedArgs, target);
-		expect(delegatedArgs.filter((arg) => arg === "--no-pull")).toHaveLength(1);
+		expect(delegatedArgs.filter(arg => arg === "--no-pull")).toHaveLength(1);
 	});
 
 	it("fails safely offline when the checkout is absent", () => {
@@ -211,11 +199,9 @@ describe("scripts/sync-private-skills.sh", () => {
 		const target = path.join(root, "skill-target");
 		const log = path.join(root, "delegated-args.log");
 
-		const result = runBootstrap(
-			root,
-			["--repo", missingRemote, "--dir", checkout, "--target", target, "--offline"],
-			{ SYNC_STUB_LOG: log },
-		);
+		const result = runBootstrap(root, ["--repo", missingRemote, "--dir", checkout, "--target", target, "--offline"], {
+			SYNC_STUB_LOG: log,
+		});
 
 		expect(result.status).not.toBe(0);
 		expect(fs.existsSync(checkout)).toBe(false);
@@ -230,15 +216,11 @@ describe("scripts/sync-private-skills.sh", () => {
 		const log = path.join(root, "delegated-args.log");
 		cloneCheckout(root, remote, checkout);
 
-		const result = runBootstrap(
-			root,
-			["--repo", remote, "--dir", checkout, "--target", target],
-			{
-				SYNC_STUB_LOG: log,
-				SYNC_STUB_EXIT: "37",
-				SYNC_STUB_ERROR_TEXT: "delegated sync failed",
-			},
-		);
+		const result = runBootstrap(root, ["--repo", remote, "--dir", checkout, "--target", target], {
+			SYNC_STUB_LOG: log,
+			SYNC_STUB_EXIT: "37",
+			SYNC_STUB_ERROR_TEXT: "delegated sync failed",
+		});
 
 		expect(result.status).toBe(37);
 		expect(result.stderr).toContain("delegated sync failed");

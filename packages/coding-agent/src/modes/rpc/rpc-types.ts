@@ -4,7 +4,7 @@
  * Commands are sent as JSON lines on stdin.
  * Responses and events are emitted as JSON lines on stdout.
  */
-import type { AgentMessage, AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { AgentMessage, AgentToolResult, ThinkingLevel, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
@@ -19,12 +19,16 @@ import type {
 	SubagentProgressPayload,
 } from "../../task";
 import type { TodoPhase } from "../../tools/todo";
+import type { RpcMessagesPage } from "./rpc-messages";
 
 // ============================================================================
 // RPC Commands (stdin)
 // ============================================================================
 
 export type RpcCommand =
+	// Protocol
+	| { id?: string; type: "negotiate_protocol"; protocolVersion: number }
+
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
@@ -36,6 +40,7 @@ export type RpcCommand =
 
 	// State
 	| { id?: string; type: "get_state" }
+	| { id?: string; type: "set_fast_mode"; enabled: boolean }
 	| { id?: string; type: "get_available_commands" }
 	| { id?: string; type: "set_todos"; phases: TodoPhase[] }
 	| { id?: string; type: "set_host_tools"; tools: RpcHostToolDefinition[] }
@@ -82,6 +87,7 @@ export type RpcCommand =
 
 	// Messages
 	| { id?: string; type: "get_messages" }
+	| { id?: string; type: "get_messages_page"; cursor?: string; limit?: number }
 
 	// Login
 	| { id?: string; type: "get_login_providers" }
@@ -103,6 +109,9 @@ export interface RpcSessionState {
 	sessionId: string;
 	sessionName?: string;
 	autoCompactionEnabled: boolean;
+	fastModeEnabled: boolean;
+	fastModeActive: boolean;
+	tokensPerSecond: number | null;
 	messageCount: number;
 	queuedMessageCount: number;
 	todoPhases: TodoPhase[];
@@ -131,6 +140,23 @@ export interface RpcPromptResultFrame {
 	type: "prompt_result";
 	id?: string;
 	agentInvoked: boolean;
+}
+
+export interface RpcReadyFrame {
+	type: "ready";
+	protocolVersion: 1;
+	supportedProtocolVersions: [1, 2];
+	maxFrameBytes: number;
+	maxReassembledFrameBytes: number;
+}
+
+export interface RpcChunkFrame {
+	type: "rpc_chunk";
+	chunkId: string;
+	index: number;
+	count: number;
+	byteLength: number;
+	data: string;
 }
 
 export interface RpcHandoffResult {
@@ -173,6 +199,15 @@ export interface RpcSubagentMessagesResult {
 
 // Success responses with data
 export type RpcResponse =
+	// Protocol
+	| {
+			id?: string;
+			type: "response";
+			command: "negotiate_protocol";
+			success: true;
+			data: { protocolVersion: 2 };
+	  }
+
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
 	| { id?: string; type: "response"; command: "steer"; success: true }
@@ -184,6 +219,13 @@ export type RpcResponse =
 
 	// State
 	| { id?: string; type: "response"; command: "get_state"; success: true; data: RpcSessionState }
+	| {
+			id?: string;
+			type: "response";
+			command: "set_fast_mode";
+			success: true;
+			data: { enabled: boolean; active: boolean };
+	  }
 	| {
 			id?: string;
 			type: "response";
@@ -290,6 +332,7 @@ export type RpcResponse =
 
 	// Messages
 	| { id?: string; type: "response"; command: "get_messages"; success: true; data: { messages: AgentMessage[] } }
+	| { id?: string; type: "response"; command: "get_messages_page"; success: true; data: RpcMessagesPage }
 
 	// Login
 	| {
@@ -301,8 +344,8 @@ export type RpcResponse =
 	  }
 	| { id?: string; type: "response"; command: "login"; success: true; data: { providerId: string } }
 
-	// Error response (any command can fail)
-	| { id?: string; type: "response"; command: string; success: false; error: string };
+	// Error response (any command can fail); `code` is an optional machine-readable reason.
+	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
 
 // ============================================================================
 // Subagent Events (stdout)
@@ -330,10 +373,22 @@ export type RpcSessionEventFrame = AgentSessionEvent | RpcSubagentFrame;
 // ============================================================================
 // Extension UI Events (stdout)
 // ============================================================================
+/** Positional presentation metadata for an RPC select option. */
+export interface RpcExtensionUISelectOptionDetail {
+	description?: string;
+}
 
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
-	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
+	| {
+			type: "extension_ui_request";
+			id: string;
+			method: "select";
+			title: string;
+			options: string[];
+			optionDetails?: RpcExtensionUISelectOptionDetail[];
+			timeout?: number;
+	  }
 	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
 	| {
 			type: "extension_ui_request";
@@ -400,6 +455,8 @@ export interface RpcHostToolDefinition {
 	description: string;
 	parameters: Record<string, unknown>;
 	hidden?: boolean;
+	/** How this host tool is presented when enabled; omission normalizes to `"discoverable"` at the adapter boundary. */
+	loadMode?: ToolLoadMode;
 }
 
 /** Emitted by the RPC server when it needs the host to execute a registered tool. */

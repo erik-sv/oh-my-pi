@@ -1,18 +1,25 @@
 import * as path from "node:path";
-import { formatHashlineHeader } from "@oh-my-pi/hashline";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@oh-my-pi/pi-natives";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { replaceTabs, Text } from "@oh-my-pi/pi-tui";
 import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { type } from "arktype";
-import { canonicalSnapshotKey, getFileSnapshotStore } from "../edit/file-snapshot-store";
+import { getEditStore } from "../edit/store";
 import { normalizeToLF } from "../edit/normalize";
+import { formatHashlineHeader } from "./hashline-format";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
-import { Ellipsis, fileHyperlink, framedBlock, renderStatusLine, truncateToWidth } from "../tui";
+import {
+	Ellipsis,
+	fileHyperlink,
+	framedBlock,
+	outputBlockContentWidth,
+	renderStatusLine,
+	truncateToWidth,
+} from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
@@ -32,7 +39,7 @@ import {
 	formatParseErrorsCountLabel,
 	PREVIEW_LIMITS,
 } from "./render-utils";
-import { queueResolveHandler } from "./resolve";
+import { PREVIEW_PENDING_NOTICE, queueResolveHandler } from "./resolve";
 import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 
@@ -283,8 +290,10 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				internalUrlAction: "rewrite",
 				settings: this.session.settings,
 				signal,
+				sessionFile: this.session.getSessionFile() ?? undefined,
 				localProtocolOptions: this.session.localProtocolOptions,
 				skills: this.session.skills,
+				rules: this.session.activeRules,
 				resolveExternalUrl: async rawPath => {
 					if (!parseReadUrlTarget(rawPath)) return undefined;
 					throw new ToolError(
@@ -347,12 +356,12 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
 			const hashContexts = new Map<string, { tag: string }>();
 			if (useHashLines) {
-				const snapshotStore = getFileSnapshotStore(this.session);
+				const snapshotStore = getEditStore(this.session);
 				for (const relativePath of fileList) {
 					const absolutePath = path.resolve(this.session.cwd, relativePath);
 					try {
 						const fullText = normalizeToLF(await Bun.file(absolutePath).text());
-						const tag = snapshotStore.record(canonicalSnapshotKey(absolutePath), fullText);
+						const tag = snapshotStore.recordSnapshot(absolutePath, fullText);
 						hashContexts.set(relativePath, { tag });
 					} catch {
 						// Best-effort: if a file disappears between ast-edit and rendering, emit plain line output.
@@ -464,12 +473,12 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						// so the model's next hashline edit anchors against fresh tags.
 						const freshTagLines: string[] = [];
 						if (useHashLines) {
-							const snapshotStore = getFileSnapshotStore(this.session);
+							const snapshotStore = getEditStore(this.session);
 							for (const relativePath of appliedFileList) {
 								const appliedAbsolutePath = path.resolve(this.session.cwd, relativePath);
 								try {
 									const fullText = normalizeToLF(await Bun.file(appliedAbsolutePath).text());
-									const freshTag = snapshotStore.record(canonicalSnapshotKey(appliedAbsolutePath), fullText);
+									const freshTag = snapshotStore.recordSnapshot(appliedAbsolutePath, fullText);
 									freshTagLines.push(formatHashlineHeader(relativePath, freshTag));
 								} catch {
 									// File disappeared between apply and re-read; skip its tag.
@@ -520,6 +529,9 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 						return toolResult(appliedDetails).text(text).done();
 					},
 				});
+				// The renderer's ⟨proposed⟩ badge is TUI-only; this line is the model's
+				// in-result signal that the diff above is staged, not applied.
+				outputLines.unshift(PREVIEW_PENDING_NOTICE, "");
 			}
 
 			const details: AstEditToolDetails = {
@@ -692,7 +704,7 @@ export const astEditToolRenderer = {
 		}
 		return framedBlock(uiTheme, width => {
 			const changeLines = buildChangeBody(changeGroups, Boolean(options.expanded), COLLAPSED_CHANGE_LIMIT, uiTheme);
-			const innerWidth = Math.max(1, width - 3);
+			const innerWidth = outputBlockContentWidth(width);
 			const bodyLines = [...changeLines, ...extraLines].map(l => truncateToWidth(l, innerWidth, Ellipsis.Omit));
 			while (bodyLines.length > 0 && bodyLines[0].trim() === "") bodyLines.shift();
 			return {

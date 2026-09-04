@@ -191,12 +191,53 @@ describe("latexToBlock (2-D layout)", () => {
 		expect(latexToBlock("x_q^q").map(line => line.trimEnd())).toEqual([" q", "x", " q"]);
 	});
 
+	it("boxes multi-letter script words instead of ragged Unicode glyphs", () => {
+		// t/u/r/n/s all have Unicode subscript forms, but the mixed glyph
+		// heights read ragged; words get a real lowered box.
+		expect(latexToBlock("N_{turns} + 1").map(line => line.trimEnd())).toEqual(["N      + 1", " turns"]);
+		expect(latexToBlock("x^{ab}").map(line => line.trimEnd())).toEqual([" ab", "x"]);
+		// Single letters and digits keep compact Unicode scripts.
+		expect(latexToBlock("x_i + y_1")).toEqual(["xᵢ + y₁"]);
+	});
+
 	it("pins both scripts of a tall base in one shared column", () => {
 		expect(latexToBlock("\\begin{bmatrix} a & b \\\\ c & d \\end{bmatrix}_0^T").map(line => line.trimEnd())).toEqual([
 			"⎡ a  b ⎤ᵀ",
 			"⎢      ⎥",
 			"⎣ c  d ⎦₀",
 		]);
+	});
+	it("draws a labeled underbrace with the baseline on the content", () => {
+		expect(latexToBlock("x + \\underbrace{a+b}_{\\text{sum}}").map(line => line.trimEnd())).toEqual([
+			"x + a+b",
+			"    ╰┬╯",
+			"    sum",
+		]);
+	});
+
+	it("draws a labeled overbrace above the content", () => {
+		expect(latexToBlock("\\overbrace{a+b}^{\\text{sum}} + x").map(line => line.trimEnd())).toEqual([
+			"sum",
+			"╭┴╮",
+			"a+b + x",
+		]);
+	});
+
+	it("centers content and label on the wider of the two", () => {
+		expect(latexToBlock("\\underbrace{ab}_{\\text{longer label}}").map(line => line.trimEnd())).toEqual([
+			"     ab",
+			"    ╰┬╯",
+			"longer label",
+		]);
+	});
+
+	it("draws an unlabeled underbrace", () => {
+		expect(latexToBlock("\\underbrace{a+b+c}").map(line => line.trimEnd())).toEqual(["a+b+c", "╰─┬─╯"]);
+	});
+
+	it("stacks \\overset above and \\underset below the base on its baseline", () => {
+		expect(latexToBlock("A \\overset{!}{=} B").map(line => line.trimEnd())).toEqual(["  !", "A = B"]);
+		expect(latexToBlock("A \\underset{0}{=} B").map(line => line.trimEnd())).toEqual(["A = B", "  0"]);
 	});
 
 	it("aligns align-environment rows on the & column", () => {
@@ -216,6 +257,43 @@ describe("latexToBlock (2-D layout)", () => {
 
 	it("splits top-level \\\\ into vertical rows", () => {
 		expect(latexToBlock("a \\\\ b")).toEqual(["a", "b"]);
+	});
+
+	it("keeps a \\frac intact when numerator and denominator are on separate source lines", () => {
+		// A top-level newline between `\frac{num}` and `{den}` is an argument
+		// continuation, not a row break — the fraction must stay stacked with a
+		// single bar between numerator and denominator (issue #7996).
+		expect(latexToBlock("\\frac{a}\n{b}")).toEqual([" a ", "───", " b "]);
+		expect(latexToBlock("\\frac\n{a}{b}")).toEqual([" a ", "───", " b "]);
+		expect(latexToBlock("\\frac{a}\n\\sqrt{b}")).toEqual(latexToBlock("\\frac{a}\\sqrt{b}"));
+		expect(latexToBlock("\\frac\na\nb")).toEqual([" a ", "───", " b "]);
+		expect(latexToBlock("x^\n\\alpha")).toEqual(["xᵅ"]);
+	});
+
+	it("preserves outer arity when an unbraced command is itself an argument", () => {
+		// `readArg` accepts a command plus its arguments as one outer argument.
+		// Whitespace introduced by preserved source newlines must stay inside the
+		// nested command rather than turning its first argument into the outer
+		// denominator.
+		const sqrtFraction = ["  ┌── ", " ╲│ a ", "──────", "  b   "];
+		expect(latexToBlock("\\frac\\sqrt{a}{b}")).toEqual(sqrtFraction);
+		expect(latexToBlock("\\frac\\sqrt {a} {b}")).toEqual(sqrtFraction);
+		expect(latexToBlock("\\frac\\sqrt\n{a}\n{b}")).toEqual(sqrtFraction);
+		expect(latexToBlock("\\frac\\frac{a}{b}\n{c}")).toEqual(["  a  ", " ─── ", "  b  ", "─────", "  c  "]);
+		expect(latexToBlock("\\frac\\frac\n{a}\n{b}\n{c}")).toEqual(["  a  ", " ─── ", "  b  ", "─────", "  c  "]);
+		expect(latexToBlock("\\frac\\hat{a}\n{b}")).toEqual([" â ", "───", " b "]);
+	});
+
+	it("still treats a top-level newline as a row break when it is not an argument continuation", () => {
+		// `lhs =` on its own source line stays a row above its block; two fractions
+		// on separate lines each start with `\frac`, so they stack as two rows.
+		expect(latexToBlock("y =\n\\frac{1}{2}")).toEqual(["y =", " 1 ", "───", " 2 "]);
+		expect(latexToBlock("\\frac{a}{b}\n\\frac{c}{d}")).toEqual([" a ", "───", " b ", " c ", "───", " d "]);
+		// A row that merely *opens* with a braced group is a real row break: no
+		// preceding command owes it an argument, so it must not fold into the row
+		// above (regression for PR #7997 review).
+		expect(latexToBlock("a\n{b+c}")).toEqual(["a  ", "b+c"]);
+		expect(latexToBlock("x+1\n{y+2}")).toEqual(["x+1", "y+2"]);
 	});
 
 	it("keeps \\color scope across a stacked fraction, painting the bar", () => {
@@ -239,6 +317,14 @@ describe("latexToBlock (2-D layout)", () => {
 
 	it("styles fonts across a stacked fraction (\\mathbf)", () => {
 		expect(latexToBlock("\\mathbf{\\frac{a}{b}}")).toEqual([" 𝐚 ", "───", " 𝐛 "]);
+	});
+
+	it("styles text-mode fonts across a stacked fraction", () => {
+		const lines = latexToBlock(String.raw`\textbf{\frac{a}{b}}`);
+
+		expect(lines.map(stripVTControlCharacters)).toEqual([" a ", "───", " b "]);
+		expect(lines[0]).toContain("\x1b[1m");
+		expect(lines[2]).toContain("\x1b[1m");
 	});
 
 	it("stacks limit operators inside styling wrappers", () => {

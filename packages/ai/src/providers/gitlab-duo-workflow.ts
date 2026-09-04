@@ -24,6 +24,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { toolWireSchema } from "../utils/schema/wire";
 import chatmlHistoryNote from "./gitlab-duo-workflow-chatml-note.md" with { type: "text" };
+import { redactSensitiveCredentials } from "./transform-messages";
 
 export const GITLAB_DUO_WORKFLOW_PROVIDER_ID = "gitlab-duo-agent";
 export const GITLAB_DUO_WORKFLOW_API = "gitlab-duo-agent";
@@ -914,12 +915,12 @@ function markGitLabDuoWorkflowSettingsEnsured(apiKey: string, baseUrl: string, c
 function hasGitLabDuoWorkflowExplicitNamespace(options: GitLabDuoWorkflowOptions): boolean {
 	return Boolean(
 		nonEmptyString(options.rootNamespaceId) ??
-			nonEmptyString(options.namespaceId) ??
-			nonEmptyString(Bun.env.GITLAB_DUO_NAMESPACE_ID) ??
-			nonEmptyString(options.projectId) ??
-			nonEmptyString(options.projectPath) ??
-			nonEmptyString(Bun.env.GITLAB_DUO_PROJECT_ID) ??
-			nonEmptyString(Bun.env.GITLAB_DUO_PROJECT_PATH),
+		nonEmptyString(options.namespaceId) ??
+		nonEmptyString(Bun.env.GITLAB_DUO_NAMESPACE_ID) ??
+		nonEmptyString(options.projectId) ??
+		nonEmptyString(options.projectPath) ??
+		nonEmptyString(Bun.env.GITLAB_DUO_PROJECT_ID) ??
+		nonEmptyString(Bun.env.GITLAB_DUO_PROJECT_PATH),
 	);
 }
 
@@ -1845,12 +1846,10 @@ function defaultGitLabDuoWorkflowWebSocketFactory(
 	url: string,
 	options: GitLabDuoWorkflowWebSocketFactoryOptions,
 ): GitLabDuoWorkflowWebSocketLike {
-	return new (
-		WebSocket as unknown as new (
-			url: string,
-			options: Bun.WebSocketOptions,
-		) => GitLabDuoWorkflowWebSocketLike
-	)(url, { headers: options.headers });
+	return new (WebSocket as unknown as new (
+		url: string,
+		options: Bun.WebSocketOptions,
+	) => GitLabDuoWorkflowWebSocketLike)(url, { headers: options.headers });
 }
 
 export function runGitLabDuoWorkflowSocket(
@@ -2581,10 +2580,13 @@ function isGitLabDuoWorkflowChatMlGoal(context: Context): boolean {
 // conversation sequences the way `Human:`/`Assistant:` are.
 function buildGitLabDuoWorkflowGoal(context: Context): string {
 	const conversation = buildGitLabDuoWorkflowConversationHistory(context.messages);
+	// The goal transcript bypasses transformMessages, so apply the outbound
+	// credential redaction here — the same scrub the flow-config system slot
+	// already receives — before the payload leaves the process.
 	if (conversation.length <= 1) {
-		return extractLatestUserPrompt(context.messages);
+		return redactSensitiveCredentials(extractLatestUserPrompt(context.messages));
 	}
-	return renderGitLabDuoWorkflowChatMl(conversation);
+	return redactSensitiveCredentials(renderGitLabDuoWorkflowChatMl(conversation));
 }
 
 const GITLAB_DUO_WORKFLOW_CHATML_START = "<|im_start|>";

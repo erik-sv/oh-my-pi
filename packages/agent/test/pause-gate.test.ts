@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import { agentLoop, agentPauseGate } from "@oh-my-pi/pi-agent-core";
 import type { AgentContext, AgentLoopConfig, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
-import { type } from "arktype";
 import { createUserMessage } from "./helpers";
 
 function identityConverter(messages: AgentMessage[]): Message[] {
@@ -36,21 +36,41 @@ describe("agentPauseGate", () => {
 		const context: AgentContext = { systemPrompt: ["Test"], messages: [], tools: [] };
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
+		const parked = Promise.withResolvers<void>();
+		const originalWait = agentPauseGate.waitUntilResumed;
+		agentPauseGate.waitUntilResumed = (signal?: AbortSignal) => {
+			parked.resolve();
+			return originalWait.call(agentPauseGate, signal);
+		};
 		expect(agentPauseGate.pause()).toBe(true);
 		expect(agentPauseGate.pause()).toBe(false); // already engaged
 
 		const result = agentLoop([createUserMessage("hi")], context, config, undefined, mock.stream).result();
-		await Bun.sleep(20);
+		await parked.promise;
 		expect(mock.calls.length).toBe(0); // parked before the first provider call
 
-		expect(agentPauseGate.resume()).toBeGreaterThanOrEqual(0);
-		const messages = await result;
-		expect(mock.calls.length).toBe(1);
-		expect(messages[messages.length - 1].role).toBe("assistant");
+		try {
+			expect(agentPauseGate.resume()).toBeGreaterThanOrEqual(0);
+			const messages = await result;
+			expect(mock.calls.length).toBe(1);
+			expect(messages[messages.length - 1].role).toBe("assistant");
+		} finally {
+			agentPauseGate.waitUntilResumed = originalWait;
+		}
 	});
 
 	it("holds tool execution at the tool boundary when paused mid-turn", async () => {
 		const executed: string[] = [];
+		// Signal exactly when the loop parks on the gate. A test-local manual
+		// patch (not vi.spyOn) so a sibling file's restoreAllMocks cannot remove
+		// it, and a gate regression that never parks hangs this await (test
+		// timeout) instead of racing past a vacuous assertion.
+		const toolBoundary = Promise.withResolvers<void>();
+		const originalWait = agentPauseGate.waitUntilResumed;
+		agentPauseGate.waitUntilResumed = (signal?: AbortSignal) => {
+			toolBoundary.resolve();
+			return originalWait.call(agentPauseGate, signal);
+		};
 		const mock = createMockModel({
 			responses: [
 				() => {
@@ -65,15 +85,19 @@ describe("agentPauseGate", () => {
 		const context: AgentContext = { systemPrompt: ["Test"], messages: [], tools: [makeEchoTool(executed)] };
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 
-		const result = agentLoop([createUserMessage("run echo")], context, config, undefined, mock.stream).result();
-		await Bun.sleep(20);
-		expect(executed).toEqual([]); // tool parked, not started
-		expect(mock.calls.length).toBe(1); // and no follow-up model call either
+		try {
+			const result = agentLoop([createUserMessage("run echo")], context, config, undefined, mock.stream).result();
+			await toolBoundary.promise;
+			expect(executed).toEqual([]); // tool parked, not started
+			expect(mock.calls.length).toBe(1); // and no follow-up model call either
 
-		agentPauseGate.resume();
-		await result;
-		expect(executed).toEqual(["frozen"]);
-		expect(mock.calls.length).toBe(2);
+			agentPauseGate.resume();
+			await result;
+			expect(executed).toEqual(["frozen"]);
+			expect(mock.calls.length).toBe(2);
+		} finally {
+			agentPauseGate.waitUntilResumed = originalWait;
+		}
 	});
 
 	it("lets an external abort unwind a parked run without releasing the gate", async () => {
@@ -82,6 +106,12 @@ describe("agentPauseGate", () => {
 		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
 		const abortController = new AbortController();
 
+		const parked = Promise.withResolvers<void>();
+		const originalWait = agentPauseGate.waitUntilResumed;
+		agentPauseGate.waitUntilResumed = (signal?: AbortSignal) => {
+			parked.resolve();
+			return originalWait.call(agentPauseGate, signal);
+		};
 		agentPauseGate.pause();
 		const result = agentLoop(
 			[createUserMessage("hi")],
@@ -90,19 +120,23 @@ describe("agentPauseGate", () => {
 			abortController.signal,
 			mock.stream,
 		).result();
-		await Bun.sleep(20);
+		await parked.promise;
 		abortController.abort("user interrupt");
 
 		// The run must terminate as aborted promptly (not stay parked until
 		// resume). The provider request itself carries the aborted signal, so
 		// whether the transport is entered at all is an implementation detail.
-		const messages = await result;
-		const last = messages[messages.length - 1];
-		expect(last.role).toBe("assistant");
-		if (last.role === "assistant") {
-			expect(last.stopReason).toBe("aborted");
+		try {
+			const messages = await result;
+			const last = messages[messages.length - 1];
+			expect(last.role).toBe("assistant");
+			if (last.role === "assistant") {
+				expect(last.stopReason).toBe("aborted");
+			}
+			expect(agentPauseGate.paused).toBe(true); // aborting one run never resumes the process
+		} finally {
+			agentPauseGate.waitUntilResumed = originalWait;
 		}
-		expect(agentPauseGate.paused).toBe(true); // aborting one run never resumes the process
 	});
 
 	it("re-parks a waiter when the gate is re-engaged in the same tick as resume", async () => {
@@ -114,7 +148,7 @@ describe("agentPauseGate", () => {
 
 		agentPauseGate.resume();
 		agentPauseGate.pause(); // re-engage before the waiter's microtask runs
-		await Bun.sleep(10);
+		await Promise.resolve();
 		expect(released).toBe(false);
 
 		agentPauseGate.resume();

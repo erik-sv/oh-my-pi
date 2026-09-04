@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
 	IndexedSessionStorage,
@@ -66,6 +67,11 @@ export interface SqlSessionStorageOptions {
 	 * external migration.
 	 */
 	createTable?: boolean;
+	/**
+	 * Absolute root containing session JSONL paths. Required before destructive
+	 * session deletion so a forged SQL path cannot target arbitrary directories.
+	 */
+	sessionRoot?: string;
 }
 
 interface DialectQueries {
@@ -324,11 +330,13 @@ function byteSuffix(chunks: readonly string[], maxBytes: number): string {
 export class SqlSessionStorage extends IndexedSessionStorage {
 	readonly #adapter: SqlSessionStorageAdapter;
 	readonly #table: string;
+	readonly #sessionRoot: string | undefined;
 
-	constructor(backend: SessionStorageBackend, adapter: SqlSessionStorageAdapter, table: string) {
+	constructor(backend: SessionStorageBackend, adapter: SqlSessionStorageAdapter, table: string, sessionRoot?: string) {
 		super(backend);
 		this.#adapter = adapter;
 		this.#table = table;
+		this.#sessionRoot = sessionRoot ? path.resolve(sessionRoot) : undefined;
 	}
 
 	/**
@@ -338,7 +346,7 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const backend = new SqlSessionStorageBackend(options);
-		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table);
+		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table, options.sessionRoot);
 		await storage.initialize();
 		return storage;
 	}
@@ -351,9 +359,18 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 		return this.#table;
 	}
 
-	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+	override async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		const sessionRoot = this.#sessionRoot;
+		if (!sessionRoot) {
+			throw new Error("SqlSessionStorage: sessionRoot is required for destructive session deletion");
+		}
+		const resolvedSessionPath = path.resolve(sessionPath);
+		const relative = path.relative(sessionRoot, resolvedSessionPath);
+		if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			throw new Error(`SqlSessionStorage: session path is outside the configured root: ${sessionPath}`);
+		}
 		await super.deleteSessionWithArtifacts(sessionPath);
-		const artifactsDir = sessionPath.slice(0, -6);
+		const artifactsDir = resolvedSessionPath.slice(0, -".jsonl".length);
 		try {
 			await fsp.rm(artifactsDir, { recursive: true, force: true });
 		} catch (err) {
@@ -469,35 +486,37 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async writeFull(path: string, content: string, mtimeMs: number, title?: SessionTitleUpdate): Promise<void> {
-		await this.#client.begin(async transaction => {
+		await this.#withPathLocks([path], async transaction => {
 			await transaction.unsafe(this.#q.delete, [path]);
 			await this.#insertChunks(transaction, path, splitChunks(content), mtimeMs, 0, title);
 		});
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void> {
-		await this.#client.unsafe(this.#q.updateTitle, [
-			title.title ?? null,
-			title.source ?? null,
-			title.updatedAt,
-			mtimeMs,
-			path,
-		]);
+		await this.#withPathLocks([path], async transaction => {
+			await transaction.unsafe(this.#q.updateTitle, [
+				title.title ?? null,
+				title.source ?? null,
+				title.updatedAt,
+				mtimeMs,
+				path,
+			]);
+		});
 	}
 
 	async append(path: string, line: string, mtimeMs: number): Promise<void> {
-		const firstChunks = (await this.#client.unsafe(this.#q.readFirstChunks, [path])) as ChunkRow[];
-		if (firstChunks.length === 1 && firstChunks[0].content === "") {
-			const title = rowTitleUpdate(firstChunks[0]);
-			await this.#client.begin(async transaction => {
+		await this.#withPathLocks([path], async transaction => {
+			const firstChunks = (await transaction.unsafe(this.#q.readFirstChunks, [path])) as ChunkRow[];
+			if (firstChunks.length === 1 && firstChunks[0].content === "") {
+				const title = rowTitleUpdate(firstChunks[0]);
 				await transaction.unsafe(this.#q.delete, [path]);
 				await this.#insertChunks(transaction, path, [line], mtimeMs, 0, title);
-			});
-			return;
-		}
-		const lastFirstSeq = firstChunks.length === 1 ? toNumber(firstChunks[0].seq) + 1 : undefined;
-		const seq = lastFirstSeq ?? (await this.#nextSeq(this.#client, path));
-		await this.#insertChunks(this.#client, path, [line], mtimeMs, seq);
+				return;
+			}
+			const lastFirstSeq = firstChunks.length === 1 ? toNumber(firstChunks[0].seq) + 1 : undefined;
+			const seq = lastFirstSeq ?? (await this.#nextSeq(transaction, path));
+			await this.#insertChunks(transaction, path, [line], mtimeMs, seq);
+		});
 	}
 
 	async truncate(path: string, mtimeMs: number): Promise<void> {
@@ -505,16 +524,43 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async remove(paths: string[]): Promise<void> {
-		await this.#client.begin(async transaction => {
+		await this.#withPathLocks(paths, async transaction => {
 			for (const path of paths) await transaction.unsafe(this.#q.delete, [path]);
 		});
 	}
 
 	async move(src: string, dst: string, mtimeMs: number): Promise<void> {
-		await this.#client.begin(async transaction => {
+		await this.#withPathLocks([src, dst], async transaction => {
+			const source = (await transaction.unsafe(this.#q.readFirstChunks, [src])) as ChunkRow[];
+			if (source.length === 0) throw enoent(src);
 			await transaction.unsafe(this.#q.delete, [dst]);
 			await transaction.unsafe(this.#q.rename, [dst, mtimeMs, src]);
 		});
+	}
+
+	async #withPathLocks<T>(
+		paths: readonly string[],
+		callback: (transaction: SqlSessionStorageTransactionClient) => Promise<T>,
+	): Promise<T> {
+		if (this.#adapter !== "postgres") return this.#client.begin(callback);
+
+		let failure: Error | undefined;
+		const result = await this.#client.begin(async transaction => {
+			await transaction.unsafe("SAVEPOINT omp_path_mutation");
+			try {
+				for (const path of [...new Set(paths)].sort()) {
+					const key = createHash("sha256").update(path).digest().readBigInt64BE().toString();
+					await transaction.unsafe("SELECT pg_advisory_xact_lock($1::bigint)", [key]);
+				}
+				return await callback(transaction);
+			} catch (error) {
+				failure = toError(error);
+				await transaction.unsafe("ROLLBACK TO SAVEPOINT omp_path_mutation");
+				return undefined as T;
+			}
+		});
+		if (failure) throw failure;
+		return result;
 	}
 
 	async #migrateDefaultLegacyRows(client: SqlSessionStorageClient): Promise<void> {

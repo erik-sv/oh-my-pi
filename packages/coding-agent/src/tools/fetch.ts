@@ -1,15 +1,14 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { FetchImpl, ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import { htmlToMarkdown } from "@oh-my-pi/pi-natives";
+import { type FetchImpl, getEnvApiKey, type ImageContent, type TextContent } from "@oh-my-pi/pi-ai";
+import { htmlToMarkdown, notebookToEditableText } from "@oh-my-pi/pi-natives";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { $which, ptree, truncate } from "@oh-my-pi/pi-utils";
-import { LRUCache } from "lru-cache/raw";
+import { type ArchiveFormat, listArchiveRoot, sniffArchiveFormat } from "@oh-my-pi/pi-utils/ar";
 import type { Settings } from "../config/settings";
-import { readEditableNotebookText } from "../edit/notebook";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { type Theme, theme } from "../modes/theme/theme";
 import type { ToolSession } from "../sdk";
@@ -19,17 +18,20 @@ import { renderStatusLine, urlHyperlink } from "../tui";
 import { CachedOutputBlock, markFramedBlockComponent } from "../tui/output-block";
 import { webpExclusionForModel } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
+import { CONVERTIBLE_EXTENSIONS } from "../utils/markit";
 import { ensureTool } from "../utils/tools-manager";
-import { type ArchiveFormat, listArchiveRoot, sniffArchiveFormat } from "../utils/zip";
+import { findFirecrawlApiKey, scrapeWithFirecrawl } from "../web/firecrawl";
 import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../web/parallel";
 import type { RenderResult, SpecialHandler } from "../web/scrapers/types";
 import { finalizeOutput, loadPage, looksLikeHtml, MAX_BYTES, MAX_OUTPUT_CHARS } from "../web/scrapers/types";
 import { convertWithMarkit, fetchBinary } from "../web/scrapers/utils";
+import { findCredential } from "../web/search/providers/utils";
 import { applyListLimit } from "./list-limit";
 import { formatStyledArtifactReference, type OutputMeta } from "./output-meta";
-import { isReadableUrlPath, type LineRange, parseLineRanges } from "./path-utils";
+import { isReadableUrlPath, type LineRange, parseLineRanges, parseTailCount } from "./path-utils";
+import type { ParsedSelector } from "./read-selector";
 import { formatBytes, formatExpandHint, getDomain, replaceTabs } from "./render-utils";
-import { listTables, looksLikeSqlite, renderTableList } from "./sqlite-reader";
+import { listTables, looksLikeSqlite, openSqliteReadConnection, renderTableList } from "./sqlite-reader";
 import { ToolAbortError, ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
@@ -39,20 +41,16 @@ import { clampTimeout } from "./tool-timeouts";
 // =============================================================================
 
 const FETCH_DEFAULT_MAX_LINES = 300;
-// Convertible document types handled by markit.
+// MIME types markit can convert — one per registered converter (pdf, docx,
+// pptx, xlsx, epub). Legacy `application/msword`, `application/vnd.ms-*`, and
+// `application/rtf` are intentionally absent: markit has no converter for them.
 const CONVERTIBLE_MIMES = new Set([
 	"application/pdf",
-	"application/msword",
-	"application/vnd.ms-powerpoint",
-	"application/vnd.ms-excel",
 	"application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 	"application/vnd.openxmlformats-officedocument.presentationml.presentation",
 	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-	"application/rtf",
 	"application/epub+zip",
 ]);
-
-const CONVERTIBLE_EXTENSIONS = new Set([".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".rtf", ".epub"]);
 
 const NOTEBOOK_MIMES = new Set(["application/x-ipynb+json"]);
 const NOTEBOOK_EXTENSIONS = new Set([".ipynb"]);
@@ -145,25 +143,22 @@ function normalizeUrl(url: string): string {
 	return url;
 }
 
-// URL line selectors mirror the file form: `:50`, `:50-100`, `:50+150`, `:5-10,20-30`, `:raw`,
-// or `:raw:N-M` / `:N-M:raw` to combine raw mode with a range. If a URL would otherwise look
-// like `host:port`, add a trailing slash before the selector (e.g. `https://example.com/:80`
+// URL line selectors mirror the file form: `:50`, `:50-100`, `:50+150`, `:5-10,20-30`, `:-60`,
+// `:raw`, or `:raw:N-M` / `:N-M:raw` to combine raw mode with a range. If a URL would otherwise
+// look like `host:port`, add a trailing slash before the selector (e.g. `https://example.com/:80`
 // to read line 80 of the document at `https://example.com/`).
 
+/** A readable external URL split from its trailing read selector. */
 export interface ParsedReadUrlTarget {
 	path: string;
-	raw: boolean;
-	offset?: number;
-	limit?: number;
-	/** Populated only when the selector carries 2+ ranges. Single-range stays on offset/limit. */
-	ranges?: readonly LineRange[];
+	sel: ParsedSelector;
 }
 
-/** Recognize a single selector token (`raw` or one/many line ranges). */
+/** Recognize a single selector token (`raw`, a tail, or one/many line ranges). */
 function isUrlSelectorToken(token: string): boolean {
 	if (token.toLowerCase() === "raw") return true;
 	try {
-		return parseLineRanges(token) !== null;
+		return parseLineRanges(token) !== null || parseTailCount(token) !== null;
 	} catch {
 		// `parseLineRanges` throws `ToolError` for malformed ranges (e.g. `5+0`). Only treat the
 		// token as a selector when it parses cleanly so URL ports like `:80` keep flowing
@@ -181,37 +176,37 @@ export function parseReadUrlTarget(readPath: string): ParsedReadUrlTarget | null
 	}
 
 	let raw = false;
-	let ranges: readonly LineRange[] | undefined;
-	for (const sel of embedded?.sels ?? []) {
-		if (sel.toLowerCase() === "raw") {
+	let ranges: [LineRange, ...LineRange[]] | undefined;
+	let tail: number | undefined;
+	for (const token of embedded?.sels ?? []) {
+		if (token.toLowerCase() === "raw") {
 			raw = true;
 			continue;
 		}
-		if (ranges !== undefined) {
+		if (ranges !== undefined || tail !== undefined) {
 			// Two range groups on the same URL (`…:5-10:20-30`) — combine with commas instead.
 			throw new ToolError(
 				`URL selector has multiple range groups; combine them with commas (e.g. \`:5-10,20-30\`).`,
 			);
 		}
-		const parsed = parseLineRanges(sel);
-		if (parsed === null) {
+		ranges = parseLineRanges(token) ?? undefined;
+		if (ranges !== undefined) continue;
+		const count = parseTailCount(token);
+		if (count === null) {
 			// Shouldn't happen — isUrlSelectorToken vetted it. Belt-and-suspenders.
-			throw new ToolError(`Invalid URL line selector: ${sel}`);
+			throw new ToolError(`Invalid URL line selector: ${token}`);
 		}
-		ranges = parsed;
+		tail = count;
 	}
 
-	if (!ranges || ranges.length === 0) return { path: urlPath, raw };
-	if (ranges.length === 1) {
-		const r = ranges[0];
-		return {
-			path: urlPath,
-			raw,
-			offset: r.startLine,
-			limit: r.endLine !== undefined ? r.endLine - r.startLine + 1 : undefined,
-		};
-	}
-	return { path: urlPath, raw, ranges };
+	const sel: ParsedSelector = ranges
+		? { kind: "lines", ranges, raw }
+		: tail !== undefined
+			? { kind: "tail", count: tail, raw }
+			: raw
+				? { kind: "raw" }
+				: { kind: "none" };
+	return { path: urlPath, sel };
 }
 
 /**
@@ -520,7 +515,7 @@ function cleanFeedText(text: string): string {
  * Parse RSS/Atom feed to markdown
  */
 async function parseFeedToMarkdown(content: string, maxItems = 10): Promise<string> {
-	const { parseHTML } = await import("linkedom");
+	const { parseHTML } = await import("@oh-my-pi/pi-utils/dom");
 	try {
 		const doc = parseHTML(content).document;
 
@@ -575,30 +570,50 @@ async function parseFeedToMarkdown(content: string, maxItems = 10): Promise<stri
 }
 
 /**
- * Cap on any single remote reader-mode request (Parallel, Jina) so a stalled
- * remote endpoint cannot consume the whole reader-mode budget and starve the
- * local fallback renderers (trafilatura, lynx, native). See #1449.
+ * Cap on any single remote reader-mode request (Parallel, Firecrawl, Jina) so a
+ * stalled remote endpoint cannot consume the whole reader-mode budget and starve
+ * the local fallback renderers (trafilatura, lynx, native). See #1449.
  */
 const REMOTE_READER_MAX_MS = 10_000;
+const JINA_MARKDOWN_MARKER = "Markdown Content:";
+const JINA_READER_MAX_BYTES = 2 * 1024 * 1024;
+
+function parseJinaReaderContent(responseBody: string): string | null {
+	const markerStart = responseBody.indexOf(JINA_MARKDOWN_MARKER);
+	if (markerStart < 0) return null;
+
+	const content = responseBody.slice(markerStart + JINA_MARKDOWN_MARKER.length).trim();
+	if (content.length < 100 || content.startsWith("Loading...") || content.startsWith("Please enable JavaScript")) {
+		return null;
+	}
+	return content;
+}
 
 /** Reader backends for {@link renderHtmlToText}, in default priority order. */
-export type FetchProvider = "native" | "trafilatura" | "lynx" | "parallel" | "jina";
+export type FetchProvider = "native" | "trafilatura" | "lynx" | "parallel" | "firecrawl" | "jina";
 
-const FETCH_PROVIDER_ORDER: readonly FetchProvider[] = ["native", "trafilatura", "lynx", "parallel", "jina"];
+const FETCH_PROVIDER_ORDER: readonly FetchProvider[] = [
+	"native",
+	"trafilatura",
+	"lynx",
+	"parallel",
+	"firecrawl",
+	"jina",
+];
 
 /**
  * Render HTML to markdown by trying reader backends in priority order: native
- * (in-process), trafilatura, lynx, Parallel, then Jina. The `providers.fetch`
- * setting picks the order — `auto` uses the default above; any specific backend
- * is tried first, then the remaining backends as fallbacks. Every backend's
- * output must clear the same quality gate (>100 non-whitespace chars and not
- * {@link isLowQualityOutput}) before it is accepted, otherwise the next backend
- * is tried.
+ * (in-process), trafilatura, lynx, Parallel, Firecrawl, then Jina. The
+ * `providers.fetch` setting picks the order — `auto` uses the default above; any
+ * specific backend is tried first, then the remaining backends as fallbacks.
+ * Every backend's output must clear the same quality gate (>100 non-whitespace
+ * chars and not {@link isLowQualityOutput}) before it is accepted, otherwise the
+ * next backend is tried.
  *
  * The overall `timeout` budget bounds the whole call; remote backends (Parallel,
- * Jina) are additionally capped at `REMOTE_READER_MAX_MS` so a hung endpoint
- * cannot starve later renderers — especially the purely-local native converter,
- * which always works on already-loaded HTML. Only a real `userSignal`
+ * Firecrawl, Jina) are additionally capped at `REMOTE_READER_MAX_MS` so a hung
+ * endpoint cannot starve later renderers — especially the purely-local native
+ * converter, which always works on already-loaded HTML. Only a real `userSignal`
  * cancellation aborts the chain (#1449).
  */
 export async function renderHtmlToText(
@@ -655,12 +670,25 @@ export async function renderHtmlToText(
 			const firstDocument = parallelResult.results[0];
 			return firstDocument ? getParallelExtractContent(firstDocument) : null;
 		},
+		firecrawl: async () => {
+			if (!findFirecrawlApiKey(storage)) return null;
+			return scrapeWithFirecrawl(url, { signal: remoteSignal(), fetch: fetchImpl }, storage);
+		},
 		jina: async () => {
+			const apiKey = findCredential(storage, getEnvApiKey("jina"), "jina");
+			const headers: Record<string, string> = {
+				Accept: "text/markdown",
+				"X-No-Cache": "true",
+			};
+			if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 			const response = await fetchImpl(`https://r.jina.ai/${url}`, {
-				headers: { Accept: "text/markdown" },
+				headers,
 				signal: remoteSignal(),
 			});
-			return response.ok ? await response.text() : null;
+			if (!response.ok) return null;
+			const contentLength = Number(response.headers.get("content-length"));
+			if (Number.isFinite(contentLength) && contentLength > JINA_READER_MAX_BYTES) return null;
+			return parseJinaReaderContent(await response.text());
 		},
 	};
 
@@ -862,8 +890,8 @@ async function withTempBinaryFile<T>(
 }
 
 async function renderNotebookPayload(bytes: Uint8Array, displayUrl: string): Promise<string> {
-	return withTempBinaryFile("omp-url-notebook-", ".ipynb", bytes, tempPath =>
-		readEditableNotebookText(tempPath, displayUrl),
+	return withTempBinaryFile("omp-url-notebook-", ".ipynb", bytes, async tempPath =>
+		notebookToEditableText(await Bun.file(tempPath).text(), displayUrl),
 	);
 }
 
@@ -871,8 +899,7 @@ async function renderSqlitePayload(bytes: Uint8Array): Promise<string> {
 	return withTempBinaryFile("omp-url-sqlite-", ".sqlite", bytes, async tempPath => {
 		let db: Database | null = null;
 		try {
-			db = new Database(tempPath, { readonly: true, strict: true });
-			db.run("PRAGMA busy_timeout = 3000");
+			db = await openSqliteReadConnection(tempPath);
 			const listLimit = applyListLimit(listTables(db), { limit: URL_SQLITE_LIST_LIMIT });
 			return renderTableList(listLimit.items);
 		} finally {
@@ -1419,7 +1446,8 @@ async function renderUrl(
 			throw new ToolAbortError();
 		}
 
-		// 5E: Render HTML via the reader-backend chain (native/trafilatura/lynx/parallel/jina)
+		// 5E: Render HTML via the reader-backend chain
+		// (native/trafilatura/lynx/parallel/firecrawl/jina)
 		const htmlResult = await renderHtmlToText(
 			finalUrl,
 			rawContent,
@@ -1553,22 +1581,13 @@ export interface ReadUrlToolDetails {
 	meta?: OutputMeta;
 }
 
-interface ReadUrlCacheEntry {
+interface ReadUrlEntry {
 	artifactId?: string;
 	artifactPath?: string;
-	contentPath?: string;
 	details: ReadUrlToolDetails;
 	image?: FetchImagePayload;
 	output: string;
 	content: string;
-}
-
-const READ_URL_CACHE_MAX_ENTRIES = 100;
-const readUrlCache = new LRUCache<string, ReadUrlCacheEntry>({ max: READ_URL_CACHE_MAX_ENTRIES });
-
-function getReadUrlCacheKey(session: ToolSession, requestedUrl: string, raw: boolean): string {
-	const scope = session.getSessionFile() ?? session.cwd;
-	return `${scope}::${raw ? "raw" : "rendered"}::${normalizeUrl(requestedUrl)}`;
 }
 
 async function findArtifactPath(session: ToolSession, artifactId: string): Promise<string | null> {
@@ -1584,25 +1603,6 @@ async function findArtifactPath(session: ToolSession, artifactId: string): Promi
 	}
 }
 
-async function readArtifactOutput(session: ToolSession, artifactId: string): Promise<string | null> {
-	const artifactPath = await findArtifactPath(session, artifactId);
-	return artifactPath ? await Bun.file(artifactPath).text() : null;
-}
-
-async function materializeReadUrlCacheEntry(
-	session: ToolSession,
-	entry: ReadUrlCacheEntry,
-): Promise<ReadUrlCacheEntry | null> {
-	if (entry.artifactId) {
-		const artifactOutput = await readArtifactOutput(session, entry.artifactId);
-		if (artifactOutput !== null) {
-			return { ...entry, output: artifactOutput };
-		}
-	}
-
-	return entry.output.length > 0 ? entry : null;
-}
-
 async function persistReadUrlArtifact(
 	session: ToolSession,
 	output: string,
@@ -1613,7 +1613,7 @@ async function persistReadUrlArtifact(
 	return artifact;
 }
 
-async function ensureReadUrlCacheArtifact(session: ToolSession, entry: ReadUrlCacheEntry): Promise<ReadUrlCacheEntry> {
+async function ensureReadUrlArtifact(session: ToolSession, entry: ReadUrlEntry): Promise<ReadUrlEntry> {
 	if (entry.artifactId && entry.artifactPath) return entry;
 	if (entry.artifactId) {
 		const artifactPath = await findArtifactPath(session, entry.artifactId);
@@ -1632,19 +1632,7 @@ function readUrlContentExtension(finalUrl: string): string {
 	}
 }
 
-async function ensureReadUrlContentFile(
-	session: ToolSession,
-	entry: ReadUrlCacheEntry,
-	raw: boolean,
-): Promise<ReadUrlCacheEntry> {
-	if (entry.contentPath) {
-		try {
-			await Bun.file(entry.contentPath).stat();
-			return entry;
-		} catch {
-			// Recreate below when the cached scratch file was removed.
-		}
-	}
+async function materializeReadUrlContent(session: ToolSession, entry: ReadUrlEntry, raw: boolean): Promise<string> {
 	const root = session.getArtifactsDir?.();
 	if (!root) {
 		throw new ToolError("Cannot search URL output because this session cannot materialize read artifacts.");
@@ -1654,23 +1642,19 @@ async function ensureReadUrlContentFile(
 	const hash = Bun.hash(`${raw ? "raw" : "rendered"}:${entry.details.finalUrl}`).toString(36);
 	const contentPath = path.join(dir, `${hash}${readUrlContentExtension(entry.details.finalUrl)}`);
 	await Bun.write(contentPath, entry.content);
-	return { ...entry, contentPath };
+	return contentPath;
 }
 
-function cacheReadUrlEntry(session: ToolSession, requestedUrl: string, raw: boolean, entry: ReadUrlCacheEntry): void {
-	readUrlCache.set(getReadUrlCacheKey(session, requestedUrl, raw), entry);
-	readUrlCache.set(getReadUrlCacheKey(session, entry.details.finalUrl, raw), entry);
-}
-
-async function buildReadUrlCacheEntry(
+/** Fetch and render a URL for a read or search operation. */
+export async function fetchReadUrl(
 	session: ToolSession,
 	params: { path: string; raw?: boolean },
 	signal?: AbortSignal,
 	options?: { ensureArtifact?: boolean },
-): Promise<ReadUrlCacheEntry> {
+): Promise<ReadUrlEntry> {
 	const { path: url, raw = false } = params;
 
-	const effectiveTimeout = clampTimeout("fetch", 30);
+	const effectiveTimeout = clampTimeout("fetch", 30, session.settings.get("tools.maxTimeout"));
 
 	if (signal?.aborted) {
 		throw new ToolAbortError();
@@ -1708,30 +1692,6 @@ async function buildReadUrlCacheEntry(
 	};
 }
 
-export async function loadReadUrlCacheEntry(
-	session: ToolSession,
-	params: { path: string; raw?: boolean },
-	signal?: AbortSignal,
-	options?: { ensureArtifact?: boolean; preferCached?: boolean },
-): Promise<ReadUrlCacheEntry> {
-	const raw = params.raw ?? false;
-	const cached = readUrlCache.get(getReadUrlCacheKey(session, params.path, raw));
-	if (options?.preferCached && cached) {
-		const prepared = options.ensureArtifact ? await ensureReadUrlCacheArtifact(session, cached) : cached;
-		const materialized = await materializeReadUrlCacheEntry(session, prepared);
-		if (materialized) {
-			cacheReadUrlEntry(session, params.path, raw, materialized);
-			return materialized;
-		}
-	}
-
-	const fresh = await buildReadUrlCacheEntry(session, params, signal, {
-		ensureArtifact: options?.ensureArtifact,
-	});
-	cacheReadUrlEntry(session, params.path, raw, fresh);
-	return fresh;
-}
-
 /** Materialize rendered URL body text to a local file for tools that require filesystem paths. */
 export async function materializeReadUrlToFile(
 	session: ToolSession,
@@ -1741,13 +1701,9 @@ export async function materializeReadUrlToFile(
 	if (!session.settings.get("fetch.enabled")) {
 		throw new ToolError("URL reads are disabled by settings.");
 	}
-	const cacheEntry = await loadReadUrlCacheEntry(session, params, signal, { preferCached: true });
-	const materialized = await ensureReadUrlContentFile(session, cacheEntry, params.raw ?? false);
-	cacheReadUrlEntry(session, params.path, params.raw ?? false, materialized);
-	if (!materialized.contentPath) {
-		throw new ToolError("Cannot search URL output because this session cannot materialize read artifacts.");
-	}
-	return { path: materialized.contentPath, details: materialized.details };
+	const entry = await fetchReadUrl(session, params, signal);
+	const contentPath = await materializeReadUrlContent(session, entry, params.raw ?? false);
+	return { path: contentPath, details: entry.details };
 }
 
 function buildUrlReadOutput(result: FetchRenderResult, content: string): string {
@@ -1768,36 +1724,35 @@ export async function executeReadUrl(
 	params: { path: string; raw?: boolean },
 	signal?: AbortSignal,
 ): Promise<AgentToolResult<ReadUrlToolDetails>> {
-	let cacheEntry = await loadReadUrlCacheEntry(session, params, signal, { preferCached: true });
-	const truncation = truncateHead(cacheEntry.output, {
+	let entry = await fetchReadUrl(session, params, signal);
+	const truncation = truncateHead(entry.output, {
 		maxBytes: DEFAULT_MAX_BYTES,
 		maxLines: FETCH_DEFAULT_MAX_LINES,
 	});
 	const needsArtifact = truncation.truncated;
-	if (needsArtifact && !cacheEntry.artifactId) {
-		cacheEntry = await ensureReadUrlCacheArtifact(session, cacheEntry);
-		cacheReadUrlEntry(session, params.path, params.raw ?? false, cacheEntry);
+	if (needsArtifact && !entry.artifactId) {
+		entry = await ensureReadUrlArtifact(session, entry);
 	}
-	const output = needsArtifact ? truncation.content : cacheEntry.output;
+	const output = needsArtifact ? truncation.content : entry.output;
 	const details: ReadUrlToolDetails = {
-		...cacheEntry.details,
-		truncated: Boolean(cacheEntry.details.truncated || needsArtifact),
+		...entry.details,
+		truncated: Boolean(entry.details.truncated || needsArtifact),
 	};
 
 	const contentBlocks: Array<TextContent | ImageContent> = [{ type: "text", text: output }];
-	if (cacheEntry.image) {
-		contentBlocks.push({ type: "image", data: cacheEntry.image.data, mimeType: cacheEntry.image.mimeType });
+	if (entry.image) {
+		contentBlocks.push({ type: "image", data: entry.image.data, mimeType: entry.image.mimeType });
 	}
 
 	const resultBuilder = toolResult(details).content(contentBlocks).sourceUrl(details.finalUrl);
 	if (needsArtifact) {
-		resultBuilder.truncation(truncation, { direction: "head", artifactId: cacheEntry.artifactId });
-	} else if (cacheEntry.details.truncated) {
-		const outputLines = cacheEntry.output.split("\n").length;
-		const outputBytes = Buffer.byteLength(cacheEntry.output, "utf-8");
+		resultBuilder.truncation(truncation, { direction: "head", artifactId: entry.artifactId });
+	} else if (entry.details.truncated) {
+		const outputLines = entry.output.split("\n").length;
+		const outputBytes = Buffer.byteLength(entry.output, "utf-8");
 		const totalBytes = Math.max(outputBytes + 1, MAX_OUTPUT_CHARS + 1);
 		const totalLines = outputLines + 1;
-		resultBuilder.truncationFromText(cacheEntry.output, {
+		resultBuilder.truncationFromText(entry.output, {
 			direction: "tail",
 			totalLines,
 			totalBytes,

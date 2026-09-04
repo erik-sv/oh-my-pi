@@ -17,7 +17,7 @@ import { githubRenderer } from "./tools/github";
 import { globRenderer } from "./tools/glob";
 import { goalRenderer } from "./tools/goal";
 import { grepRenderer } from "./tools/grep";
-import { inspectImageRenderer } from "./tools/inspect-image";
+import { hubRenderer } from "./tools/hub";
 import { ircRenderer } from "./tools/irc";
 import { jobRenderer } from "./tools/job";
 import { lspRenderer } from "./tools/lsp";
@@ -25,11 +25,8 @@ import { recallRenderer } from "./tools/memory-recall";
 import { reflectRenderer } from "./tools/memory-reflect";
 import { retainRenderer } from "./tools/memory-retain";
 import { readRenderer } from "./tools/read";
-import { reportFindingRenderer } from "./tools/report-finding";
 import { reportToolIssueRenderer } from "./tools/report-tool-issue";
 import { resolveRenderer } from "./tools/resolve";
-import { searchBm25Renderer } from "./tools/search-bm25";
-import { sshRenderer } from "./tools/ssh";
 import { taskRenderer } from "./tools/task";
 import { todoRenderer } from "./tools/todo";
 import { webSearchRenderer } from "./tools/web-search";
@@ -57,7 +54,7 @@ const RENDERERS: Record<string, ToolRenderer> = {
 	generate_image: generateImageRenderer,
 	github: githubRenderer,
 	goal: goalRenderer,
-	inspect_image: inspectImageRenderer,
+	hub: hubRenderer,
 	irc: ircRenderer,
 	job: jobRenderer,
 	await: jobRenderer,
@@ -68,13 +65,12 @@ const RENDERERS: Record<string, ToolRenderer> = {
 	reflect: reflectRenderer,
 	retain: retainRenderer,
 	read: readRenderer,
-	report_finding: reportFindingRenderer,
 	report_tool_issue: reportToolIssueRenderer,
 	resolve: resolveRenderer,
+	reject: resolveRenderer,
+	propose: resolveRenderer,
 	grep: grepRenderer,
 	search: grepRenderer,
-	search_tool_bm25: searchBm25Renderer,
-	ssh: sshRenderer,
 	task: taskRenderer,
 	todo: todoRenderer,
 	web_search: webSearchRenderer,

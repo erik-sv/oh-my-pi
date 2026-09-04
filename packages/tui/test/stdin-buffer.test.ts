@@ -434,6 +434,7 @@ describe("StdinBuffer", () => {
 
 	describe("Bracketed Paste", () => {
 		let emittedPaste: string[] = [];
+		let emittedPasteEnters: (string | undefined)[] = [];
 
 		beforeEach(() => {
 			buffer = new StdinBuffer({ timeout: 10 });
@@ -446,8 +447,10 @@ describe("StdinBuffer", () => {
 
 			// Collect paste events
 			emittedPaste = [];
-			buffer.on("paste", (data: string) => {
+			emittedPasteEnters = [];
+			buffer.on("paste", (data: string, enter?: string) => {
 				emittedPaste.push(data);
+				emittedPasteEnters.push(enter);
 			});
 		});
 
@@ -518,7 +521,54 @@ describe("StdinBuffer", () => {
 			processInput("\x1b[200~paste\x1b");
 			processInput("[201~x");
 			expect(emittedPaste).toEqual(["paste"]);
+			expect(emittedPasteEnters).toEqual([undefined]);
 			expect(emittedSequences).toEqual(["x"]);
+		});
+
+		// A paste-and-Enter burst arrives in one read from automation and from
+		// terminals that batch input. Splitting it lets an overlay the paste opens
+		// swallow the Enter, so the Enter stays on the paste event in both keyboard
+		// encodings; anything else after the paste keeps the normal data route.
+		for (const [label, enter] of [
+			["legacy \\r", "\r"],
+			["legacy \\n", "\n"],
+			["kitty CSI-u", "\x1b[13u"],
+			["kitty CSI-u with explicit no-modifier field", "\x1b[13;1u"],
+		] as const) {
+			it(`keeps a same-read Enter (${label}) on the paste event`, () => {
+				processInput(`\x1b[200~paste\x1b[201~${enter}`);
+				expect(emittedPaste).toEqual(["paste"]);
+				expect(emittedPasteEnters).toEqual([enter]);
+				expect(emittedSequences).toEqual([]);
+			});
+		}
+
+		it("routes bytes after the attached Enter as ordinary input", () => {
+			processInput("\x1b[200~paste\x1b[201~\rnext");
+			expect(emittedPasteEnters).toEqual(["\r"]);
+			expect(emittedSequences).toEqual(["n", "e", "x", "t"]);
+		});
+
+		for (const [label, sequence] of [
+			["a modified kitty Enter", "\x1b[13;2u"],
+			["a DA1 terminal report", "\x1b[?1;2c"],
+			["an arrow key", "\x1b[A"],
+			["printable text", "x"],
+		] as const) {
+			it(`leaves ${label} after a paste on the data route`, () => {
+				processInput(`\x1b[200~paste\x1b[201~${sequence}`);
+				expect(emittedPaste).toEqual(["paste"]);
+				expect(emittedPasteEnters).toEqual([undefined]);
+				expect(emittedSequences).toEqual([sequence]);
+			});
+		}
+
+		it("does not attach an Enter that arrives in a later read", async () => {
+			processInput("\x1b[200~paste\x1b[201~");
+			processInput("\r");
+			expect(emittedPasteEnters).toEqual([undefined]);
+			await waitUntil(() => emittedSequences.length === 1);
+			expect(emittedSequences).toEqual(["\r"]);
 		});
 
 		it("does not end the paste on a partial end-marker prefix in the body", () => {
@@ -541,6 +591,117 @@ describe("StdinBuffer", () => {
 
 			expect(emittedPaste).toEqual([content]);
 			expect(emittedSequences).toEqual([]);
+		});
+	});
+
+	describe("Raw multiline paste burst (issue #5841)", () => {
+		let emittedPaste: string[] = [];
+
+		beforeEach(() => {
+			buffer = new StdinBuffer({ timeout: 10 });
+			emittedSequences = [];
+			buffer.on("data", (sequence: string) => {
+				emittedSequences.push(sequence);
+			});
+			emittedPaste = [];
+			buffer.on("paste", (data: string) => {
+				emittedPaste.push(data);
+			});
+		});
+
+		it("coalesces an unbracketed CR-delimited burst into one paste instead of per-line submits", () => {
+			// Codex desktop delivers Cmd+V without \x1b[200~…\x1b[201~ markers, so
+			// each interior CR would otherwise fire a submit and split the block.
+			processInput("line 1\rline 2\rline 3");
+			expect(emittedPaste).toEqual(["line 1\rline 2\rline 3"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("coalesces an unbracketed LF-delimited burst too", () => {
+			processInput("line 1\nline 2\nline 3");
+			expect(emittedPaste).toEqual(["line 1\nline 2\nline 3"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("coalesces a CRLF-delimited three-line burst", () => {
+			processInput("line 1\r\nline 2\r\nline 3");
+			expect(emittedPaste).toEqual(["line 1\r\nline 2\r\nline 3"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("coalesces one raw paste split across adjacent stdin reads", () => {
+			processInput("line 1\r");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+
+			processInput("line 2\rline 3");
+			expect(emittedPaste).toEqual(["line 1\rline 2\rline 3"]);
+			expect(emittedSequences).toEqual([]);
+		});
+
+		it("coalesces a paste whose first line was already delivered before a break-only read", () => {
+			processInput("line 1");
+			processInput("\r");
+			processInput("line 2\rline 3");
+
+			expect(emittedSequences.join("")).toBe("line 1");
+			expect(emittedPaste).toEqual(["\rline 2\rline 3"]);
+		});
+
+		it("leaves a single Enter batched with a following keystroke on the normal path", async () => {
+			// The event loop can batch one Enter plus the next typed char into a
+			// single stdin read; that is byte-identical to a two-line paste, so it
+			// must keep the Enter's submit rather than coalesce (PR #5843 review).
+			processInput("a\rb");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+			await waitUntil(() => emittedSequences.length === 3);
+			expect(emittedSequences).toEqual(["a", "\r", "b"]);
+		});
+
+		it("leaves a two-line burst on the normal path (one interior break is ambiguous)", async () => {
+			processInput("foo\rbar");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+			await waitUntil(() => emittedSequences.length === 7);
+			expect(emittedSequences).toEqual(["f", "o", "o", "\r", "b", "a", "r"]);
+		});
+
+		it("leaves a lone Enter as a normal submit keypress", async () => {
+			processInput("\r");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+			await waitUntil(() => emittedSequences.length === 1);
+			expect(emittedSequences).toEqual(["\r"]);
+		});
+
+		it("leaves typed text with a trailing Enter on the normal path", async () => {
+			processInput("hello\r");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+			await waitUntil(() => emittedSequences.length === 6);
+			expect(emittedSequences).toEqual(["h", "e", "l", "l", "o", "\r"]);
+		});
+
+		it("does not coalesce a run of bare Enters", async () => {
+			processInput("\r\r");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual([]);
+			await waitUntil(() => emittedSequences.length === 2);
+			expect(emittedSequences).toEqual(["\r", "\r"]);
+		});
+
+		it("keeps a single-line burst on the per-character data path", () => {
+			processInput("hello world");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences.join("")).toBe("hello world");
+		});
+
+		it("does not treat an escape-bearing chunk as a raw burst", () => {
+			// A CSI arrow key next to a CR must keep its escape parsing.
+			processInput("\x1b[A\rx");
+			expect(emittedPaste).toEqual([]);
+			expect(emittedSequences).toEqual(["\x1b[A", "\r", "x"]);
 		});
 	});
 
@@ -647,30 +808,81 @@ describe("StdinBuffer", () => {
 			expect(buffer.getBuffer()).toBe("");
 		});
 
-		it("caps an unterminated OSC delivered as one oversized chunk and keeps parsing", () => {
-			// MAX_STRING_SEQ_BYTES = 16 MiB. A single chunk whose OSC payload
-			// exceeds the cap with no BEL/ST must cap-flush the capped prefix
-			// as ONE raw sequence (progress guaranteed, scan bounded to the
-			// cap — not the whole chunk), deliver the tail per scalar, and
-			// leave the buffer clean so later input still parses.
+		it("discards an unterminated OSC delivered as one oversized chunk instead of typing its tail", () => {
+			// MAX_STRING_SEQ_BYTES = 16 MiB. A chunk whose OSC payload exceeds
+			// the cap with no BEL/ST is torn protocol data: delivering it as
+			// raw sequences used to type the tail into the focused component
+			// as thousands of keystrokes. The junk head is dropped and discard
+			// mode swallows everything up to the stream's own terminator.
 			const cap = 16 * 1024 * 1024;
 			const head = "\x1b]5522;";
-			const tail = "xy";
-			// Total pre-tail length is exactly `cap`, so the cap-flush consumes
-			// the whole unterminated sequence and only `tail` remains.
-			processInput(`${head}${"a".repeat(cap - head.length)}${tail}`);
+			processInput(`${head}${"a".repeat(cap - head.length)}xy`);
 
-			expect(emittedSequences.length).toBe(1 + tail.length);
-			expect(emittedSequences[0]!.length).toBe(cap);
-			expect(emittedSequences[0]!.startsWith("\x1b]5522;")).toBe(true);
-			expect(emittedSequences.slice(1)).toEqual(["x", "y"]);
+			expect(emittedSequences).toEqual([]);
 			expect(buffer.getBuffer()).toBe("");
 
-			// Parser state is clean: a normal OSC afterwards completes.
-			emittedSequences.length = 0;
-			processInput("\x1b]z\x07");
-			expect(emittedSequences).toEqual(["\x1b]z\x07"]);
+			// Still mid-string: further payload is swallowed, not typed.
+			processInput("zzzz");
+			expect(emittedSequences).toEqual([]);
+
+			// The torn string's own terminator ends discard mode; input after
+			// it parses normally.
+			processInput("tail\x1b\\\x1b]z\x07abc");
+			expect(emittedSequences).toEqual(["\x1b]z\x07", "a", "b", "c"]);
 			expect(buffer.getBuffer()).toBe("");
+		});
+	});
+
+	describe("Torn String Sequences (kitty OSC 5522 paste spam)", () => {
+		it("swallows a torn kitty OSC 5522 packet instead of typing its base64 tail", async () => {
+			// Regression: a stall past the incomplete-sequence flush window mid
+			// packet during a kitty OSC 5522 clipboard read (image paste) tore
+			// the packet — the flushed head reached the editor as an unknown
+			// escape and the packet's remaining base64 was typed into the
+			// composer as plain text, while the read state machine still
+			// completed and inserted the corrupt image: image chip + base64
+			// spam.
+			setKittyProtocolActive(true);
+			buffer.destroy();
+			buffer = new StdinBuffer({ timeout: 5, partialHoldTimeout: 5 });
+			buffer.on("data", (sequence: string) => {
+				emittedSequences.push(sequence);
+			});
+
+			const okPacket = "\x1b]5522;type=read:status=OK\x1b\\";
+			processInput(`${okPacket}\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;${"A".repeat(512)}`);
+			expect(emittedSequences).toEqual([okPacket]);
+
+			// Stall past timeout + partial hold: the torn head is dropped, not
+			// delivered as a key.
+			await waitUntil(() => buffer.getBuffer().length === 0);
+			expect(emittedSequences).toEqual([okPacket]);
+
+			// The packet tail (base64 + ST) arrives after the stall: swallowed,
+			// not typed. The next packet is delivered intact.
+			processInput(`${"B".repeat(512)}\x1b\\`);
+			const donePacket = "\x1b]5522;type=read:status=DONE\x1b\\";
+			processInput(donePacket);
+			expect(emittedSequences).toEqual([okPacket, donePacket]);
+		});
+
+		it("detects a split ST terminator while discarding a torn string tail", async () => {
+			setKittyProtocolActive(true);
+			buffer.destroy();
+			buffer = new StdinBuffer({ timeout: 5, partialHoldTimeout: 5 });
+			buffer.on("data", (sequence: string) => {
+				emittedSequences.push(sequence);
+			});
+
+			processInput("\x1b]5522;type=read:status=DATA:mime=Lg==;partial");
+			await waitUntil(() => buffer.getBuffer().length === 0);
+			expect(emittedSequences).toEqual([]);
+
+			// Terminator split across reads: trailing ESC held, backslash in
+			// the next chunk completes ST and what follows resumes as keys.
+			processInput("tail\x1b");
+			processInput("\\ok");
+			expect(emittedSequences).toEqual(["o", "k"]);
 		});
 	});
 

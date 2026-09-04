@@ -1,14 +1,17 @@
-import { afterEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
+	disposeTerminalTitleState,
 	generateSessionTitle,
+	setExtensionTerminalTitle,
 	setSessionTerminalTitle,
-	startSessionTerminalTitleAnimation,
-	stopSessionTerminalTitleAnimation,
+	setTerminalTitle,
+	setTerminalTitleState,
 } from "@oh-my-pi/pi-coding-agent/utils/title-generator";
 import { logger, setTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { mockWindowsConsoleTitle, type WindowsConsoleTitleMock } from "./terminal-title-test-utils";
 
 function getModelOrThrow(id: string): Model<Api> {
 	const model = getBundledModel("anthropic", id);
@@ -47,41 +50,7 @@ function createRegistry(model: Model<Api>) {
 	} as never;
 }
 
-function captureTerminalTitleWrites(): { writes: string[]; restore: () => void } {
-	const originalIsTTY = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
-	const originalWrite = process.stdout.write;
-	const previousHeadless = setTerminalHeadless(false);
-	const writes: string[] = [];
-	Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
-	process.stdout.write = ((chunk: string | Uint8Array): boolean => {
-		writes.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
-		return true;
-	}) as typeof process.stdout.write;
-	return {
-		writes,
-		restore: () => {
-			setTerminalHeadless(previousHeadless);
-			process.stdout.write = originalWrite;
-			if (originalIsTTY) {
-				Object.defineProperty(process.stdout, "isTTY", originalIsTTY);
-			} else {
-				Reflect.deleteProperty(process.stdout, "isTTY");
-			}
-		},
-	};
-}
-
-function parseTerminalTitleWrite(write: string | undefined): string {
-	expect(write).toBeDefined();
-	const text = write!;
-	expect(text.startsWith("\x1b]0;")).toBe(true);
-	expect(text.endsWith("\x07")).toBe(true);
-	return text.slice(4, -1);
-}
-
 afterEach(() => {
-	stopSessionTerminalTitleAnimation();
-	vi.useRealTimers();
 	vi.restoreAllMocks();
 });
 
@@ -458,6 +427,25 @@ describe("title generator", () => {
 		expect(title).toBe("Fix login button on mobile");
 	});
 
+	it.each(["Here's a thinking process:", "Thinking process:", "Reasoning process:"])(
+		"rejects a markerless prose thinking preamble: %s",
+		async responseText => {
+			const model = getModelFor("deepseek", "deepseek-v4-pro");
+			vi.spyOn(ai, "completeSimple").mockResolvedValue({
+				stopReason: "stop",
+				content: [{ type: "text", text: responseText }],
+			} as never);
+
+			const title = await generateSessionTitle(
+				"the login button is broken on mobile",
+				createRegistry(model),
+				createSettings(model),
+			);
+
+			expect(title).toBeNull();
+		},
+	);
+
 	it("preserves a markerless title that mentions a <think> tag", async () => {
 		const model = getModelFor("deepseek", "deepseek-v4-pro");
 		vi.spyOn(ai, "completeSimple").mockResolvedValue({
@@ -589,24 +577,195 @@ describe("title generator", () => {
 		expect(mockComplete).toHaveBeenCalled();
 		expect(mockComplete.mock.calls[0]?.[0]).toBe(smolModel);
 	});
+});
 
-	it("animates the terminal title icon while assistant work is active", () => {
+// The terminal title runtime is a module-global. `emitTerminalTitle()` composes
+// the emitted OSC title from three inputs — an extension override, a run-state
+// separator (spinner frame, static Windows `:`, `>`, or `!` between the `π`
+// brand and the session label), and the session label — and writes it to
+// `process.stdout` as `ESC]0;<title>BEL`. These tests pin the observable
+// contract at that sink: what string actually reaches the terminal after a
+// given sequence of the exported state transitions.
+//
+// Two seams must be opened for the real write to happen under `bun test`:
+//   - `isTerminalHeadless()` defaults to true in the test runtime and short-
+//     circuits `setTerminalTitle` before any write; we opt out with
+//     `setTerminalHeadless(false)` and restore it.
+//   - `setTerminalTitle` also no-ops unless `process.stdout.isTTY`; we force it.
+
+const OSC_TITLE_RE = /\x1b\]0;([\s\S]*?)\x07/;
+
+// Braille spinner frames used by the `working` state (mirrors the module's
+// private TITLE_SPINNER_FRAMES); a clobbered override would surface one of these.
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+describe("terminal title runtime", () => {
+	let writes: string[] = [];
+	let stdoutSpy: { mockRestore(): void } | undefined;
+	let prevHeadless = false;
+	let ttyDescriptor: PropertyDescriptor | undefined;
+	let windowsTitleMock: WindowsConsoleTitleMock | undefined;
+
+	// Titles emitted (newest last) since the last reset of `writes`; used across
+	// every assertion, so the OSC extraction lives here rather than at each site.
+	function emittedTitles(): string[] {
+		return writes.map(payload => OSC_TITLE_RE.exec(payload)?.[1]).filter((t): t is string => t !== undefined);
+	}
+
+	beforeEach(() => {
+		// Deterministic clock so the real spinner interval can be advanced without
+		// a wall-clock wait.
 		vi.useFakeTimers();
-		const capture = captureTerminalTitleWrites();
+
+		// Force the real write path: not headless, stdout is a TTY.
+		prevHeadless = setTerminalHeadless(false);
+		ttyDescriptor = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+
+		windowsTitleMock = mockWindowsConsoleTitle();
+		writes = [];
+		stdoutSpy = spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+			writes.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk as Uint8Array));
+			return true;
+		});
+
+		// Drive the module-global back to a known state from the public API so
+		// the tests are order-independent: clear any override + session base and
+		// settle the run state to idle.
+		setSessionTerminalTitle(undefined);
+		setTerminalTitleState("idle");
+
+		// Discard the reset's own emissions; each test asserts only its own writes.
+		writes.length = 0;
+	});
+
+	afterEach(() => {
+		// Stop any spinner timer started during a test before tearing spies down.
+		disposeTerminalTitleState();
+		windowsTitleMock?.restore();
+		windowsTitleMock = undefined;
+		stdoutSpy?.mockRestore();
+		stdoutSpy = undefined;
+		if (ttyDescriptor) Object.defineProperty(process.stdout, "isTTY", ttyDescriptor);
+		else Reflect.deleteProperty(process.stdout, "isTTY");
+		setTerminalHeadless(prevHeadless);
+		vi.useRealTimers();
+	});
+
+	it("keeps an extension override verbatim across a run-state change (spinner never clobbers it)", () => {
+		// CONTRACT (core regression): once an extension owns the title, flipping
+		// the run state to `working` must NOT re-emit the base title with a
+		// spinner prefix. The override wins verbatim.
+		setExtensionTerminalTitle("Deploying prod");
+		expect(emittedTitles().at(-1)).toBe("Deploying prod");
+
+		writes.length = 0;
+		setTerminalTitleState("working");
+		setTerminalTitleState("attention");
+		setTerminalTitleState("idle");
+
+		// No state transition produced a NEW title away from the override.
+		// (Deduped emits mean the sink may not fire at all; if it does, only "Deploying prod".)
+		for (const title of emittedTitles()) expect(title).toBe("Deploying prod");
+		for (const payload of writes) {
+			for (const frame of SPINNER_FRAMES) expect(payload).not.toContain(frame);
+		}
+	});
+
+	it("keeps the override verbatim across a real spinner tick", () => {
+		// CONTRACT: the periodic spinner tick (frame++ → emit) must also respect
+		// the override. This exercises the timer-driven emission path, not just
+		// the synchronous state setter.
+		setExtensionTerminalTitle("Long extension task");
+		writes.length = 0;
+
+		// Enter `working` to start the spinner interval, then advance the fake
+		// clock across several tick intervals (interval is 80ms).
+		setTerminalTitleState("working");
+		vi.advanceTimersByTime(400);
+
+		for (const title of emittedTitles()) expect(title).toBe("Long extension task");
+		for (const payload of writes) {
+			for (const frame of SPINNER_FRAMES) expect(payload).not.toContain(frame);
+		}
+	});
+
+	it("clears the override when an authoritative session title is set", () => {
+		// CONTRACT: `setSessionTerminalTitle` supersedes any extension override —
+		// the emitted title tracks the real session, not the stale override.
+		setExtensionTerminalTitle("Stale extension title");
+		writes.length = 0;
+
+		setSessionTerminalTitle("my-session");
+
+		const last = emittedTitles().at(-1);
+		expect(last).toBeDefined();
+		expect(last).toContain("my-session");
+		expect(last).not.toContain("Stale extension title");
+	});
+
+	it("dedupes direct writes after sanitizing the title", () => {
+		setTerminalTitle("direct title\u0000");
+		setTerminalTitle("direct title");
+
+		expect(emittedTitles()).toEqual(["direct title"]);
+		expect(writes).toHaveLength(1);
+	});
+
+	it("keeps the working title static with ':' on Windows", () => {
+		const originalPlatform = process.platform;
 		try {
-			startSessionTerminalTitleAnimation("Fix terminal title", "/tmp/oh-my-pi");
-			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π⠋: Fix terminal title");
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			setSessionTerminalTitle("windows-project");
+			writes.length = 0;
 
-			vi.advanceTimersByTime(160);
-			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π⠙: Fix terminal title");
+			setTerminalTitleState("working");
+			expect(emittedTitles()).toEqual(["π : windows-project"]);
 
-			setSessionTerminalTitle("Keep new title", "/tmp/oh-my-pi");
-			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π⠙: Keep new title");
-
-			stopSessionTerminalTitleAnimation();
-			expect(parseTerminalTitleWrite(capture.writes.at(-1))).toBe("π: Keep new title");
+			writes.length = 0;
+			vi.advanceTimersByTime(400);
+			expect(writes).toEqual([]);
 		} finally {
-			capture.restore();
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
+	});
+
+	it("keeps the working title static under WSL", () => {
+		const originalPlatform = process.platform;
+		const originalWslDistro = process.env.WSL_DISTRO_NAME;
+		try {
+			Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+			process.env.WSL_DISTRO_NAME = "Ubuntu";
+			setSessionTerminalTitle("wsl-project");
+			writes.length = 0;
+
+			setTerminalTitleState("working");
+			expect(emittedTitles()).toEqual(["π : wsl-project"]);
+
+			writes.length = 0;
+			vi.advanceTimersByTime(400);
+			expect(writes).toEqual([]);
+		} finally {
+			if (originalWslDistro === undefined) delete process.env.WSL_DISTRO_NAME;
+			else process.env.WSL_DISTRO_NAME = originalWslDistro;
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
+		}
+	});
+
+	it("uses SetConsoleTitleW without an OSC write on Windows", () => {
+		const originalPlatform = process.platform;
+		const native = windowsTitleMock;
+		if (!native) throw new Error("Windows console title mock not initialized");
+		native.succeeds = true;
+		try {
+			Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+			setTerminalTitle("native Ω");
+			setTerminalTitle("native Ω");
+
+			expect(native.titles).toEqual(["native Ω"]);
+			expect(writes).toEqual([]);
+		} finally {
+			Object.defineProperty(process, "platform", { value: originalPlatform, configurable: true });
 		}
 	});
 });

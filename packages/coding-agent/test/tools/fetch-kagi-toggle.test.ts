@@ -558,35 +558,143 @@ describe("read tool URL handling", () => {
 		expect(htmlToMarkdownSpy).not.toHaveBeenCalled();
 	});
 
-	it("reuses cached output for repeated plain URL reads", async () => {
-		const session = createSession();
-		const tool = new ReadTool(session);
-		const pageUrl = "https://example.com/repeated-read-cache";
-		const loadPageSpy = vi.spyOn(scrapers, "loadPage").mockResolvedValue({
-			ok: true,
-			status: 200,
-			contentType: "text/plain",
-			finalUrl: pageUrl,
-			content: "Cached line 1\nCached line 2",
-		});
+	it("prefers Firecrawl scrape first when providers.fetch is set to firecrawl", async () => {
+		const originalApiKey = process.env.FIRECRAWL_API_KEY;
+		process.env.FIRECRAWL_API_KEY = "test-firecrawl-key";
+		try {
+			const session = createSession({ "providers.fetch": "firecrawl" });
+			const tool = new ReadTool(session);
+			const pageUrl = "https://example.com/firecrawl-page";
+			const requests: { url: string; authorization: string | null; body: unknown }[] = [];
+			session.fetch = asGlobalFetch(async (input, init) => {
+				if (String(input) === "https://api.firecrawl.dev/v2/scrape") {
+					requests.push({
+						url: String(input),
+						authorization: new Headers(init?.headers).get("authorization"),
+						body: JSON.parse(String(init?.body)),
+					});
+					return new Response(
+						JSON.stringify({
+							success: true,
+							data: {
+								markdown:
+									"Firecrawl-rendered content that is comfortably longer than one hundred characters. ".repeat(
+										2,
+									),
+								metadata: { sourceURL: pageUrl, statusCode: 200 },
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("blocked", { status: 500, statusText: "Blocked" });
+			});
+			const pageHtml = "<html><body><main><h1>Firecrawl Page</h1></main></body></html>";
+			const ensureToolSpy = vi.spyOn(toolsManager, "ensureTool");
+			const htmlToMarkdownSpy = vi.spyOn(natives, "htmlToMarkdown");
+			vi.spyOn(scrapers, "loadPage").mockImplementation(async requestedUrl => {
+				if (requestedUrl === pageUrl) {
+					return {
+						ok: true,
+						status: 200,
+						contentType: "text/html",
+						finalUrl: pageUrl,
+						content: pageHtml,
+					};
+				}
 
-		const firstResult = await tool.execute("fetch-cache-first", { path: pageUrl });
-		const secondResult = await tool.execute("fetch-cache-second", { path: pageUrl });
-		const firstText = firstResult.content.find(content => content.type === "text");
-		const secondText = secondResult.content.find(content => content.type === "text");
+				return {
+					ok: false,
+					status: 404,
+					contentType: "text/plain",
+					finalUrl: requestedUrl,
+					content: "",
+				};
+			});
 
-		expect(firstText?.type).toBe("text");
-		expect(firstText?.text).toContain("Cached line 1");
-		expect(secondText?.type).toBe("text");
-		expect(secondText?.text).toContain("Cached line 1");
-		expect(loadPageSpy).toHaveBeenCalledTimes(1);
+			const result = await tool.execute("fetch-firecrawl-html", { path: pageUrl });
+			const textBlock = result.content.find(content => content.type === "text");
+
+			expect(result.details?.method).toBe("firecrawl");
+			expect(textBlock?.type).toBe("text");
+			expect(textBlock?.text).toContain("Firecrawl-rendered content");
+			expect(requests).toHaveLength(1);
+			expect(requests[0]?.authorization).toBe("Bearer test-firecrawl-key");
+			expect(requests[0]?.body).toMatchObject({ url: pageUrl, formats: ["markdown"] });
+			expect(ensureToolSpy).not.toHaveBeenCalled();
+			expect(htmlToMarkdownSpy).not.toHaveBeenCalled();
+		} finally {
+			if (originalApiKey === undefined) delete process.env.FIRECRAWL_API_KEY;
+			else process.env.FIRECRAWL_API_KEY = originalApiKey;
+		}
 	});
 
-	it("supports offset and limit for URL reads using cached output", async () => {
+	it("retries a retryable Firecrawl response before falling through", async () => {
+		const originalApiKey = process.env.FIRECRAWL_API_KEY;
+		process.env.FIRECRAWL_API_KEY = "test-firecrawl-key";
+		try {
+			const session = createSession({ "providers.fetch": "firecrawl" });
+			const tool = new ReadTool(session);
+			const pageUrl = "https://example.com/firecrawl-retry";
+			let scrapeCalls = 0;
+			session.fetch = asGlobalFetch(async input => {
+				if (String(input) === "https://api.firecrawl.dev/v2/scrape") {
+					scrapeCalls++;
+					if (scrapeCalls === 1) {
+						return new Response(JSON.stringify({ error: "temporarily unavailable" }), { status: 503 });
+					}
+					return new Response(
+						JSON.stringify({
+							success: true,
+							data: {
+								markdown:
+									"Firecrawl content served on the retry attempt, comfortably over one hundred characters. ".repeat(
+										2,
+									),
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					);
+				}
+				return new Response("blocked", { status: 500, statusText: "Blocked" });
+			});
+			vi.spyOn(scrapers, "loadPage").mockImplementation(async requestedUrl => {
+				if (requestedUrl === pageUrl) {
+					return {
+						ok: true,
+						status: 200,
+						contentType: "text/html",
+						finalUrl: pageUrl,
+						content: "<html><body><main><h1>Firecrawl Retry</h1></main></body></html>",
+					};
+				}
+
+				return {
+					ok: false,
+					status: 404,
+					contentType: "text/plain",
+					finalUrl: requestedUrl,
+					content: "",
+				};
+			});
+
+			const result = await tool.execute("fetch-firecrawl-retry", { path: pageUrl });
+			const textBlock = result.content.find(content => content.type === "text");
+
+			expect(scrapeCalls).toBe(2);
+			expect(result.details?.method).toBe("firecrawl");
+			expect(textBlock?.text).toContain("served on the retry attempt");
+		} finally {
+			if (originalApiKey === undefined) delete process.env.FIRECRAWL_API_KEY;
+			else process.env.FIRECRAWL_API_KEY = originalApiKey;
+		}
+	});
+
+	it("supports offset and limit selectors on URL reads", async () => {
 		const session = createSession();
 		const tool = new ReadTool(session);
 		const pageUrl = "https://example.com/offset-test";
-		const loadPageSpy = vi.spyOn(scrapers, "loadPage").mockResolvedValue({
+		vi.spyOn(scrapers, "loadPage").mockResolvedValue({
 			ok: true,
 			status: 200,
 			contentType: "text/plain",
@@ -594,27 +702,17 @@ describe("read tool URL handling", () => {
 			content: "Line 1\nLine 2\nLine 3\nLine 4",
 		});
 
-		const firstResult = await tool.execute("fetch-offset-prime", { path: pageUrl });
-		const firstText = firstResult.content.find(content => content.type === "text");
-		expect(firstText?.type).toBe("text");
-		expect(firstText?.text).toContain("Line 1");
-		expect(loadPageSpy).toHaveBeenCalledTimes(1);
-
-		loadPageSpy.mockClear();
-		loadPageSpy.mockRejectedValue(new Error("network should not be hit"));
-
 		const pagedResult = await tool.execute("fetch-offset-page", {
 			path: `${pageUrl}:7-8`,
 		});
 		const pagedText = pagedResult.content.find(content => content.type === "text");
 		expect(pagedText?.type).toBe("text");
-		// `:7-8` selects 2 lines starting at offset 7 of the wrapped cached
+		// `:7-8` selects 2 lines starting at offset 7 of the wrapped URL
 		// output. Read tool widens the window by ±3 unanchored context lines
 		// so anchors at the boundary stay fresh, so adjacent content lines are
 		// also visible.
 		expect(pagedText?.text).toContain("Line 1");
 		expect(pagedText?.text).toContain("Line 2");
-		expect(loadPageSpy).not.toHaveBeenCalled();
 		expect(fs.readdirSync(path.join(testDir, "session")).some(file => file.endsWith(".read.log"))).toBe(true);
 	});
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { isProviderRetryableError } from "@oh-my-pi/pi-ai/providers/anthropic";
+import { isProviderRetryableError } from "@oh-my-pi/pi-ai/error";
 
 describe("isProviderRetryableError", () => {
 	it("retries known transient rate-limit errors", () => {
@@ -40,13 +40,12 @@ describe("isProviderRetryableError", () => {
 				new Error(
 					'Post "https://api.anthropic.com/v1/messages?beta=true": remote error: tls: bad record MAC (type=server_error)',
 				),
-				"anthropic",
 			),
 		).toBe(true);
 	});
 
 	it("does not retry permanent TLS configuration failures (no server annotation)", () => {
-		expect(isProviderRetryableError(new Error("tls: failed to verify certificate"), "anthropic")).toBe(false);
+		expect(isProviderRetryableError(new Error("tls: failed to verify certificate"))).toBe(false);
 	});
 
 	it("retries Bun socket closure errors", () => {
@@ -83,16 +82,34 @@ describe("isProviderRetryableError", () => {
 		).toBe(false);
 		expect(isProviderRetryableError(new Error("usage_limit_reached"))).toBe(false);
 		expect(isProviderRetryableError(new Error("You have hit your ChatGPT usage limit"))).toBe(false);
+		// Anthropic monthly spend-cap 429 (issue #4787): must not retry, or the
+		// provider loop burns its budget on minutes-long retry-after backoff and
+		// surfaces "Deadline exceeded" instead of the quota error.
+		expect(
+			isProviderRetryableError(
+				new Error(
+					'429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account\'s monthly spend limit. Please try again later."}}',
+				),
+			),
+		).toBe(false);
 		// A generic transient rate limit (no account/usage framing) still retries.
 		expect(isProviderRetryableError(new Error("Rate limit exceeded"))).toBe(true);
 	});
 
-	it("retries Copilot transient model_not_supported only for github-copilot provider", () => {
-		const err = new Error("400 The requested model is not supported.");
-		(err as unknown as { status: number; code: string }).status = 400;
-		(err as unknown as { status: number; code: string }).code = "model_not_supported";
-		expect(isProviderRetryableError(err, "github-copilot")).toBe(true);
-		expect(isProviderRetryableError(err, "anthropic")).toBe(false);
-		expect(isProviderRetryableError(err)).toBe(false);
+	it("does not retry Copilot 400 model rejections", () => {
+		// Both codes are deterministic: GitHub gates models per integrator and
+		// per account, so a replay of the same request fails identically.
+		for (const code of ["model_not_supported", "model_not_available_for_integrator"]) {
+			const body = {
+				error: {
+					message: "The requested model is not supported.",
+					code,
+					param: "model",
+					type: "invalid_request_error",
+				},
+			};
+			const err = Object.assign(new Error(`400 ${JSON.stringify(body)}`), { status: 400, code, error: body });
+			expect(isProviderRetryableError(err)).toBe(false);
+		}
 	});
 });

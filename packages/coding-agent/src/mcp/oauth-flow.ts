@@ -11,6 +11,7 @@ import type { OAuthController, OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/ty
 import type { FetchImpl } from "@oh-my-pi/pi-ai/types";
 import { getActiveProfile } from "@oh-my-pi/pi-utils/dirs";
 import type { OAuthCredential } from "../session/auth-storage";
+import { buildWellKnownUrls } from "./oauth-discovery";
 
 /** Credential-id prefix for OMP-managed MCP OAuth credentials keyed by profile and server URL. */
 const MCP_OAUTH_URL_CREDENTIAL_PREFIX = "mcp_oauth:";
@@ -51,6 +52,27 @@ export function mcpOAuthCredentialProfile(credentialId: string): string | undefi
 	if (!credentialId.startsWith(MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX)) return undefined;
 	const separator = credentialId.indexOf(":", MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX.length);
 	return separator === -1 ? undefined : credentialId.slice(MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX.length, separator);
+}
+
+/**
+ * Server URL embedded in a managed MCP OAuth credential id, or `undefined`
+ * for legacy random ids (`mcp_oauth_<rand>`) minted before URL-keyed ids.
+ *
+ * Inverse of {@link mcpOAuthCredentialId}. Mirrors {@link mcpOAuthCredentialProfile}:
+ * the URL contains `:` and `/`, so for profile-scoped ids the URL is everything
+ * after the profile segment; for legacy url-keyed ids (`mcp_oauth:<url>`) it is
+ * everything after the prefix. Lets the auth-broker — which never sees the MCP
+ * config — recover the server URL for the RFC 8707 fallback resource on refresh.
+ */
+export function mcpOAuthServerUrlFromCredentialId(credentialId: string): string | undefined {
+	if (credentialId.startsWith(MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX)) {
+		const separator = credentialId.indexOf(":", MCP_OAUTH_PROFILE_CREDENTIAL_PREFIX.length);
+		return separator === -1 ? undefined : credentialId.slice(separator + 1) || undefined;
+	}
+	if (credentialId.startsWith(MCP_OAUTH_URL_CREDENTIAL_PREFIX)) {
+		return credentialId.slice(MCP_OAUTH_URL_CREDENTIAL_PREFIX.length) || undefined;
+	}
+	return undefined;
 }
 
 /**
@@ -189,7 +211,7 @@ function staticClientIdFromConfig(config: MCPOAuthConfig): string | undefined {
 	const fromConfig = config.clientId?.trim();
 	if (fromConfig) return fromConfig;
 	try {
-		return new URL(config.authorizationUrl).searchParams.get("client_id") ?? undefined;
+		return new URL(config.authorizationUrl).searchParams.get("client_id")?.trim() || undefined;
 	} catch {
 		return undefined;
 	}
@@ -277,6 +299,10 @@ export interface MCPOAuthConfig {
 	authorizationUrl: string;
 	/** Token endpoint URL */
 	tokenUrl: string;
+	/** Authorization-server issuer URL used for metadata discovery. */
+	issuerUrl?: string;
+	/** Dynamic client registration endpoint advertised by the authorization server. */
+	registrationUrl?: string;
 	/** Client ID (optional when already embedded in authorization URL) */
 	clientId?: string;
 	/** Client secret (optional for PKCE flows) */
@@ -383,6 +409,13 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
 		if (!this.#resolvedClientId) {
 			await this.#tryRegisterClient(redirectUri);
+			// `unapproved_client` explicitly establishes that registration cannot
+			// produce the required client id. Other DCR failures stay on the
+			// clientless probe path because they may be transient or caused by
+			// unrelated registration metadata.
+			if (!this.#resolvedClientId && this.#isDefinitiveRegistrationRejection()) {
+				throw this.#missingClientIdError();
+			}
 		}
 
 		const authUrl = new URL(this.config.authorizationUrl);
@@ -392,8 +425,12 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			params.set("response_type", "code");
 		}
 		const existingClientId = params.get("client_id")?.trim();
-		if (this.#resolvedClientId && !existingClientId) {
+		if (this.#resolvedClientId) {
 			params.set("client_id", this.#resolvedClientId);
+		} else if (existingClientId) {
+			params.set("client_id", existingClientId);
+		} else {
+			params.delete("client_id");
 		}
 		if (this.config.scopes && !params.get("scope")) {
 			params.set("scope", this.config.scopes);
@@ -403,12 +440,13 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			params.set("prompt", prompt);
 		}
 		const existingResource = params.get("resource")?.trim();
-		if (existingResource) {
-			// A resource already embedded in the provider's authorization URL is
-			// provider-authored, not OMP's server-URL fallback. Preserve same-host
-			// values here even when the caller marked its separate
-			// `config.resource` as fallback; gateway-hosted MCP servers can use
-			// origin-only or path-scoped values as the token audience.
+		if (this.#resource && !this.config.stripSameOriginResource) {
+			// Protected-resource or authorization-server metadata identifies the
+			// requested audience; a query carried by the endpoint URL does not.
+			params.set("resource", this.#resource);
+		} else if (existingResource) {
+			// An embedded resource outranks OMP's server-URL fallback. Gateway-
+			// hosted MCP servers can use origin-only or path-scoped audiences.
 			const filtered = filterResourceIndicator(resolveResourceUri(existingResource), this.config.authorizationUrl);
 			if (filtered) {
 				this.#resource = filtered;
@@ -480,11 +518,21 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		}
 
 		const data = (await response.json()) as {
-			access_token: string;
+			access_token?: string;
 			refresh_token?: string;
 			expires_in?: number;
 			token_type?: string;
+			error?: string;
+			error_description?: string;
 		};
+
+		// Some providers (e.g. the Slack Web API) signal failure with HTTP 200 and
+		// an `{ ok: false, error }` body. Accepting such a response would store an
+		// empty access token and only surface `invalid_token` on a later request.
+		if (typeof data.access_token !== "string" || data.access_token.length === 0) {
+			const providerError = data.error_description ?? data.error;
+			throw new Error(`Token exchange returned no access token${providerError ? `: ${providerError}` : ""}`);
+		}
 
 		// Calculate expiry timestamp
 		const expiresIn = data.expires_in ?? 3600; // Default to 1 hour
@@ -561,7 +609,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	 * accept the later authorize request for the same scope set.
 	 */
 	async #tryRegisterClient(redirectUri: string): Promise<void> {
-		const registrationEndpoint = await this.#resolveRegistrationEndpoint();
+		const registrationEndpoint = this.config.registrationUrl ?? (await this.#resolveRegistrationEndpoint());
 		if (!registrationEndpoint) return;
 
 		try {
@@ -601,8 +649,9 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 				client_secret?: string;
 			};
 
-			if (data.client_id && data.client_id.trim() !== "") {
-				this.#resolvedClientId = data.client_id;
+			const clientId = data.client_id?.trim();
+			if (clientId) {
+				this.#resolvedClientId = clientId;
 			}
 			if (data.client_secret && data.client_secret.trim() !== "") {
 				this.#registeredClientSecret = data.client_secret;
@@ -619,35 +668,16 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	}
 
 	async #resolveRegistrationEndpoint(): Promise<string | null> {
-		const authorizationUrl = new URL(this.config.authorizationUrl);
-
-		// origin-root well-known; most servers serve metadata here.
-		const rootUrl = new URL("/.well-known/oauth-authorization-server", authorizationUrl.origin).toString();
-		const endpoint = await this.#tryWellKnownForRegistration(rootUrl);
-		if (endpoint) return endpoint;
-
-		// path-prefixed well-known for gateways (e.g. https://gateway.example.com/my-service/).
-		const normalizedPath = authorizationUrl.pathname.replace(/\/$/, "");
-		const lastSlash = normalizedPath.lastIndexOf("/");
-		// Bare-origin authorization URL — nothing further to try.
-		if (lastSlash < 0) return null;
-
-		// Single-segment paths are the gateway prefix itself; multi-segment paths
-		// drop the trailing segment (typically a service endpoint).
-		const prefixPath = lastSlash === 0 ? normalizedPath : normalizedPath.slice(0, lastSlash);
-		const prefixedUrl = new URL(
-			".well-known/oauth-authorization-server",
-			`${authorizationUrl.origin}${prefixPath}/`,
-		).toString();
-		const prefixedEndpoint = await this.#tryWellKnownForRegistration(prefixedUrl);
-		if (prefixedEndpoint) return prefixedEndpoint;
-
-		// RFC 8414 §3.1 path-ful issuer form: /.well-known/oauth-authorization-server/<path>.
-		const pathfulUrl = new URL(
-			`/.well-known/oauth-authorization-server${normalizedPath}`,
-			authorizationUrl.origin,
-		).toString();
-		return await this.#tryWellKnownForRegistration(pathfulUrl);
+		const candidates = buildWellKnownUrls(
+			"/.well-known/oauth-authorization-server",
+			this.config.issuerUrl ?? this.config.authorizationUrl,
+			this.config.issuerUrl !== undefined,
+		);
+		for (const url of candidates) {
+			const endpoint = await this.#tryWellKnownForRegistration(url.toString());
+			if (endpoint) return endpoint;
+		}
+		return null;
 	}
 
 	async #tryWellKnownForRegistration(wellKnownUrl: string): Promise<string | null> {
@@ -687,6 +717,19 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 			}
 			// Ignore network/probe failures to avoid blocking flows that still work.
 		}
+	}
+
+	/**
+	 * Whether the provider explicitly rejected this client as unapproved.
+	 *
+	 * HTTP status alone is insufficient: payload errors such as
+	 * `invalid_client_metadata` and `invalid_redirect_uri` do not establish that
+	 * the authorization endpoint requires a client id. Keep those on the
+	 * clientless probe path.
+	 */
+	#isDefinitiveRegistrationRejection(): boolean {
+		const failure = this.#registrationFailure;
+		return failure?.status === 403 && /\bunapproved_client\b/i.test(failure.detail ?? "");
 	}
 
 	/**
@@ -763,7 +806,8 @@ export async function refreshMCPOAuthToken(
 		grant_type: "refresh_token",
 		refresh_token: refreshToken,
 	});
-	if (clientId) params.set("client_id", clientId);
+	const normalizedClientId = clientId?.trim();
+	if (normalizedClientId) params.set("client_id", normalizedClientId);
 	// Drop redundant indicators so refresh stays consistent with the initial
 	// grant; see {@link filterResourceIndicator} for context.
 	const resolvedResource = filterResourceIndicator(resolveResourceUri(resource), filterAnchor, {

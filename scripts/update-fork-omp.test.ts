@@ -29,7 +29,10 @@ function makeFixture(fingerprint = "native-source-tree:") {
 	const addon = path.join(nativeDir, `pi_natives.${process.platform}-${process.arch}.node`);
 	fs.writeFileSync(addon, "binary payload __piNativesV16_5_0 without the new runtime export");
 	const buildLog = path.join(dir, "build.log");
-	fs.writeFileSync(path.join(nativeDir, `.source-fingerprint-${process.platform}-${process.arch}.node`), `${fingerprint}\n`);
+	fs.writeFileSync(
+		path.join(nativeDir, `.source-fingerprint-${process.platform}-${process.arch}.node`),
+		`${fingerprint}\n`,
+	);
 
 	makeExecutable(
 		path.join(shimDir, "git"),
@@ -38,8 +41,8 @@ function makeFixture(fingerprint = "native-source-tree:") {
 			'  "remote get-url origin") echo "$FORK_URL" ;;',
 			'  "rev-parse --short HEAD") echo abc1234 ;;',
 			'  "rev-parse HEAD:crates"*) echo native-source-tree ;;',
-			'  *) exit 0 ;;',
-			'esac',
+			"  *) exit 0 ;;",
+			"esac",
 			"",
 		].join("\n"),
 	);
@@ -51,17 +54,18 @@ function makeFixture(fingerprint = "native-source-tree:") {
 			'    *process.platform*) printf "%s" "$TEST_HOST_TAG"; exit 0 ;;',
 			'    *) [ "$PI_REQUIRED_NATIVE_EXPORTS" = "__piNativesV16_5_0,snapcompactSupportedChars" ] || exit 91',
 			'       [ "$TEST_EXPORTS_OK" = "1" ] || [ -f "$TEST_BUILD_LOG" ]; exit $? ;;',
-			'  esac',
-			'fi',
+			"  esac",
+			"fi",
 			'if [ "$1" = "--cwd=packages/natives" ] && [ "$2" = "run" ] && [ "$3" = "build" ]; then',
 			'  echo built >> "$TEST_BUILD_LOG"',
-			'  exit 0',
-			'fi',
-			'exit 0',
+			"  exit 0",
+			"fi",
+			"exit 0",
 			"",
 		].join("\n"),
 	);
 	makeExecutable(path.join(shimDir, "cargo"), "exit 0\n");
+	makeExecutable(path.join(shimDir, "omp"), "exit 0\n");
 
 	return { checkout, shimDir, buildLog };
 }
@@ -75,6 +79,7 @@ function runUpdater(fixture: { checkout: string; shimDir: string; buildLog: stri
 			PATH: `${fixture.shimDir}${path.delimiter}${process.env.PATH ?? ""}`,
 			TEST_BUILD_LOG: fixture.buildLog,
 			TEST_EXPORTS_OK: exportsAvailable ? "1" : "0",
+			OMP_PRIVATE_SKILLS: "0",
 			TEST_HOST_TAG: `${process.platform}-${process.arch}`,
 		},
 		encoding: "utf8",
@@ -132,7 +137,10 @@ function createBareFork(root: string, name: string, release: string): { bare: st
 	fs.writeFileSync(path.join(work, "Cargo.lock"), "# updater test fixture\n");
 	fs.writeFileSync(path.join(work, "rust-toolchain.toml"), '[toolchain]\nchannel = "stable"\n');
 	fs.writeFileSync(path.join(work, "crates", "fixture.txt"), `${release}\n`);
-	fs.writeFileSync(path.join(work, "packages", "natives", "scripts", "fixture.ts"), `export default ${JSON.stringify(release)};\n`);
+	fs.writeFileSync(
+		path.join(work, "packages", "natives", "scripts", "fixture.ts"),
+		`export default ${JSON.stringify(release)};\n`,
+	);
 	fs.writeFileSync(path.join(work, "packages", "natives", "package.json"), '{"version":"1.2.3"}\n');
 	fs.writeFileSync(
 		path.join(work, "packages", "natives", "native", "pi_natives.test-platform-test-arch.node"),
@@ -155,13 +163,7 @@ function writeToolStubs(root: string): string {
 	fs.mkdirSync(bin);
 	makeExecutable(
 		path.join(bin, "bun"),
-		[
-			'if [ "$1" = "-e" ]; then',
-			"  printf 'test-platform-test-arch'",
-			"fi",
-			"exit 0",
-			"",
-		].join("\n"),
+		['if [ "$1" = "-e" ]; then', "  printf 'test-platform-test-arch'", "fi", "exit 0", ""].join("\n"),
 	);
 	makeExecutable(path.join(bin, "cargo"), "exit 0\n");
 	makeExecutable(path.join(bin, "omp"), "exit 0\n");

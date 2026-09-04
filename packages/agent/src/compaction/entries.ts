@@ -97,12 +97,6 @@ export interface TtsrInjectionEntry extends SessionEntryBase {
 	injectedRules: string[];
 }
 
-export interface MCPToolSelectionEntry extends SessionEntryBase {
-	type: "mcp_tool_selection";
-	/** MCP tool names selected for visibility in discovery mode. */
-	selectedToolNames: string[];
-}
-
 export interface SessionInitEntry extends SessionEntryBase {
 	type: "session_init";
 	/** Full system prompt sent to the model */
@@ -123,6 +117,16 @@ export interface ModeChangeEntry extends SessionEntryBase {
 	data?: Record<string, unknown>;
 }
 
+/**
+ * Durable context-reset marker recorded by an in-place `/clear`. It carries no
+ * payload — its presence on the branch means every entry before it was dropped
+ * from the model context, so context assembly and compaction start after the
+ * latest one. The full pre-reset history stays on disk for transcript export.
+ */
+export interface ResetBoundaryEntry extends SessionEntryBase {
+	type: "reset_boundary";
+}
+
 export interface CustomCompactionSessionEntries {}
 
 export type SessionEntry =
@@ -137,9 +141,9 @@ export type SessionEntry =
 	| LabelEntry
 	| TitleChangeEntry
 	| TtsrInjectionEntry
-	| MCPToolSelectionEntry
 	| SessionInitEntry
 	| ModeChangeEntry
+	| ResetBoundaryEntry
 	| CustomCompactionSessionEntries[keyof CustomCompactionSessionEntries];
 
 export interface ReadonlySessionManager {

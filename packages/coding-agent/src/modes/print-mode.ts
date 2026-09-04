@@ -6,9 +6,9 @@
  * - `omp --mode json "prompt"` - JSON event stream
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, ImageContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { logger, sanitizeText } from "@oh-my-pi/pi-utils";
-import type { AgentSession, AgentSessionEvent } from "../session/agent-session";
+import { type AgentSession, type AgentSessionEvent, SHUTDOWN_CONSOLIDATE_BUDGET_MS } from "../session/agent-session";
 import { isSilentAbort } from "../session/messages";
 import { flushTelemetryExport } from "../telemetry-export";
 import { initializeExtensions } from "./runtime-init";
@@ -27,7 +27,14 @@ export interface PrintModeOptions {
 	initialImages?: ImageContent[];
 	/** If true, include thinking blocks in text output */
 	printThoughts?: boolean;
+	/** Whether the caller explicitly started the headless plan flow. */
+	planYolo?: boolean;
 }
+
+/** Matches the longest built-in provider request deadline while bounding tool-loop stalls. */
+export const PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS = 10 * 60_000;
+/** Error exits cannot hold automation for the full normal drain budget. */
+export const PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS = 30_000;
 
 /** Drop the provider-opaque replay payload (e.g. encrypted reasoning items) before printing. */
 function stripProviderPayload<T extends AgentMessage>(message: T): T {
@@ -50,6 +57,8 @@ function stripProviderPayload<T extends AgentMessage>(message: T): T {
  */
 export function printableEvent(event: AgentSessionEvent): unknown {
 	switch (event.type) {
+		case "tool_stream_update":
+			return { type: event.type, toolCallId: event.toolCallId, toolName: event.toolName };
 		case "message_update": {
 			const streamEvent = event.assistantMessageEvent;
 			if (streamEvent.type === "done" || streamEvent.type === "error") {
@@ -82,17 +91,36 @@ export function printableEvent(event: AgentSessionEvent): unknown {
  * Sends prompts to the agent and outputs the result.
  */
 export async function runPrintMode(session: AgentSession, options: PrintModeOptions): Promise<void> {
-	const { mode, messages = [], initialMessage, initialImages, printThoughts } = options;
+	const { mode, messages = [], initialMessage, initialImages, printThoughts, planYolo = false } = options;
+
+	// process.stdout.write is fire-and-forget: a large final record (e.g. a
+	// multi-MB agent_end) can be dropped when the process exits before the pipe
+	// drains, truncating the record mid-line while the process still exits 0.
+	// Serialize every stdout write on the previous write's completion callback so
+	// records stay ordered and honor backpressure, then block shutdown on the
+	// tail before dispose/exit. Same truncation class as issue #5309 (issue #7635).
+	let stdoutTail: Promise<void> = Promise.resolve();
+	const writeStdoutLine = (text: string): void => {
+		stdoutTail = stdoutTail.then(() => {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			process.stdout.write(text, err => {
+				if (err) reject(err);
+				else resolve();
+			});
+			return promise;
+		});
+	};
 
 	// Emit session header for JSON mode
 	if (mode === "json") {
 		const header = session.sessionManager.getHeader();
 		if (header) {
-			process.stdout.write(`${JSON.stringify(header)}\n`);
+			writeStdoutLine(`${JSON.stringify(header)}\n`);
 		}
 	}
 	// Set up extensions for print mode (no UI, no command context)
 	await initializeExtensions(session, {
+		mode: mode === "json" ? "json" : "print",
 		reportSendError: (action, err) => {
 			process.stderr.write(
 				`Extension ${action === "extension_send" ? "sendMessage" : "sendUserMessage"} failed: ${err.message}\n`,
@@ -103,42 +131,84 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		},
 	});
 
+	// `plan.defaultOnStartup` opens fresh *interactive* sessions in plan mode so a
+	// human can review the plan before it executes. Headless print mode has no
+	// surface to review, approve, or exit a plan from, and the turn carries no
+	// deterministic way out of plan mode — the model must voluntarily emit a valid
+	// `xd://propose` execute-dispatch, and when it does not the run strands until
+	// the deadline (issue #8272). So do not honor the startup default here; the
+	// supported headless plan flow is `--plan-yolo` (auto-approve → implement),
+	// which is wired independently through the prewalk coordinator.
+	const planStartupIgnored =
+		session.settings.get("plan.defaultOnStartup") &&
+		session.settings.get("plan.enabled") &&
+		session.sessionManager.buildSessionContext().messages.length === 0 &&
+		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
+		!planYolo;
+	if (planStartupIgnored) {
+		process.stderr.write(
+			"Note: plan.defaultOnStartup is ignored in print mode (no interactive surface to review the plan). Use --plan-yolo for a headless plan flow.\n",
+		);
+	}
+
 	// Always subscribe to enable session persistence via _handleAgentEvent
 	session.subscribe(event => {
 		// In JSON mode, output all events
 		if (mode === "json") {
-			process.stdout.write(`${JSON.stringify(printableEvent(event))}\n`);
+			writeStdoutLine(`${JSON.stringify(printableEvent(event))}\n`);
 		}
 	});
 
+	let wroteTextWorkingIndicator = false;
+	const writeTextWorkingIndicator = (): void => {
+		if (mode !== "text" || wroteTextWorkingIndicator) return;
+		process.stderr.write("Working...\n");
+		wroteTextWorkingIndicator = true;
+	};
+
 	// Send initial message with attachments
 	if (initialMessage !== undefined) {
+		writeTextWorkingIndicator();
+		if (mode === "text") session.setTextOutputCommitted(false);
 		await logger.time("print:prompt:initial", () => session.prompt(initialMessage, { images: initialImages }));
 	}
 
 	// Send remaining messages
 	for (const message of messages) {
+		writeTextWorkingIndicator();
+		if (mode === "text") session.setTextOutputCommitted(false);
 		await logger.time("print:prompt:next", () => session.prompt(message));
 	}
 
+	// From this point onward a late blocker must be recorded without starting a
+	// primary turn whose response print mode would never emit.
+	session.prepareForHeadlessAdvisorDrain();
+
 	// In text mode, output final response
 	if (mode === "text") {
-		const state = session.state;
-		const lastMessage = state.messages[state.messages.length - 1];
+		// Read via the session accessor, not the raw state tail: a classifier
+		// refusal is pruned from active context at settle, and an aborted turn
+		// can trail synthetic tool results — both would hide the terminal
+		// assistant message (and its error) from a last-element read.
+		const assistantMsg = session.getLastAssistantMessage();
 
-		if (lastMessage?.role === "assistant") {
-			const assistantMsg = lastMessage as AssistantMessage;
-
+		if (assistantMsg) {
 			// Check for error/aborted — skip silent-abort (plan-mode compaction transition)
 			if (
 				(assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") &&
 				!isSilentAbort(assistantMsg)
 			) {
 				const errorLine = sanitizeText(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
-				// Flush before this hard exit — it bypasses the awaited postmortem.quit()
-				// in main(), and the postmortem `exit` handler can't await, so the error
-				// spans would otherwise stay buffered in the batch processor and drop.
+				// This branch hard-exits, bypassing the `await session.dispose()` at
+				// the end of runPrintMode. Flush telemetry and dispose the session
+				// HERE so error spans reach the exporter (the postmortem `exit`
+				// handler can't await) and the browser reaper installed in
+				// `dispose()` (releaseTabsForOwner) actually runs — otherwise an
+				// OMP-owned Chromium survives this exit (issue #5643). `dispose()`
+				// is idempotent, so the unreachable call below is a harmless no-op.
+				await session.waitForAdvisorCatchup(PRINT_MODE_ERROR_ADVISOR_DRAIN_TIMEOUT_MS);
 				await flushTelemetryExport();
+				await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 				const flushed = process.stderr.write(`${errorLine}\n`);
 				if (flushed) {
 					process.exit(1);
@@ -158,22 +228,20 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 			// Output text content
 			for (const content of assistantMsg.content) {
 				if (content.type === "text") {
-					process.stdout.write(`${sanitizeText(content.text)}\n`);
+					writeStdoutLine(`${sanitizeText(content.text)}\n`);
 				} else if (printThoughts && content.type === "thinking" && content.thinking.trim().length > 0) {
-					process.stdout.write(`${sanitizeText(content.thinking)}\n`);
+					writeStdoutLine(`${sanitizeText(content.thinking)}\n`);
 				}
 			}
 		}
+		session.setTextOutputCommitted(true);
 	}
 
-	// Ensure stdout is fully flushed before returning
-	// This prevents race conditions where the process exits before all output is written
-	await new Promise<void>((resolve, reject) => {
-		process.stdout.write("", err => {
-			if (err) reject(err);
-			else resolve();
-		});
-	});
+	await session.waitForAdvisorCatchup(PRINT_MODE_ADVISOR_DRAIN_TIMEOUT_MS);
 
-	await session.dispose();
+	// Block shutdown until every serialized stdout write (including the final
+	// agent_end and late JSON advisor events) has drained; process.exit would
+	// otherwise discard the buffered tail and truncate the last record.
+	await stdoutTail;
+	await session.dispose({ mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS });
 }

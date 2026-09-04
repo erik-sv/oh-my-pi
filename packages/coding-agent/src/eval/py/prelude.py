@@ -1,10 +1,12 @@
 from __future__ import annotations
+
 # OMP prelude helpers (loaded once into the runner namespace)
 if "__omp_prelude_loaded__" not in globals():
     __omp_prelude_loaded__ = True
     from pathlib import Path
-    import os, json, math, re
+    import asyncio, collections.abc, inspect, os, json, math, re, types, typing
     from urllib.parse import unquote
+
     INTENT_FIELD = "i"
 
     # __omp_display is injected by runner.py before the prelude executes; it
@@ -40,7 +42,6 @@ if "__omp_prelude_loaded__" not in globals():
         """Emit structured status event for TUI rendering."""
         _omp_display({"application/x-omp-status": {"op": op, **data}}, raw=True)
 
-
     def env(key: str | None = None, value: str | None = None):
         """Get/set environment variables."""
         if key is None:
@@ -56,6 +57,27 @@ if "__omp_prelude_loaded__" not in globals():
         return val
 
     _OMP_INTERNAL_URL_RE = re.compile(r"^([a-z][a-z0-9+.-]*)://(.*)$", re.IGNORECASE)
+
+    def _should_delegate_read(path: str | Path) -> bool:
+        return (
+            isinstance(path, str)
+            and _OMP_INTERNAL_URL_RE.match(path) is not None
+            and not path.lower().startswith("local://")
+        )
+
+    def _read_line_selector(offset: int, limit: int | None) -> str | None:
+        if offset <= 1 and limit is None:
+            return None
+        start = max(1, offset)
+        if limit is None:
+            return f"{start}-"
+        return f"{start}-{start + limit - 1}"
+
+    def _read_tool_text(path: str) -> str:
+        result = _bridge_call("read", {"path": path})
+        if isinstance(result, dict) and "text" in result:
+            return result["text"]
+        return result
 
     def _resolve_omp_path(path: str | Path) -> Path:
         """Map a helper path to a real filesystem Path.
@@ -94,7 +116,13 @@ if "__omp_prelude_loaded__" not in globals():
         return Path(resolved)
 
     def read(path: str | Path, offset: int = 1, limit: int | None = None) -> str:
-        """Read file contents. offset/limit are 1-indexed line numbers."""
+        """Read file or read-tool URI contents. offset/limit are 1-indexed lines."""
+        if _should_delegate_read(path):
+            if limit is not None and limit <= 0:
+                return ""
+            selector = _read_line_selector(offset, limit)
+            tool_path = path if selector is None else f"{path}:{selector}"
+            return _read_tool_text(tool_path)
         p = _resolve_omp_path(path)
         data = p.read_text(encoding="utf-8")
         lines = data.splitlines(keepends=True)
@@ -123,24 +151,24 @@ if "__omp_prelude_loaded__" not in globals():
         limit: int | None = None,
     ) -> str | dict | list[dict]:
         """Read task/agent output by ID. Returns text or JSON depending on format.
-        
+
         Args:
-            *ids: Output IDs to read (e.g., 'explore_0', 'reviewer_1')
+            *ids: Output IDs to read (e.g., 'scout_0', 'reviewer_1')
             format: 'raw' (default), 'json' (dict with metadata), 'stripped' (no ANSI)
             query: jq-like query for JSON outputs (e.g., '.endpoints[0].file')
             offset: Line number to start reading from (1-indexed)
             limit: Maximum number of lines to read
-        
+
         Returns:
             Single ID: str (format='raw'/'stripped') or dict (format='json')
             Multiple IDs: list of dict with 'id' and 'content'/'data' keys
-        
+
         Examples:
-            output('explore_0')  # Read as raw text
+            output('scout_0')  # Read as raw text
             output('reviewer_0', format='json')  # Read with metadata
-            output('explore_0', query='.files[0]')  # Extract JSON field
-            output('explore_0', offset=10, limit=20)  # Lines 10-29
-            output('explore_0', 'reviewer_1')  # Read multiple outputs
+            output('scout_0', query='.files[0]')  # Extract JSON field
+            output('scout_0', offset=10, limit=20)  # Lines 10-29
+            output('scout_0', 'reviewer_1')  # Read multiple outputs
         """
         # Prefer PI_ARTIFACTS_DIR so subagents resolve through the parent's
         # shared artifacts dir; fall back to deriving from PI_SESSION_FILE
@@ -153,33 +181,35 @@ if "__omp_prelude_loaded__" not in globals():
                 raise RuntimeError("No session - output artifacts unavailable")
             artifacts_dir = session_file.rsplit(".", 1)[0]  # Strip .jsonl extension
         if not Path(artifacts_dir).exists():
-            _emit_status("output", error="Artifacts directory not found", path=artifacts_dir)
+            _emit_status(
+                "output", error="Artifacts directory not found", path=artifacts_dir
+            )
             raise RuntimeError(f"No artifacts directory found: {artifacts_dir}")
-        
+
         if not ids:
             _emit_status("output", error="No IDs provided")
             raise ValueError("At least one output ID is required")
-        
+
         if query and (offset is not None or limit is not None):
             _emit_status("output", error="query cannot be combined with offset/limit")
             raise ValueError("query cannot be combined with offset/limit")
-        
+
         results: list[dict] = []
         not_found: list[str] = []
-        
+
         for output_id in ids:
             output_path = Path(artifacts_dir) / f"{output_id}.md"
             if not output_path.exists():
                 not_found.append(output_id)
                 continue
-            
+
             raw_content = output_path.read_text(encoding="utf-8")
             raw_lines = raw_content.splitlines()
             total_lines = len(raw_lines)
-            
+
             selected_content = raw_content
             range_info: dict | None = None
-            
+
             # Handle query
             if query:
                 try:
@@ -187,39 +217,60 @@ if "__omp_prelude_loaded__" not in globals():
                 except json.JSONDecodeError as e:
                     _emit_status("output", id=output_id, error=f"Not valid JSON: {e}")
                     raise ValueError(f"Output {output_id} is not valid JSON: {e}")
-                
+
                 # Apply jq-like query
                 result_value = _apply_query(json_value, query)
                 try:
-                    selected_content = json.dumps(result_value, indent=2) if result_value is not None else "null"
+                    selected_content = (
+                        json.dumps(result_value, indent=2)
+                        if result_value is not None
+                        else "null"
+                    )
                 except (TypeError, ValueError):
                     selected_content = str(result_value)
-            
+
             # Handle offset/limit
             elif offset is not None or limit is not None:
                 start_line = max(1, offset or 1)
                 if start_line > total_lines:
-                    _emit_status("output", id=output_id, error=f"Offset {start_line} beyond end ({total_lines} lines)")
-                    raise ValueError(f"Offset {start_line} is beyond end of output ({total_lines} lines) for {output_id}")
-                
-                effective_limit = limit if limit is not None else total_lines - start_line + 1
+                    _emit_status(
+                        "output",
+                        id=output_id,
+                        error=f"Offset {start_line} beyond end ({total_lines} lines)",
+                    )
+                    raise ValueError(
+                        f"Offset {start_line} is beyond end of output ({total_lines} lines) for {output_id}"
+                    )
+
+                effective_limit = (
+                    limit if limit is not None else total_lines - start_line + 1
+                )
                 end_line = min(total_lines, start_line + effective_limit - 1)
                 selected_lines = raw_lines[start_line - 1 : end_line]
                 selected_content = "\n".join(selected_lines)
-                range_info = {"start_line": start_line, "end_line": end_line, "total_lines": total_lines}
-            
+                range_info = {
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "total_lines": total_lines,
+                }
+
             # Strip ANSI codes if requested
             if format == "stripped":
                 import re
+
                 selected_content = re.sub(r"\x1b\[[0-9;]*m", "", selected_content)
-            
+
             # Build result
             if format == "json":
                 result_data = {
                     "id": output_id,
                     "path": str(output_path),
-                    "line_count": total_lines if not query else len(selected_content.splitlines()),
-                    "char_count": len(raw_content) if not query else len(selected_content),
+                    "line_count": total_lines
+                    if not query
+                    else len(selected_content.splitlines()),
+                    "char_count": len(raw_content)
+                    if not query
+                    else len(selected_content),
                     "content": selected_content,
                 }
                 if range_info:
@@ -229,12 +280,10 @@ if "__omp_prelude_loaded__" not in globals():
                 results.append(result_data)
             else:
                 results.append({"id": output_id, "content": selected_content})
-        
+
         # Handle not found
         if not_found:
-            available = sorted(
-                [f.stem for f in Path(artifacts_dir).glob("*.md")]
-            )
+            available = sorted([f.stem for f in Path(artifacts_dir).glob("*.md")])
             error_msg = f"Output not found: {', '.join(not_found)}"
             if available:
                 error_msg += f"\n\nAvailable outputs: {', '.join(available[:20])}"
@@ -242,7 +291,7 @@ if "__omp_prelude_loaded__" not in globals():
                     error_msg += f" (and {len(available) - 20} more)"
             _emit_status("output", not_found=not_found, available_count=len(available))
             raise FileNotFoundError(error_msg)
-        
+
         # Return format
         if len(ids) == 1:
             if format == "json":
@@ -250,13 +299,13 @@ if "__omp_prelude_loaded__" not in globals():
                 return results[0]
             _emit_status("output", id=ids[0], chars=len(results[0]["content"]))
             return results[0]["content"]
-        
+
         # Multiple IDs
         if format == "json":
             total_chars = sum(r["char_count"] for r in results)
             _emit_status("output", count=len(results), total_chars=total_chars)
             return results
-        
+
         combined_output: list[dict] = []
         for r in results:
             combined_output.append({"id": r["id"], "content": r["content"]})
@@ -268,13 +317,13 @@ if "__omp_prelude_loaded__" not in globals():
         """Apply jq-like query to data. Supports .key, [index], and chaining."""
         if not query:
             return data
-        
+
         query = query.strip()
         if query.startswith("."):
             query = query[1:]
         if not query:
             return data
-        
+
         # Parse query into tokens
         tokens = []
         current_token = ""
@@ -293,7 +342,7 @@ if "__omp_prelude_loaded__" not in globals():
                 j = i + 1
                 while j < len(query) and query[j] != "]":
                     j += 1
-                bracket_content = query[i+1:j]
+                bracket_content = query[i + 1 : j]
                 if bracket_content.startswith('"') and bracket_content.endswith('"'):
                     tokens.append(("key", bracket_content[1:-1]))
                 else:
@@ -304,7 +353,7 @@ if "__omp_prelude_loaded__" not in globals():
             i += 1
         if current_token:
             tokens.append(("key", current_token))
-        
+
         # Apply tokens
         current = data
         for token_type, value in tokens:
@@ -316,9 +365,8 @@ if "__omp_prelude_loaded__" not in globals():
                 if not isinstance(current, dict) or value not in current:
                     return None
                 current = current[value]
-        
-        return current
 
+        return current
 
     def _tool_proxy_from_env() -> tuple[str, str, str]:
         base = os.environ.get("PI_TOOL_BRIDGE_URL")
@@ -328,12 +376,21 @@ if "__omp_prelude_loaded__" not in globals():
             raise RuntimeError("tool bridge is unavailable in this kernel")
         return (base.rstrip("/"), token, session)
 
+    import urllib.error, urllib.request
+
+    # urllib discovers environment and macOS SystemConfiguration proxies. This
+    # host-owned loopback endpoint must always connect directly.
+    _BRIDGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
     def _bridge_call(name: str, args: dict):
         """POST one request to the host tool bridge and return its `value`."""
-        import urllib.request, urllib.error
         base, token, session = _tool_proxy_from_env()
         _run_id_getter = globals().get("__omp_current_run_id__")
-        _run_id = _run_id_getter() if callable(_run_id_getter) else globals().get("__omp_run_id__")
+        _run_id = (
+            _run_id_getter()
+            if callable(_run_id_getter)
+            else globals().get("__omp_run_id__")
+        )
         payload = json.dumps(
             {"session": session, "run": _run_id, "name": name, "args": args}
         ).encode("utf-8")
@@ -347,7 +404,7 @@ if "__omp_prelude_loaded__" not in globals():
             },
         )
         try:
-            with urllib.request.urlopen(req) as resp:
+            with _BRIDGE_OPENER.open(req) as resp:
                 body = resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read()
@@ -362,6 +419,39 @@ if "__omp_prelude_loaded__" not in globals():
             raise RuntimeError(msg or f"bridge call {name!r} failed")
         return data.get("value")
 
+    def _surface_bridged_tool_images(value):
+        """Surface bridge metadata/images without leaking opaque payloads to cell code."""
+        if not isinstance(value, dict):
+            return value
+        images = value.get("images")
+        if not isinstance(images, list) or not images:
+            return value
+        displayed = 0
+        for image in images:
+            if not isinstance(image, dict):
+                continue
+            data = image.get("data")
+            mime_type = image.get("mimeType")
+            if not isinstance(data, str) or not isinstance(mime_type, str):
+                continue
+            _omp_display({mime_type: data}, raw=True)
+            displayed += 1
+        if displayed == 0:
+            return value
+        surfaced = {key: item for key, item in value.items() if key != "images"}
+        suffix = "" if displayed == 1 else "s"
+        surfaced["images"] = f"({displayed} image{suffix} displayed)"
+        return surfaced
+
+    async def _omp_prelude(name: str, parameters):
+        """Invoke one enabled eval prelude capability through the host bridge."""
+        value = await asyncio.to_thread(
+            _bridge_call,
+            "__prelude__",
+            {"name": name, "parameters": parameters},
+        )
+        return _surface_bridged_tool_images(value)
+
     class _ToolCallable:
         """Invokes one host-side tool via the loopback HTTP bridge."""
 
@@ -373,7 +463,7 @@ if "__omp_prelude_loaded__" not in globals():
         def __repr__(self) -> str:
             return f"<tool.{self._name}>"
 
-        def __call__(self, args=None, /, **kwargs):
+        async def __call__(self, args=None, /, **kwargs):
             if args is None:
                 merged: dict = {}
             elif isinstance(args, dict):
@@ -385,12 +475,165 @@ if "__omp_prelude_loaded__" not in globals():
             merged.update(kwargs)
             if INTENT_FIELD not in merged:
                 merged[INTENT_FIELD] = "py prelude"
-            return _bridge_call(self._name, merged)
+            value = await asyncio.to_thread(_bridge_call, self._name, merged)
+            return _surface_bridged_tool_images(value)
+
+    def _annotation_schema(annotation) -> dict:
+        """Map supported Python annotations to JSON Schema."""
+        if annotation is inspect.Parameter.empty or annotation is typing.Any:
+            return {}
+
+        origin = typing.get_origin(annotation)
+        args = typing.get_args(annotation)
+        if origin is typing.Annotated:
+            schema = _annotation_schema(args[0])
+            description = next((item for item in args[1:] if isinstance(item, str)), None)
+            if description is not None:
+                schema = {**schema, "description": description}
+            return schema
+        if origin is typing.Literal:
+            return {"enum": list(args)}
+        if origin in (typing.Union, types.UnionType):
+            non_null = [item for item in args if item is not type(None)]
+            if len(non_null) == 1 and len(non_null) != len(args):
+                return {
+                    "anyOf": [
+                        _annotation_schema(non_null[0]),
+                        {"type": "null"},
+                    ]
+                }
+            return {}
+
+        if annotation is str:
+            return {"type": "string"}
+        if annotation is int:
+            return {"type": "integer"}
+        if annotation is float:
+            return {"type": "number"}
+        if annotation is bool:
+            return {"type": "boolean"}
+
+        array_origins = {
+            list,
+            tuple,
+            set,
+            collections.abc.Sequence,
+        }
+        if annotation in array_origins or origin in array_origins:
+            schema = {"type": "array"}
+            if args:
+                schema["items"] = _annotation_schema(args[0])
+            return schema
+
+        object_origins = {
+            dict,
+            collections.abc.Mapping,
+        }
+        if annotation in object_origins or origin in object_origins:
+            schema = {"type": "object"}
+            if len(args) >= 2:
+                schema["additionalProperties"] = _annotation_schema(args[1])
+            return schema
+        return {}
+
+    def _tool_schema(fn) -> dict:
+        """Infer one eval-defined tool's object schema from its signature."""
+        signature = inspect.signature(fn)
+        try:
+            hints = typing.get_type_hints(fn, include_extras=True)
+        except Exception:
+            hints = getattr(fn, "__annotations__", {})
+        properties = {}
+        required = []
+        for parameter in signature.parameters.values():
+            if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
+                raise TypeError("tool parameters must be keyword-capable")
+            if parameter.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
+            schema = _annotation_schema(hints.get(parameter.name, parameter.annotation))
+            if parameter.default is inspect.Parameter.empty:
+                required.append(parameter.name)
+            else:
+                try:
+                    json.dumps(parameter.default)
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    schema = {**schema, "default": parameter.default}
+            properties[parameter.name] = schema
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+
+    class _EvalTool:
+        """Kernel-owned function and its model-facing tool metadata."""
+
+        __slots__ = ("name", "fn", "description", "parameters")
+
+        def __init__(self, name, fn, description, parameters):
+            self.name = name
+            self.fn = fn
+            self.description = description
+            self.parameters = parameters
+
+        def describe(self) -> dict:
+            return {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+
+    __omp_tools__: dict[str, _EvalTool] = {}
+    globals()["__omp_tools__"] = __omp_tools__
+    _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
     class _ToolProxy:
-        """`tool.<name>(args)` proxy mirroring the JS runtime bridge."""
+        """Define kernel tools or invoke host-side tools by attribute."""
 
         __slots__ = ()
+
+        def __call__(self, fn=None, /, *, name=None, description=None):
+            if fn is None:
+                return lambda decorated: self(
+                    decorated,
+                    name=name,
+                    description=description,
+                )
+            if not callable(fn):
+                raise TypeError("@tool expects a function")
+            resolved_name = name or getattr(fn, "__name__", "")
+            if not isinstance(resolved_name, str) or _TOOL_NAME_RE.fullmatch(resolved_name) is None:
+                raise ValueError(f"invalid tool name {resolved_name!r}")
+            schema = _tool_schema(fn)
+            resolved_description = (
+                description
+                if isinstance(description, str) and description
+                else inspect.getdoc(fn) or f"Python tool {resolved_name}"
+            )
+            __omp_tools__[resolved_name] = _EvalTool(
+                resolved_name,
+                fn,
+                resolved_description,
+                schema,
+            )
+            _emit_status(
+                "tool_define",
+                name=resolved_name,
+                params=list(schema["properties"]),
+            )
+            return fn
+
+        def defined(self) -> list[str]:
+            return list(__omp_tools__)
+
+        def undefine(self, name) -> bool:
+            return __omp_tools__.pop(name, None) is not None
 
         def __getattr__(self, name: str) -> _ToolCallable:
             if name.startswith("_"):
@@ -402,183 +645,253 @@ if "__omp_prelude_loaded__" not in globals():
 
         def __repr__(self) -> str:
             session = os.environ.get("PI_TOOL_BRIDGE_SESSION")
-            return f"<tool proxy session={session}>" if session else "<tool proxy unavailable>"
+            return (
+                f"<tool proxy session={session}>"
+                if session
+                else "<tool proxy unavailable>"
+            )
 
     tool = _ToolProxy()
 
-    def completion(prompt, *, model="default", system=None, schema=None):
-        """Oneshot, stateless completion against a model tier.
+    _HANDLE_UNSET = object()
 
-        `model` selects a tier: "smol", "default" (the session's active model),
-        or "slow". Pass `system` for a system prompt. Pass a JSON-Schema dict
-        as `schema` to force a structured response; the parsed object is then
-        returned instead of the completion text.
-        """
+    class _Handle:
+        """Shared process-local agent/completion handle behavior."""
+
+        __slots__ = ("id", "_schema", "_result")
+
+        kind = ""
+
+        def __init__(self, id, schema=None):
+            self.id = id
+            self._schema = schema
+            self._result = _HANDLE_UNSET
+
+        @property
+        def status(self):
+            snapshot = _bridge_call(
+                "__status__",
+                {"item": {"kind": self.kind, "id": self.id}},
+            )
+            return snapshot.get("status") if isinstance(snapshot, dict) else "failed"
+
+        def done(self):
+            return self.status != "running"
+
+        def wait(self, timeout=None):
+            if self._result is not _HANDLE_UNSET:
+                return self._result
+            return wait([self], timeout=timeout)[0]
+
+        def cancel(self):
+            result = _bridge_call(
+                "__cancel__",
+                {"item": {"kind": self.kind, "id": self.id}},
+            )
+            return bool(result.get("cancelled")) if isinstance(result, dict) else False
+
+        def __await__(self):
+            return asyncio.get_running_loop().run_in_executor(
+                None,
+                self.wait,
+            ).__await__()
+
+    class AgentHandle(_Handle):
+        """Background subagent handle returned by ``agent()``."""
+
+        __slots__ = ("agent", "handle")
+        kind = "agent"
+
+        def __init__(self, id, agent, schema=None):
+            super().__init__(id, schema)
+            self.agent = agent
+            self.handle = f"agent://{id}"
+
+        def __repr__(self):
+            return f"<agent {self.id} ({self.agent})>"
+
+        def send(self, message):
+            return _bridge_call(
+                "hub",
+                {
+                    "op": "send",
+                    "to": self.id,
+                    "message": str(message),
+                    "i": "agent handle",
+                },
+            )
+
+        def output(self, **kwargs):
+            return output(self.id, **kwargs)
+
+    class CompletionHandle(_Handle):
+        """Background one-shot completion handle returned by ``completion()``."""
+
+        __slots__ = ()
+        kind = "completion"
+
+        def __repr__(self):
+            return f"<completion {self.id}>"
+
+    def _handle_value(handle, snapshot):
+        status = snapshot.get("status") if isinstance(snapshot, dict) else "failed"
+        if status == "running":
+            raise TimeoutError(f"{handle.kind} handle {handle.id} is still running")
+        if status in ("failed", "cancelled"):
+            message = (
+                snapshot.get("error")
+                if isinstance(snapshot, dict)
+                else f"{handle.kind} handle {handle.id} failed"
+            )
+            raise RuntimeError(message or f"{handle.kind} handle {handle.id} failed")
+        if isinstance(snapshot, dict) and "data" in snapshot:
+            value = snapshot["data"]
+        else:
+            text = snapshot.get("text", "") if isinstance(snapshot, dict) else ""
+            value = json.loads(text) if handle._schema is not None else text
+        handle._result = value
+        return value
+
+    def wait(handles, timeout=None, *, raise_errors=True):
+        """Wait for agent/completion handles in input order."""
+        items = [handles] if isinstance(handles, _Handle) else list(handles)
+        for handle in items:
+            if not isinstance(handle, _Handle):
+                raise TypeError("wait() expects agent or completion handles")
+        results = [None] * len(items)
+        pending = []
+        pending_indexes = []
+        for index, handle in enumerate(items):
+            if handle._result is _HANDLE_UNSET:
+                pending.append({"kind": handle.kind, "id": handle.id})
+                pending_indexes.append(index)
+            else:
+                results[index] = handle._result
+        if pending:
+            args = {"items": pending}
+            if timeout is not None:
+                args["timeoutMs"] = max(0, float(timeout) * 1000)
+            response = _bridge_call("__wait__", args)
+            snapshots = response.get("items", []) if isinstance(response, dict) else []
+            for index, handle, snapshot in zip(
+                pending_indexes,
+                (items[index] for index in pending_indexes),
+                snapshots,
+            ):
+                try:
+                    results[index] = _handle_value(handle, snapshot)
+                except RuntimeError as error:
+                    results[index] = error
+            if len(snapshots) != len(pending):
+                raise RuntimeError("wait() returned an incomplete handle result")
+        if raise_errors:
+            for result in results:
+                if isinstance(result, RuntimeError):
+                    raise result
+        return results
+
+    def completion(prompt, *, model="default", system=None, schema=None):
+        """Start a stateless completion and return its handle."""
         args = {"prompt": prompt, "model": model}
         if system is not None:
             args["system"] = system
         if schema is not None:
             args["schema"] = schema
-        res = _bridge_call("__completion__", args)
-        text = res.get("text") if isinstance(res, dict) else res
-        return json.loads(text) if schema is not None else text
+        result = _bridge_call("__completion__", args)
+        if not isinstance(result, dict) or not isinstance(result.get("id"), str):
+            raise RuntimeError("completion() did not return a handle")
+        return CompletionHandle(result["id"], schema)
 
-    def agent(prompt, *, agent="task", model=None, label=None, schema=None, isolated=None, apply=None, merge=None, handle=False):
-        """Run a subagent and return its final output.
-
-        `agent` selects the subagent definition (default "task"). Pass
-        `model` to override that agent's model, `label` for the output artifact
-        id, and `schema` to request structured JSON output; when `schema` is
-        supplied the parsed object is returned. Share background by writing a
-        local:// file and referencing it in the prompt.
-
-        Pass `isolated=True` to run the subagent inside an isolation worktree
-        (copy-on-write of the parent repo) so parallel `agent()` spawns can
-        edit overlapping files safely. Strict opt-in, mirroring the `task`
-        tool: the default is non-isolated regardless of `task.isolation.mode`.
-        `isolated=True` while the setting is `"none"` errors out instead of
-        silently downgrading.
-
-        When isolated, `apply=False` keeps captured changes inside the
-        worktree and surfaces the root patch path, branch name, and nested
-        repository patches through the DAG node dict (combine with
-        `handle=True` to receive them — see below; the bare return type
-        stays bytes/string/parsed object and has nowhere to expose artifacts).
-        `merge=False` forces patch mode even when `task.isolation.merge` is
-        `"branch"`, avoiding the per-call git lock + repo mutation that branch
-        mode performs.
-
-        Set `handle=True` to receive a DAG node dict instead of bare
-        text: ``{"text", "output", "handle", "id", "agent"}`` where ``handle``
-        is the spawned agent's recoverable ``agent://<id>`` URI. A downstream
-        ``pipeline``/``parallel`` stage embeds that ``handle`` (or ``output``)
-        in its prompt so a large transcript flows through the graph by
-        reference, never re-inlined. When ``schema`` is also set the parsed
-        object lands under ``"data"``. When the spawn ran isolated the node
-        also carries ``"isolated"`` and, when present, ``"patch_path"``,
-        ``"branch_name"``, ``"nested_patches"``, ``"changes_applied"``
-        (``True``/``False``/``None`` — ``None`` means ``apply=False``), and
-        ``"isolation_summary"``. If
-        the bridge returns no recoverable id the node still resolves with
-        ``handle=None`` — the helper never throws.
-        """
+    def agent(
+        prompt,
+        *,
+        agent=None,
+        label=None,
+        schema=None,
+        schema_mode=None,
+        isolated=None,
+        apply=None,
+        merge=None,
+        tools=None,
+    ):
+        """Start a background subagent and return its handle."""
         args = {"prompt": prompt}
         if agent is not None:
             args["agent"] = agent
-        if model is not None:
-            args["model"] = model
         if label is not None:
             args["label"] = label
         if schema is not None:
             args["schema"] = schema
+        if schema_mode is not None:
+            args["schemaMode"] = schema_mode
         if isolated is not None:
             args["isolated"] = bool(isolated)
         if apply is not None:
             args["apply"] = bool(apply)
         if merge is not None:
             args["merge"] = bool(merge)
-        if handle:
-            args["handle"] = True
-        res = _bridge_call("__agent__", args)
-        text = res.get("text") if isinstance(res, dict) else res
-        parsed = json.loads(text) if schema is not None else text
-        if not handle:
-            return parsed
-        details = res.get("details") if isinstance(res, dict) else None
-        if not isinstance(details, dict) or details.get("id") is None:
-            return {"text": text, "output": text, "handle": None, "id": None, "agent": None}
-        node = {
-            "text": text,
-            "output": text,
-            "handle": f"agent://{details['id']}",
-            "id": details["id"],
-            "agent": details.get("agent"),
-        }
-        if schema is not None:
-            node["data"] = parsed
-        for src_key, dst_key in (
-            ("isolated", "isolated"),
-            ("patchPath", "patch_path"),
-            ("branchName", "branch_name"),
-            ("nestedPatches", "nested_patches"),
-            ("changesApplied", "changes_applied"),
-            ("isolationSummary", "isolation_summary"),
-        ):
-            if src_key in details:
-                node[dst_key] = details[src_key]
-        return node
+        if tools is not None:
+            args["tools"] = list(tools)
+        result = _bridge_call("__agent__", args)
+        if not isinstance(result, dict) or not isinstance(result.get("id"), str):
+            raise RuntimeError("agent() did not return a handle")
+        return AgentHandle(result["id"], result.get("agent"), schema)
 
-    def _concurrency_limit():
-        """Worker-pool ceiling from the host ``task.maxConcurrency`` setting.
+    class WorkPool:
+        """Pool of keep-alive subagents fed through the host workpool bridge."""
 
-        An eval fan-out runs as wide as a ``task`` batch would. Returns ``0`` for
-        unbounded (run every item at once); falls back to ``0`` if the host
-        bridge is unreachable.
-        """
-        try:
-            snap = _bridge_call("__concurrency__", {}) or {}
-            n = int(snap.get("limit") or 0)
-        except Exception:
-            return 0
-        return n if n > 0 else 0
+        __slots__ = ("name", "agent", "limit")
 
-    def _pool_map(items, fn):
-        """Run ``fn`` over ``items`` through a bounded thread pool.
+        def __init__(self, name, agent, limit):
+            self.name = name
+            self.agent = agent
+            self.limit = limit
 
-        Preserves input order, barriers until every task settles, and raises the
-        lowest-index exception if any task failed. Each task runs inside a copy
-        of the submitting thread's context so the ``_CURRENT_RID`` ContextVar
-        propagates and bridge calls (agent(), tool.*, etc.) keep working. The
-        pool width tracks ``task.maxConcurrency`` (0 = run every item at once).
-        """
-        import concurrent.futures, contextvars
-        items = list(items)
-        if not items:
-            return []
-        limit = _concurrency_limit()
-        workers = min(limit, len(items)) if limit > 0 else len(items)
-        results = [None] * len(items)
-        errors = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {}
-            for i, item in enumerate(items):
-                ctx = contextvars.copy_context()
-                futures[pool.submit(ctx.run, fn, item)] = i
-            for fut in concurrent.futures.as_completed(futures):
-                i = futures[fut]
-                try:
-                    results[i] = fut.result()
-                except BaseException as exc:  # noqa: BLE001 - propagate to caller
-                    errors[i] = exc
-        if errors:
-            raise errors[min(errors)]
-        return results
+        def push(self, *items):
+            if not all(isinstance(item, str) for item in items):
+                raise TypeError("WorkPool.push() expects string items")
+            result = _bridge_call(
+                "__workpool__",
+                {"op": "push", "name": self.name, "items": list(items)},
+            )
+            return result.get("ids", []) if isinstance(result, dict) else []
 
-    def parallel(thunks):
-        """Run zero-arg callables through a bounded pool, preserving input order.
+        def status(self):
+            return _bridge_call(
+                "__workpool__",
+                {"op": "status", "name": self.name},
+            )
 
-        Barriers until all finish; re-raises the lowest-index exception if any
-        thunk raised. Pool width tracks the task tool's ``task.maxConcurrency``.
-        """
-        thunks = list(thunks)
-        for t in thunks:
-            if not callable(t):
-                raise TypeError("parallel() expects an iterable of zero-arg callables")
-        return _pool_map(thunks, lambda t: t())
+        def peek(self):
+            return _bridge_call(
+                "__workpool__",
+                {"op": "peek", "name": self.name},
+            )
 
-    def pipeline(items, *stages):
-        """Map items left-to-right through one-arg stage callables.
+        def close(self):
+            return _bridge_call(
+                "__workpool__",
+                {"op": "close", "name": self.name},
+            )
 
-        Every item clears stage N before any item enters stage N+1 (barrier per
-        stage). Stage 1 receives the original item; later stages receive the
-        previous stage's result. Pool width tracks ``task.maxConcurrency``.
-        """
-        current = list(items)
-        for stage in stages:
-            if not callable(stage):
-                raise TypeError("pipeline() stages must be callables")
-            current = _pool_map(current, stage)
-        return current
+        def __repr__(self):
+            return f"<workpool {self.name} ({self.agent}) {self.limit} agents>"
+
+    def workpool(agent=None, *, name=None, context=None, tools=None):
+        """Create a pool of keep-alive subagents."""
+        args = {"op": "create"}
+        if agent is not None:
+            args["agent"] = agent
+        if name is not None:
+            args["name"] = name
+        if context is not None:
+            args["context"] = context
+        if tools is not None:
+            args["tools"] = list(tools)
+        result = _bridge_call("__workpool__", args)
+        if not isinstance(result, dict) or not isinstance(result.get("name"), str):
+            raise RuntimeError("workpool() did not return a pool")
+        return WorkPool(result["name"], result.get("agent"), result.get("limit"))
 
     def log(message):
         """Emit a status ``log`` event for TUI rendering."""

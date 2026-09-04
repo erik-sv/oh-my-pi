@@ -17,14 +17,24 @@ import {
 	wrapTextWithAnsi,
 } from "@oh-my-pi/pi-tui";
 import type {
+	ExtensionAskDialogOption,
 	ExtensionAskDialogQuestion,
 	ExtensionAskDialogResultItem,
 	ExtensionAskDialogSubmitResult,
 } from "../../extensibility/extensions";
+import { expandKeyHint } from "../../tools/render-utils";
 import { getTabBarTheme } from "../shared";
 import { getMarkdownTheme, highlightCode, theme } from "../theme/theme";
-import { matchesSelectCancel, matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
+import {
+	matchesAppToolsExpand,
+	matchesSelectCancel,
+	matchesSelectDown,
+	matchesSelectPageDown,
+	matchesSelectPageUp,
+	matchesSelectUp,
+} from "../utils/keybinding-matchers";
 import { CountdownTimer } from "./countdown-timer";
+import { editorKey } from "./keybinding-hints";
 import { bottomBorder, divider, row, topBorder } from "./overlay-box";
 import { handleTabSwitchKey } from "./selector-helpers";
 
@@ -38,9 +48,6 @@ const SUBMIT_OPTION = "Submit";
 const DIALOG_HEIGHT_RATIO = 0.7;
 const MIN_DIALOG_ROWS = 12;
 const MIN_BODY_ROWS = 5;
-const PREVIEW_MIN_WIDTH = 40;
-const SIDE_BY_SIDE_LIST_MIN_WIDTH = 30;
-const SIDE_BY_SIDE_GAP_WIDTH = 3;
 const MAX_HEADER_CHIP_WIDTH = 16;
 /** Maximum number of title lines shown in the prompt editor overlay, so a
  *  long or multi-line question cannot push the input row off-screen. Mirrors
@@ -77,10 +84,21 @@ interface AskDialogCallbacks {
 	onPrompt(title: string, prefill?: string): Promise<string | undefined>;
 }
 
+interface AskDialogInputGuard {
+	isBlocked(): boolean;
+	handleInput(keyData: string): void;
+	hint: string;
+	/** Mirror the guard's blocked state onto the proxied draft surface each
+	 *  render, so a draft that owns input shows a visible insertion cursor even
+	 *  though this dialog holds TUI focus. */
+	syncPresentation?(): void;
+}
+
 interface AskDialogOptions {
 	timeout?: number;
 	onTimeout?: () => void;
 	tui?: TUI;
+	inputGuard?: AskDialogInputGuard;
 }
 
 interface QuestionState {
@@ -90,6 +108,7 @@ interface QuestionState {
 	noteRowKey: string | undefined;
 	cursorIndex: number;
 	scrollOffset: number;
+	manualScroll: boolean;
 	timedOut: boolean;
 }
 
@@ -114,13 +133,10 @@ interface PreviewSegment {
 	language: string | undefined;
 }
 
+type PreviewRenderCache = Map<string, Map<number, readonly string[]>>;
+
 function clamp(value: number, min: number, max: number): number {
 	return Math.max(min, Math.min(value, max));
-}
-
-function stripRecommendedSuffix(label: string): string {
-	const suffix = " (Recommended)";
-	return label.endsWith(suffix) ? label.slice(0, -suffix.length) : label;
 }
 
 function questionTabLabel(question: ExtensionAskDialogQuestion, index: number): string {
@@ -128,14 +144,18 @@ function questionTabLabel(question: ExtensionAskDialogQuestion, index: number): 
 	return truncateToWidth(replaceTabs(base), MAX_HEADER_CHIP_WIDTH, Ellipsis.Unicode);
 }
 
-function renderQuestionTitle(question: ExtensionAskDialogQuestion, width: number): string[] {
+function wrapQuestionTitle(question: ExtensionAskDialogQuestion, width: number): string[] {
 	const mdTheme = getMarkdownTheme();
 	const questionText = renderInlineMarkdown(replaceTabs(question.question), mdTheme, t => theme.fg("text", t));
-	const wrapped = wrapTextWithAnsi(questionText, Math.max(1, width));
-	if (wrapped.length <= MAX_HEADER_ROWS) return wrapped;
+	return wrapTextWithAnsi(questionText, Math.max(1, width));
+}
+
+function renderQuestionTitle(question: ExtensionAskDialogQuestion, width: number, maxRows = MAX_HEADER_ROWS): string[] {
+	const wrapped = wrapQuestionTitle(question, width);
+	if (wrapped.length <= maxRows) return wrapped;
 	return [
-		...wrapped.slice(0, MAX_HEADER_ROWS - 1),
-		truncateToWidth(wrapped.slice(MAX_HEADER_ROWS - 1).join(" "), Math.max(1, width), Ellipsis.Unicode),
+		...wrapped.slice(0, maxRows - 1),
+		truncateToWidth(wrapped.slice(maxRows - 1).join(" "), Math.max(1, width), Ellipsis.Unicode),
 	];
 }
 
@@ -211,6 +231,31 @@ function renderPreviewContent(preview: string, width: number): string[] {
 	return out;
 }
 
+function renderCachedPreview(cache: PreviewRenderCache, preview: string, width: number): readonly string[] {
+	let byWidth = cache.get(preview);
+	if (!byWidth) {
+		byWidth = new Map();
+		cache.set(preview, byWidth);
+	}
+	let rendered = byWidth.get(width);
+	if (!rendered) {
+		rendered = renderPreviewContent(preview, width).map(line => `      ${theme.fg("border", "│")} ${line}`);
+		byWidth.set(width, rendered);
+	}
+	return rendered;
+}
+
+function pageKeysLabel(): string {
+	const pageUp = editorKey("tui.select.pageUp");
+	const pageDown = editorKey("tui.select.pageDown");
+	return `${pageUp === "pageup" ? "PgUp" : pageUp}/${pageDown === "pagedown" ? "PgDn" : pageDown}`;
+}
+
+function cancelKeyLabel(): string {
+	const [key = ""] = editorKey("tui.select.cancel").split("/");
+	return key === "escape" ? "Esc" : key;
+}
+
 function normalizedInlineInput(input: string): string {
 	return replaceTabs(input).replace(/\s+/g, " ").trim();
 }
@@ -260,20 +305,31 @@ function renderRowLabel(
 	state: QuestionState,
 	selected: boolean,
 	mdTheme: MarkdownTheme,
+	previewCache: PreviewRenderCache,
 	width: number,
 ): string[] {
 	const isOption = rowItem.kind === "option";
 	const isOther = rowItem.kind === "other";
-	const checked = isOption
-		? state.selectedOptions.has(stripRecommendedSuffix(rowItem.label))
-		: isOther && state.customInput !== undefined;
+	const option = isOption ? question.options[rowItem.optionIndex ?? -1] : undefined;
+	const checked =
+		option !== undefined ? state.selectedOptions.has(option.label) : isOther && state.customInput !== undefined;
 	const color = selected ? "accent" : checked ? "toolOutput" : "text";
 	const marker = `${theme.fg(checked ? "success" : "dim", optionMarker(question, checked))} `;
 	const cursor = selected ? theme.fg("accent", `${theme.nav.cursor} `) : "  ";
 	const label = renderInlineMarkdown(rowItem.label, mdTheme, t => theme.fg(color, t));
 	const noteMarker = state.note && state.noteRowKey === rowItem.key ? theme.fg("success", "  ✎ note") : "";
-	const firstLine = `${cursor}${marker}${label}${noteMarker}`;
-	const lines = [truncateToWidth(firstLine, width, Ellipsis.Unicode)];
+	// `width` is already the inner content width consumed by row(); when a
+	// scrollbar is needed, renderRows() calls this again with one less column.
+	// Keep the cursor, option marker, first wrapped label line, and optional
+	// note marker within that budget so the outer fit() never truncates them.
+	const noteWidth = noteMarker ? visibleWidth(noteMarker) : 0;
+	const labelWidth = Math.max(1, width - visibleWidth(cursor) - visibleWidth(marker) - noteWidth);
+	const wrappedLabel = wrapTextWithAnsi(label, labelWidth);
+	const indent = padding(visibleWidth(cursor) + visibleWidth(marker));
+	const lines = [`${cursor}${marker}${wrappedLabel[0] ?? ""}${noteMarker}`];
+	for (let i = 1; i < wrappedLabel.length; i++) {
+		lines.push(`${indent}${wrappedLabel[i] ?? ""}`);
+	}
 	if (rowItem.kind === "option") {
 		const option = question.options[rowItem.optionIndex ?? -1];
 		if (option?.description?.trim()) {
@@ -283,6 +339,10 @@ function renderRowLabel(
 				lines.push(`      ${truncateToWidth(line, Math.max(1, width - 6), Ellipsis.Unicode)}`);
 			}
 		}
+		if (option?.preview?.trim()) {
+			const previewWidth = Math.max(1, width - 8);
+			lines.push(...renderCachedPreview(previewCache, option.preview, previewWidth));
+		}
 	}
 	if (isOther && state.customInput !== undefined) {
 		const preview = replaceTabs(state.customInput).replace(/\s+/g, " ").trim();
@@ -291,10 +351,51 @@ function renderRowLabel(
 	return lines;
 }
 
+/**
+ * Coerce untrusted dialog questions into a render-safe shape. The live ask
+ * dialog is reached from the public `askDialog` extension surface and from
+ * streamed tool args, where a question entry can arrive with a missing or
+ * non-string `question` field. The render helpers (`replaceTabs`,
+ * `renderQuestionTitle`, `questionTabLabel`) assume strings, so a malformed
+ * entry throws and takes down the whole TUI render loop. Mirrors
+ * `normalizeRenderQuestions` on the transcript path.
+ */
+function normalizeDialogQuestions(questions: ExtensionAskDialogQuestion[]): ExtensionAskDialogQuestion[] {
+	if (!Array.isArray(questions)) return [];
+	const out: ExtensionAskDialogQuestion[] = [];
+	for (const entry of questions) {
+		if (!entry || typeof entry !== "object") continue;
+		const q = entry as Partial<ExtensionAskDialogQuestion>;
+		const options: ExtensionAskDialogOption[] = [];
+		if (Array.isArray(q.options)) {
+			for (const opt of q.options) {
+				if (!opt || typeof opt !== "object") continue;
+				const o = opt as Partial<ExtensionAskDialogOption>;
+				options.push({
+					label: typeof o.label === "string" ? o.label : "",
+					...(typeof o.description === "string" ? { description: o.description } : {}),
+					...(typeof o.preview === "string" ? { preview: o.preview } : {}),
+				});
+			}
+		}
+		out.push({
+			id: typeof q.id === "string" ? q.id : "?",
+			question: typeof q.question === "string" ? q.question : "",
+			...(typeof q.header === "string" ? { header: q.header } : {}),
+			options,
+			...(typeof q.multi === "boolean" ? { multi: q.multi } : {}),
+			...(Number.isInteger(q.recommended) ? { recommended: q.recommended } : {}),
+		});
+	}
+	return out;
+}
+
 export class AskDialogComponent implements Component {
 	#states: QuestionState[];
 	#activeTabIndex = 0;
 	#submitScrollOffset = 0;
+	#bodyRows = MIN_BODY_ROWS;
+	#questionCanPage = false;
 	#remainingSeconds: number | undefined;
 	#countdown: CountdownTimer | undefined;
 	#promptActive = false;
@@ -302,13 +403,20 @@ export class AskDialogComponent implements Component {
 	#closed = false;
 	#tabBar: TabBar | undefined;
 	#stableHeight: { key: string; total: number } | undefined;
+	#previewCache: PreviewRenderCache = new Map();
+	#overflowLayouts = new WeakMap<ExtensionAskDialogQuestion, Set<string>>();
+	#expanded = false;
+	#contentWidth = 76;
+	#headerExpandable = false;
+	readonly #questions: ExtensionAskDialogQuestion[];
 
 	constructor(
-		private readonly questions: ExtensionAskDialogQuestion[],
+		questions: ExtensionAskDialogQuestion[],
 		private readonly callbacks: AskDialogCallbacks,
 		private readonly options: AskDialogOptions = {},
 	) {
-		this.#states = questions.map(question => {
+		this.#questions = normalizeDialogQuestions(questions);
+		this.#states = this.#questions.map(question => {
 			const recommended = Number.isInteger(question.recommended) ? question.recommended : 0;
 			const maxIndex = Math.max(0, question.options.length - 1);
 			return {
@@ -318,6 +426,7 @@ export class AskDialogComponent implements Component {
 				noteRowKey: undefined,
 				cursorIndex: clamp(recommended ?? 0, 0, maxIndex),
 				scrollOffset: 0,
+				manualScroll: false,
 				timedOut: false,
 			};
 		});
@@ -335,12 +444,30 @@ export class AskDialogComponent implements Component {
 
 	invalidate(): void {
 		this.#stableHeight = undefined;
+		this.#previewCache.clear();
+		this.#overflowLayouts = new WeakMap();
 		this.#tabBar?.invalidate();
 	}
 
 	dispose(): void {
 		this.#closed = true;
 		this.#countdown?.dispose();
+	}
+
+	/**
+	 * Toggle a truncated question header. Returns false when there is nothing
+	 * to expand so the global Ctrl+O listener can still expand transcript tools.
+	 */
+	toggleQuestionExpansion(): boolean {
+		if (this.#closed || this.#isSubmitTab()) return false;
+		const question = this.#questions[this.#currentQuestionIndex()];
+		if (!question) return false;
+		const overflows = wrapQuestionTitle(question, this.#contentWidth).length > MAX_HEADER_ROWS;
+		if (!overflows) return false;
+		this.#expanded = !this.#expanded;
+		this.invalidate();
+		this.#requestRender();
+		return true;
 	}
 
 	handleInput(keyData: string): void {
@@ -350,6 +477,18 @@ export class AskDialogComponent implements Component {
 		this.#countdown?.reset();
 		if (matchesSelectCancel(keyData)) {
 			this.#finishCancel();
+			return;
+		}
+		// Expand before the draft-input guard so Ctrl+O can reveal a truncated
+		// question even while a pending prompt still owns typing.
+		if (matchesAppToolsExpand(keyData)) {
+			this.toggleQuestionExpansion();
+			return;
+		}
+		const inputGuard = this.options.inputGuard;
+		if (inputGuard?.isBlocked()) {
+			inputGuard.handleInput(keyData);
+			this.#requestRender();
 			return;
 		}
 		if (this.#hasSubmitTab() && handleTabSwitchKey(keyData, direction => this.#switchTab(direction))) {
@@ -364,19 +503,28 @@ export class AskDialogComponent implements Component {
 	}
 
 	render(width: number): readonly string[] {
+		// Keep the proxied draft's cursor visible while it owns input (the editor
+		// renders as the next sibling in the same container, so this lands in the
+		// same frame).
+		this.options.inputGuard?.syncPresentation?.();
 		const innerWidth = Math.max(1, width - 4);
+		this.#contentWidth = innerWidth;
 		// Fixed panel height: measured from the tallest tab at spawn and
 		// re-measured only when the viewport changes. Tab switches, cursor
 		// moves, and later answers never resize the box; content that
-		// outgrows it scrolls.
+		// outgrows it scrolls. Expanding a truncated question uses the space
+		// available within the existing height cap.
 		const totalRows = this.#dialogHeight(innerWidth, process.stdout.rows || 40);
-		const headerLines = this.#renderHeader(innerWidth);
+		const tabBarRows = this.#hasSubmitTab() ? 1 : 0;
+		const maxTitleRows = Math.max(1, totalRows - 5 - MIN_BODY_ROWS - tabBarRows);
+		const headerLines = this.#renderHeader(innerWidth, maxTitleRows);
 		// topBorder(1) + header(N) + divider(1) + divider(1) + footer(1) +
 		// bottomBorder(1) = N + 5 fixed rows outside the body. Without the
 		// bottomBorder term the dialog overflowed the viewport by one row
 		// (PRRT_kwDOQxs0bc6OFbDY).
 		const fixedRows = 1 + headerLines.length + 1 + 1 + 1 + 1;
 		const bodyRows = Math.max(MIN_BODY_ROWS, totalRows - fixedRows);
+		this.#bodyRows = bodyRows;
 		const bodyLines = this.#isSubmitTab()
 			? this.#renderSubmitBody(innerWidth, bodyRows)
 			: this.#renderQuestionBody(innerWidth, bodyRows);
@@ -393,7 +541,7 @@ export class AskDialogComponent implements Component {
 	}
 
 	#dialogHeight(width: number, termRows: number): number {
-		const key = `${width}:${termRows}`;
+		const key = `${width}:${termRows}:${this.#expanded ? 1 : 0}`;
 		if (this.#stableHeight?.key === key) return this.#stableHeight.total;
 		const total = this.#measureHeight(width, termRows);
 		this.#stableHeight = { key, total };
@@ -410,37 +558,27 @@ export class AskDialogComponent implements Component {
 		const tabBarRows = this.#hasSubmitTab() ? 1 : 0;
 		const mdTheme = getMarkdownTheme();
 		let needed = MIN_DIALOG_ROWS;
-		for (let index = 0; index < this.questions.length; index++) {
-			const question = this.questions[index];
+		for (let index = 0; index < this.#questions.length; index++) {
+			const question = this.#questions[index];
 			const state = this.#states[index];
 			if (!question || !state) continue;
-			const headerRows = tabBarRows + renderQuestionTitle(question, width).length;
+			const titleRows = this.#expanded ? Number.POSITIVE_INFINITY : MAX_HEADER_ROWS;
+			const headerRows = tabBarRows + renderQuestionTitle(question, width, titleRows).length;
 			const rowItems = this.#questionRows(question);
 			const listRows = (listWidth: number): number => {
 				let total = 0;
 				for (const rowItem of rowItems) {
-					total += renderRowLabel(rowItem, question, state, false, mdTheme, listWidth).length;
+					total += renderRowLabel(rowItem, question, state, false, mdTheme, this.#previewCache, listWidth).length;
 				}
 				return total;
 			};
-			let body = listRows(width);
-			const previews = question.options.filter(option => option.preview?.trim());
-			const sideBySide = width >= SIDE_BY_SIDE_LIST_MIN_WIDTH + PREVIEW_MIN_WIDTH + SIDE_BY_SIDE_GAP_WIDTH;
-			if (previews.length > 0 && sideBySide) {
-				const previewWidth = Math.max(PREVIEW_MIN_WIDTH, Math.floor(width * 0.45));
-				const listWidth = Math.max(1, width - previewWidth - SIDE_BY_SIDE_GAP_WIDTH);
-				let pane = 0;
-				for (const option of previews) {
-					pane = Math.max(pane, renderPreviewContent(option.preview ?? "", Math.max(1, previewWidth - 2)).length);
-				}
-				body = Math.max(body, listRows(listWidth), pane);
-			}
+			const body = listRows(width);
 			needed = Math.max(needed, chrome + headerRows + Math.max(MIN_BODY_ROWS, body));
 		}
 		if (this.#hasSubmitTab()) {
 			// Warning line + blank, one summary line per question, blank, and
 			// the Submit row; note lines added later scroll within the body.
-			const body = 2 + this.questions.length + 2;
+			const body = 2 + this.#questions.length + 2;
 			needed = Math.max(needed, chrome + tabBarRows + 1 + Math.max(MIN_BODY_ROWS, body));
 		}
 		return Math.min(needed, maxHeight);
@@ -454,11 +592,11 @@ export class AskDialogComponent implements Component {
 		// Multi questions confirm on the Submit tab (Enter toggles, never
 		// submits), so any multi question forces the tab even when there is
 		// only one question.
-		return this.questions.length > 1 || this.questions.some(question => question.multi);
+		return this.#questions.length > 1 || this.#questions.some(question => question.multi);
 	}
 
 	#submitTabIndex(): number {
-		return this.questions.length;
+		return this.#questions.length;
 	}
 
 	#isSubmitTab(): boolean {
@@ -466,18 +604,18 @@ export class AskDialogComponent implements Component {
 	}
 
 	#currentQuestionIndex(): number {
-		return clamp(this.#activeTabIndex, 0, Math.max(0, this.questions.length - 1));
+		return clamp(this.#activeTabIndex, 0, Math.max(0, this.#questions.length - 1));
 	}
 
 	#requestRender(): void {
 		this.options.tui?.requestRender();
 	}
 
-	#renderHeader(width: number): string[] {
+	#renderHeader(width: number, maxTitleRows: number): string[] {
 		const lines: string[] = [];
 		if (this.#hasSubmitTab()) {
 			const tabs: Tab[] = [
-				...this.questions.map((question, index) => ({
+				...this.#questions.map((question, index) => ({
 					id: String(index),
 					label: questionTabLabel(question, index),
 				})),
@@ -488,25 +626,47 @@ export class AskDialogComponent implements Component {
 			lines.push(...this.#tabBar.render(width));
 		}
 		if (this.#isSubmitTab()) {
+			this.#headerExpandable = false;
 			lines.push(theme.bold(theme.fg("accent", "Review answers")));
 			return lines;
 		}
 		const questionIndex = this.#currentQuestionIndex();
-		const question = this.questions[questionIndex];
-		if (!question) return lines;
-		lines.push(...renderQuestionTitle(question, width));
+		const question = this.#questions[questionIndex];
+		if (!question) {
+			this.#headerExpandable = false;
+			return lines;
+		}
+		const wrapped = wrapQuestionTitle(question, width);
+		this.#headerExpandable = wrapped.length > MAX_HEADER_ROWS;
+		const maxRows = this.#expanded ? maxTitleRows : MAX_HEADER_ROWS;
+		lines.push(...renderQuestionTitle(question, width, maxRows));
 		return lines;
 	}
 
+	#expandHint(): string {
+		if (!this.#headerExpandable) return "";
+		return ` · ${expandKeyHint()} ${this.#expanded ? "collapse" : "expand"}`;
+	}
+
 	#footerHintText(indicator: string): string {
-		const scroll = indicator ? ` ${indicator} scroll ·` : "";
+		const cancel = `${cancelKeyLabel()} cancel`;
+		const inputGuard = this.options.inputGuard;
+		if (inputGuard?.isBlocked()) return `${inputGuard.hint}${this.#expandHint()} · ${cancel}`;
 		if (this.#isSubmitTab()) {
-			return `Enter submit · ↑/↓ scroll ·${scroll} Esc cancel`;
+			const scroll = indicator ? ` ${indicator} scroll ·` : "";
+			return `Enter submit · ↑/↓ scroll ·${scroll} ${cancel}`;
 		}
-		const question = this.questions[this.#currentQuestionIndex()];
-		const action = question?.multi ? "Space/Enter toggle · n note" : "Enter select · n note";
-		const tabs = this.#hasSubmitTab() ? " · Tab/←/→ tabs" : "";
-		return `${action} · ↑/↓ move${tabs} ·${scroll} Esc cancel`;
+		const question = this.#questions[this.#currentQuestionIndex()];
+		// Enter advances in multi-question dialogs and submits single-question ones.
+		const enterAction = this.#questions.length > 1 ? "next" : "submit";
+		const action = question?.multi ? `Space toggle · Enter ${enterAction}` : "Enter select · n note";
+		const tabs = this.#hasSubmitTab() ? " · Tab/←/→" : "";
+		const expand = this.#expandHint();
+		if (this.#questionCanPage && indicator) {
+			return `${action} · ↑/↓${tabs} · ${cancel}${expand} · ${pageKeysLabel()} ${indicator}`;
+		}
+		const scroll = indicator ? ` ${indicator} scroll ·` : "";
+		return `${action} · ↑/↓ move${tabs} ·${scroll} ${cancel}${expand}`;
 	}
 
 	#questionRows(question: ExtensionAskDialogQuestion): QuestionRow[] {
@@ -521,11 +681,13 @@ export class AskDialogComponent implements Component {
 	}
 
 	#optionLabel(question: ExtensionAskDialogQuestion, label: string, index: number): string {
-		return question.recommended === index ? `${label} (Recommended)` : label;
+		const suffix = " (Recommended)";
+		if (question.recommended !== index || label.endsWith(suffix)) return label;
+		return `${label}${suffix}`;
 	}
 
 	#activeQuestionState(): { question: ExtensionAskDialogQuestion; state: QuestionState } | undefined {
-		const question = this.questions[this.#currentQuestionIndex()];
+		const question = this.#questions[this.#currentQuestionIndex()];
 		const state = this.#states[this.#currentQuestionIndex()];
 		if (!question || !state) return undefined;
 		return { question, state };
@@ -536,13 +698,27 @@ export class AskDialogComponent implements Component {
 		if (!active) return;
 		const { question, state } = active;
 		const rows = this.#questionRows(question);
+		if (matchesSelectPageUp(keyData)) {
+			state.scrollOffset = Math.max(0, state.scrollOffset - Math.max(1, this.#bodyRows - 1));
+			state.manualScroll = true;
+			this.#requestRender();
+			return;
+		}
+		if (matchesSelectPageDown(keyData)) {
+			state.scrollOffset += Math.max(1, this.#bodyRows - 1);
+			state.manualScroll = true;
+			this.#requestRender();
+			return;
+		}
 		if (matchesSelectUp(keyData)) {
 			state.cursorIndex = clamp(state.cursorIndex - 1, 0, Math.max(0, rows.length - 1));
+			state.manualScroll = false;
 			this.#requestRender();
 			return;
 		}
 		if (matchesSelectDown(keyData)) {
 			state.cursorIndex = clamp(state.cursorIndex + 1, 0, Math.max(0, rows.length - 1));
+			state.manualScroll = false;
 			this.#requestRender();
 			return;
 		}
@@ -556,7 +732,7 @@ export class AskDialogComponent implements Component {
 		}
 		const isEnter = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
 		const isSpace = matchesKey(keyData, "space") || keyData === " ";
-		if (!isEnter && !isSpace) return;
+		if (!isEnter && !(question.multi && isSpace)) return;
 		if (rowItem.kind === "other") {
 			void this.#promptForCustomInput(question, state, rowItem);
 			return;
@@ -564,8 +740,14 @@ export class AskDialogComponent implements Component {
 		const option = question.options[rowItem.optionIndex ?? -1];
 		if (!option) return;
 		if (question.multi) {
-			// Multi is toggle-only: Enter and Space both toggle, and the
-			// answer is confirmed from the Submit tab.
+			if (isEnter) {
+				// Enter confirms the current selection without toggling the
+				// focused option; Space toggles. Advances to the next question
+				// (submitting only for a single-question dialog), matching
+				// single-select Enter (#8252).
+				this.#advanceAfterQuestion();
+				return;
+			}
 			if (state.selectedOptions.has(option.label)) {
 				state.selectedOptions.delete(option.label);
 				clearNoteIfRow(state, rowItem.key);
@@ -598,18 +780,18 @@ export class AskDialogComponent implements Component {
 	}
 
 	#switchTab(direction: 1 | -1): void {
-		const tabCount = this.questions.length + 1;
+		const tabCount = this.#questions.length + 1;
 		this.#activeTabIndex = (this.#activeTabIndex + direction + tabCount) % tabCount;
 		this.#submitScrollOffset = 0;
 	}
 
 	#advanceAfterQuestion(): void {
 		const current = this.#currentQuestionIndex();
-		if (this.questions.length === 1) {
+		if (this.#questions.length === 1) {
 			this.#finishSubmit();
 			return;
 		}
-		this.#activeTabIndex = current + 1 < this.questions.length ? current + 1 : this.#submitTabIndex();
+		this.#activeTabIndex = current + 1 < this.#questions.length ? current + 1 : this.#submitTabIndex();
 		this.#submitScrollOffset = 0;
 		this.#requestRender();
 	}
@@ -672,33 +854,7 @@ export class AskDialogComponent implements Component {
 		const { question, state } = active;
 		const rowItems = this.#questionRows(question);
 		state.cursorIndex = clamp(state.cursorIndex, 0, Math.max(0, rowItems.length - 1));
-		const selectedRow = rowItems[state.cursorIndex];
-		const preview =
-			selectedRow?.kind === "option" ? question.options[selectedRow.optionIndex ?? -1]?.preview : undefined;
-		// The preview pane exists only while the highlighted option carries a
-		// preview; otherwise the list takes the full dialog width.
-		if (!preview?.trim()) return this.#renderQuestionList(question, state, rowItems, width, maxRows);
-		const sideBySide = width >= SIDE_BY_SIDE_LIST_MIN_WIDTH + PREVIEW_MIN_WIDTH + SIDE_BY_SIDE_GAP_WIDTH;
-		if (sideBySide) {
-			const previewWidth = Math.max(PREVIEW_MIN_WIDTH, Math.floor(width * 0.45));
-			const listWidth = Math.max(1, width - previewWidth - SIDE_BY_SIDE_GAP_WIDTH);
-			const list = this.#renderQuestionList(question, state, rowItems, listWidth, maxRows);
-			const previewLines = this.#renderPreviewPane(preview, previewWidth, maxRows);
-			const lines: string[] = [];
-			for (let index = 0; index < maxRows; index++) {
-				const left = truncateToWidth(list.lines[index] ?? "", listWidth, Ellipsis.Unicode);
-				const right = truncateToWidth(previewLines[index] ?? "", previewWidth, Ellipsis.Unicode);
-				const gap = padding(Math.max(1, listWidth - visibleWidth(left)) + 1);
-				lines.push(`${left}${gap}${theme.fg("border", "│")} ${right}`);
-			}
-			return { lines, scrollOffset: list.scrollOffset, indicator: list.indicator };
-		}
-		const previewLines = this.#renderPreviewPane(preview, width, Math.max(3, Math.min(8, Math.floor(maxRows * 0.4))));
-		const listRows = Math.max(3, maxRows - previewLines.length - 1);
-		const list = this.#renderQuestionList(question, state, rowItems, width, listRows);
-		const lines = [...list.lines, theme.fg("border", "─".repeat(Math.max(1, width))), ...previewLines];
-		while (lines.length < maxRows) lines.push("");
-		return { lines: lines.slice(0, maxRows), scrollOffset: list.scrollOffset, indicator: list.indicator };
+		return this.#renderQuestionList(question, state, rowItems, width, maxRows);
 	}
 
 	#renderQuestionList(
@@ -709,16 +865,51 @@ export class AskDialogComponent implements Component {
 		rows: number,
 	): RenderedList {
 		const mdTheme = getMarkdownTheme();
-		const allLines: string[] = [];
-		const lineStartByRow: number[] = [];
-		for (let index = 0; index < rowItems.length; index++) {
-			lineStartByRow.push(allLines.length);
-			const rowItem = rowItems[index];
-			if (!rowItem) continue;
-			allLines.push(...renderRowLabel(rowItem, question, state, index === state.cursorIndex, mdTheme, width));
+		const renderRows = (contentWidth: number): { allLines: string[]; lineStartByRow: number[] } => {
+			const allLines: string[] = [];
+			const lineStartByRow: number[] = [];
+			for (let index = 0; index < rowItems.length; index++) {
+				lineStartByRow.push(allLines.length);
+				const rowItem = rowItems[index];
+				if (!rowItem) continue;
+				allLines.push(
+					...renderRowLabel(
+						rowItem,
+						question,
+						state,
+						index === state.cursorIndex,
+						mdTheme,
+						this.#previewCache,
+						contentWidth,
+					),
+				);
+			}
+			return { allLines, lineStartByRow };
+		};
+		const layoutKey = `${width}:${rows}:${state.customInput === undefined ? 0 : 1}`;
+		let overflowLayouts = this.#overflowLayouts.get(question);
+		const knownOverflow = overflowLayouts?.has(layoutKey) ?? false;
+		let renderedRows = renderRows(knownOverflow && width > 1 ? width - 1 : width);
+		if (!knownOverflow && width > 1 && renderedRows.allLines.length > rows) {
+			if (!overflowLayouts) {
+				overflowLayouts = new Set();
+				this.#overflowLayouts.set(question, overflowLayouts);
+			}
+			overflowLayouts.add(layoutKey);
+			renderedRows = renderRows(width - 1);
 		}
+		const { allLines, lineStartByRow } = renderedRows;
 		const cursorStart = lineStartByRow[state.cursorIndex] ?? 0;
-		state.scrollOffset = this.#scrollOffsetForCursor(state.scrollOffset, cursorStart, rows, allLines.length);
+		const cursorEnd = lineStartByRow[state.cursorIndex + 1] ?? allLines.length;
+		this.#questionCanPage = cursorEnd - cursorStart > rows;
+		state.scrollOffset = this.#scrollOffsetForCursor(
+			state.scrollOffset,
+			cursorStart,
+			cursorEnd,
+			rows,
+			allLines.length,
+			state.manualScroll,
+		);
 		const scrollView = new ScrollView(allLines, {
 			height: rows,
 			scrollbar: "auto",
@@ -734,15 +925,6 @@ export class AskDialogComponent implements Component {
 		};
 	}
 
-	#renderPreviewPane(preview: string, width: number, maxRows: number): string[] {
-		const bodyWidth = Math.max(1, width - 2);
-		const content = renderPreviewContent(preview, bodyWidth);
-		if (content.length <= maxRows) return content;
-		const visibleCount = Math.max(1, maxRows - 1);
-		const hidden = content.length - visibleCount;
-		return [...content.slice(0, visibleCount), theme.fg("dim", `… ${hidden} more lines`)];
-	}
-
 	#renderSubmitBody(width: number, rows: number): RenderedList {
 		const allLines: string[] = [];
 		const unanswered = this.#unansweredCount();
@@ -755,8 +937,8 @@ export class AskDialogComponent implements Component {
 			);
 			allLines.push("");
 		}
-		for (let index = 0; index < this.questions.length; index++) {
-			const question = this.questions[index];
+		for (let index = 0; index < this.#questions.length; index++) {
+			const question = this.#questions[index];
 			const state = this.#states[index];
 			if (!question || !state) continue;
 			const label = questionTabLabel(question, index);
@@ -789,12 +971,25 @@ export class AskDialogComponent implements Component {
 		};
 	}
 
-	#scrollOffsetForCursor(currentOffset: number, cursorLine: number, rows: number, totalRows: number): number {
-		if (totalRows <= rows) return 0;
-		let nextOffset = clamp(currentOffset, 0, Math.max(0, totalRows - rows));
-		if (cursorLine < nextOffset) nextOffset = cursorLine;
-		if (cursorLine >= nextOffset + rows) nextOffset = cursorLine - rows + 1;
-		return clamp(nextOffset, 0, Math.max(0, totalRows - rows));
+	#scrollOffsetForCursor(
+		currentOffset: number,
+		cursorStart: number,
+		cursorEnd: number,
+		rows: number,
+		totalRows: number,
+		manualScroll: boolean,
+	): number {
+		const maxOffset = Math.max(0, totalRows - rows);
+		if (maxOffset === 0) return 0;
+		let nextOffset = clamp(currentOffset, 0, maxOffset);
+		const cursorRows = cursorEnd - cursorStart;
+		if (manualScroll && cursorRows > rows) {
+			// A page must not expose another option while Enter still targets this one.
+			nextOffset = clamp(nextOffset, cursorStart, cursorEnd - rows);
+		} else if (cursorStart < nextOffset || cursorEnd > nextOffset + rows) {
+			nextOffset = cursorRows <= rows ? cursorEnd - rows : cursorStart;
+		}
+		return clamp(nextOffset, 0, maxOffset);
 	}
 
 	#clipIndicator(offset: number, rows: number, totalRows: number): string {
@@ -808,8 +1003,8 @@ export class AskDialogComponent implements Component {
 
 	#unansweredCount(): number {
 		let count = 0;
-		for (let index = 0; index < this.questions.length; index++) {
-			const question = this.questions[index];
+		for (let index = 0; index < this.#questions.length; index++) {
+			const question = this.#questions[index];
 			const state = this.#states[index];
 			if (!question || !state) continue;
 			if (state.selectedOptions.size === 0 && state.customInput === undefined) count += 1;
@@ -824,8 +1019,8 @@ export class AskDialogComponent implements Component {
 			return;
 		}
 		this.options.onTimeout?.();
-		for (let index = 0; index < this.questions.length; index++) {
-			const question = this.questions[index];
+		for (let index = 0; index < this.#questions.length; index++) {
+			const question = this.#questions[index];
 			const state = this.#states[index];
 			if (!question || !state) continue;
 			if (state.selectedOptions.size === 0 && state.customInput === undefined) {
@@ -865,8 +1060,8 @@ export class AskDialogComponent implements Component {
 
 	#buildResults(): ExtensionAskDialogResultItem[] {
 		const results: ExtensionAskDialogResultItem[] = [];
-		for (let index = 0; index < this.questions.length; index++) {
-			const question = this.questions[index];
+		for (let index = 0; index < this.#questions.length; index++) {
+			const question = this.#questions[index];
 			const state = this.#states[index];
 			if (!question || !state) continue;
 			const selectedOptions = question.options
