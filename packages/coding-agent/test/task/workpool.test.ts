@@ -155,6 +155,9 @@ describe("WorkPool dispatch", () => {
 		expect(rendered).toContain("{ key: <1-based number>, data: <outcome> }");
 		expect(rendered).not.toContain("Your terminal `yield` MUST use exactly this shape");
 	});
+	it("treats a zero concurrency setting as unlimited", () => {
+		expect(pool(makeSession([], 0)).limit()).toBe(Infinity);
+	});
 	it("spawns while there is room, then queues round-robin, and dispatches to an idle agent", async () => {
 		const cards: CustomMessage[] = [];
 		const session = makeSession(cards);

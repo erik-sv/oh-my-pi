@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fsp from "node:fs/promises";
+import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import {
 	IndexedSessionStorage,
@@ -66,6 +67,11 @@ export interface SqlSessionStorageOptions {
 	 * external migration.
 	 */
 	createTable?: boolean;
+	/**
+	 * Absolute root containing session JSONL paths. Required before destructive
+	 * session deletion so a forged SQL path cannot target arbitrary directories.
+	 */
+	sessionRoot?: string;
 }
 
 interface DialectQueries {
@@ -324,11 +330,13 @@ function byteSuffix(chunks: readonly string[], maxBytes: number): string {
 export class SqlSessionStorage extends IndexedSessionStorage {
 	readonly #adapter: SqlSessionStorageAdapter;
 	readonly #table: string;
+	readonly #sessionRoot: string | undefined;
 
-	constructor(backend: SessionStorageBackend, adapter: SqlSessionStorageAdapter, table: string) {
+	constructor(backend: SessionStorageBackend, adapter: SqlSessionStorageAdapter, table: string, sessionRoot?: string) {
 		super(backend);
 		this.#adapter = adapter;
 		this.#table = table;
+		this.#sessionRoot = sessionRoot ? path.resolve(sessionRoot) : undefined;
 	}
 
 	/**
@@ -338,7 +346,7 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const backend = new SqlSessionStorageBackend(options);
-		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table);
+		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table, options.sessionRoot);
 		await storage.initialize();
 		return storage;
 	}
@@ -352,8 +360,17 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	}
 
 	override async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		const sessionRoot = this.#sessionRoot;
+		if (!sessionRoot) {
+			throw new Error("SqlSessionStorage: sessionRoot is required for destructive session deletion");
+		}
+		const resolvedSessionPath = path.resolve(sessionPath);
+		const relative = path.relative(sessionRoot, resolvedSessionPath);
+		if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+			throw new Error(`SqlSessionStorage: session path is outside the configured root: ${sessionPath}`);
+		}
 		await super.deleteSessionWithArtifacts(sessionPath);
-		const artifactsDir = sessionPath.slice(0, -6);
+		const artifactsDir = resolvedSessionPath.slice(0, -".jsonl".length);
 		try {
 			await fsp.rm(artifactsDir, { recursive: true, force: true });
 		} catch (err) {
@@ -514,6 +531,8 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 
 	async move(src: string, dst: string, mtimeMs: number): Promise<void> {
 		await this.#withPathLocks([src, dst], async transaction => {
+			const source = (await transaction.unsafe(this.#q.readFirstChunks, [src])) as ChunkRow[];
+			if (source.length === 0) throw enoent(src);
 			await transaction.unsafe(this.#q.delete, [dst]);
 			await transaction.unsafe(this.#q.rename, [dst, mtimeMs, src]);
 		});
@@ -540,7 +559,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 				return undefined as T;
 			}
 		});
-		if (failure) throw new Error(failure.message);
+		if (failure) throw failure;
 		return result;
 	}
 

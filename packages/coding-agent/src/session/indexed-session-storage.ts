@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
 import type {
 	SessionStorage,
@@ -12,6 +13,21 @@ import {
 	type SessionTitleUpdate,
 	titleUpdateFromSlot,
 } from "./session-title-slot";
+
+function sessionArtifactsDir(sessionPath: string): string {
+	if (!path.isAbsolute(sessionPath) || path.normalize(sessionPath) !== sessionPath) {
+		throw new Error(`Invalid session path: ${sessionPath}`);
+	}
+	const basename = path.basename(sessionPath);
+	if (!basename.endsWith(".jsonl") || basename.length <= ".jsonl".length) {
+		throw new Error(`Invalid session path: ${sessionPath}`);
+	}
+	const artifactsDir = sessionPath.slice(0, -".jsonl".length);
+	if (artifactsDir === path.dirname(sessionPath) || path.dirname(artifactsDir) !== path.dirname(sessionPath)) {
+		throw new Error(`Invalid session artifacts path: ${sessionPath}`);
+	}
+	return artifactsDir;
+}
 
 export interface SessionStorageIndexEntry {
 	path: string;
@@ -323,7 +339,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const sessionEntry = this.#index.get(sessionPath);
 		if (!sessionEntry) throw enoent(sessionPath);
 
-		const artifactsDir = sessionPath.slice(0, -6);
+		const artifactsDir = sessionArtifactsDir(sessionPath);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
 		const paths = [sessionPath];
 		for (const key of this.#index.keys()) {

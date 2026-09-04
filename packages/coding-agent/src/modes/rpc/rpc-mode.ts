@@ -228,7 +228,13 @@ export function reportLocalOnlyPromptResult(input: {
 			}
 		})
 		.catch(error => {
-			input.onError(error instanceof Error ? error : new Error(String(error)));
+			const promptError = error instanceof Error ? error : new Error(String(error));
+			// The command was acknowledged before the asynchronous prompt pipeline ran.
+			// Emit an event as well as the legacy late error response so embedding
+			// hosts can settle a turn without treating the second response as a new
+			// request correlation.
+			input.output({ type: "prompt_error", id: input.id, message: promptError.message });
+			input.onError(promptError);
 		});
 }
 
@@ -810,6 +816,10 @@ export async function runRpcMode(
 	// breaks JSON.parse. In RPC mode stdout is the JSON protocol channel — nothing else
 	// may write there.
 	process.env.PI_NOTIFICATIONS = "off";
+	// `ready` is an embedding contract: once advertised, the session identity
+	// must already be resumable even if prompt preflight later fails before the
+	// agent loop persists a user turn.
+	await session.sessionManager.ensureOnDisk();
 
 	const frameEncoder = new RpcFrameEncoder();
 	// Ordered stdout writer honoring backpressure: chunked v2 frames are produced

@@ -13,6 +13,7 @@ import {
 	$env,
 	directoryIsMissing,
 	getLogPath,
+	getSessionsDir,
 	getProjectDir,
 	isBunTestRuntime,
 	logger,
@@ -996,7 +997,11 @@ async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 		createTable = parsedOptions.createTable;
 	}
 
-	const storage = await SqlSessionStorage.create({ client, createTable });
+	const storage = await SqlSessionStorage.create({
+		client,
+		createTable,
+		sessionRoot: parsed.sessionDir ?? getSessionsDir(),
+	});
 	setDefaultSessionStorage(storage);
 	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
 }

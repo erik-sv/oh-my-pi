@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { isEnoent, logger, parseImageMetadata } from "@oh-my-pi/pi-utils";
 
 const BLOB_PREFIX = "blob:sha256:";
 
@@ -48,6 +48,57 @@ function normalizeBlobExtension(extension: string | undefined): string | undefin
 	if (normalized.length === 0 || normalized.length > 32) return undefined;
 	if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(normalized)) return undefined;
 	return normalized.toLowerCase();
+}
+
+function errorCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null && "code" in error && typeof error.code === "string"
+		? error.code
+		: undefined;
+}
+
+async function writeBlobAtomically(blobPath: string, data: Buffer): Promise<void> {
+	const temporaryPath = `${blobPath}.tmp-${process.pid}-${Bun.randomUUIDv7()}`;
+	await fsp.writeFile(temporaryPath, data, { flag: "wx" });
+	try {
+		try {
+			await fsp.rename(temporaryPath, blobPath);
+		} catch (error) {
+			if (process.platform !== "win32" || !["EEXIST", "EPERM"].includes(errorCode(error) ?? "")) throw error;
+			const existing = await fsp.readFile(blobPath).catch(readError => {
+				if (isEnoent(readError)) return null;
+				throw readError;
+			});
+			if (existing?.equals(data)) return;
+			await fsp.rm(blobPath, { force: true });
+			await fsp.rename(temporaryPath, blobPath);
+		}
+	} finally {
+		await fsp.rm(temporaryPath, { force: true });
+	}
+}
+
+function writeBlobAtomicallySync(blobPath: string, data: Buffer): void {
+	const temporaryPath = `${blobPath}.tmp-${process.pid}-${Bun.randomUUIDv7()}`;
+	fs.writeFileSync(temporaryPath, data, { flag: "wx" });
+	try {
+		try {
+			fs.renameSync(temporaryPath, blobPath);
+		} catch (error) {
+			if (process.platform !== "win32" || !["EEXIST", "EPERM"].includes(errorCode(error) ?? "")) throw error;
+			let existing: Buffer | null;
+			try {
+				existing = fs.readFileSync(blobPath);
+			} catch (readError) {
+				if (!isEnoent(readError)) throw readError;
+				existing = null;
+			}
+			if (existing?.equals(data)) return;
+			fs.rmSync(blobPath, { force: true });
+			fs.renameSync(temporaryPath, blobPath);
+		}
+	} finally {
+		fs.rmSync(temporaryPath, { force: true });
+	}
 }
 
 async function ensureDisplayPath(blobPath: string, displayPath: string, data: Buffer): Promise<void> {
@@ -113,7 +164,8 @@ export class BlobStore {
 			},
 		};
 
-		await Bun.write(blobPath, data);
+		await fsp.mkdir(this.dir, { recursive: true });
+		await writeBlobAtomically(blobPath, data);
 		await ensureDisplayPath(blobPath, displayPath, data);
 		return result;
 	}
@@ -137,7 +189,7 @@ export class BlobStore {
 			},
 		};
 		fs.mkdirSync(this.dir, { recursive: true });
-		fs.writeFileSync(blobPath, data);
+		writeBlobAtomicallySync(blobPath, data);
 		ensureDisplayPathSync(blobPath, displayPath, data);
 		return result;
 	}
@@ -265,9 +317,8 @@ export async function resolveImageDataUrl(blobStore: BlobStore, data: string): P
 }
 
 /**
- * Resolve a blob reference back to base64 data.
- * If the data is not a blob reference, returns it unchanged.
- * If the blob is missing, logs a warning and returns a placeholder.
+ * Resolve a blob reference back to base64 image data.
+ * Missing or invalid blobs resolve to an empty payload so callers can omit the image before provider replay.
  */
 export async function resolveImageData(blobStore: BlobStore, data: string): Promise<string> {
 	const hash = parseBlobRef(data);
@@ -276,7 +327,11 @@ export async function resolveImageData(blobStore: BlobStore, data: string): Prom
 	const buffer = await blobStore.get(hash);
 	if (!buffer) {
 		logger.warn("Blob not found for image reference", { hash });
-		return data; // Return the ref as-is; downstream will see invalid base64 but won't crash
+		return "";
+	}
+	if (!parseImageMetadata(buffer)) {
+		logger.warn("Invalid blob for persisted image reference", { hash });
+		return "";
 	}
 	return buffer.toString("base64");
 }
@@ -289,7 +344,11 @@ export function resolveImageDataSync(blobStore: BlobStore, data: string): string
 	const buffer = blobStore.getSync(hash);
 	if (!buffer) {
 		logger.warn("Blob not found for image reference", { hash });
-		return data;
+		return "";
+	}
+	if (!parseImageMetadata(buffer)) {
+		logger.warn("Invalid blob for persisted image reference", { hash });
+		return "";
 	}
 	return buffer.toString("base64");
 }

@@ -333,7 +333,16 @@ function hasImageUrl(value: unknown): value is { image_url: string } {
 
 async function resolvePersistedBlobRefs(value: unknown, blobStore: BlobStore, key?: string): Promise<void> {
 	if (isExternalizableImagePosition(value, key) && isBlobRef(value.data)) {
-		value.data = await resolveImageData(blobStore, value.data);
+		const image = value as Record<string, unknown> & { data?: string };
+		const data = await resolveImageData(blobStore, image.data ?? "");
+		if (data) {
+			image.data = data;
+		} else {
+			image.type = "text";
+			image.text = "[image omitted: persisted image is unavailable]";
+			delete image.data;
+			delete image.mimeType;
+		}
 		return;
 	}
 

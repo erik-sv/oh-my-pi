@@ -21,6 +21,11 @@ const text = (value: string): TextContent => ({ type: "text", text: value });
 const png = (data: string): ImageContent => ({ type: "image", data, mimeType: "image/png" });
 const payload = (data: string): ImagePayload => ({ data, mimeType: "image/png" });
 
+const MINIMAL_PNG = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	"base64",
+);
+
 function messageEntry(message: ToolResultMessage): ToolResultEntry {
 	return {
 		type: "message",
@@ -35,9 +40,9 @@ describe("session image persistence", () => {
 	it("externalizes and resolves content images and tool detail image payloads", async () => {
 		using tempDir = TempDir.createSync("@session-image-persistence-");
 		const blobStore = new BlobStore(tempDir.path());
-		const contentImageData = Buffer.alloc(1500, 1).toString("base64");
-		const generatedImageData = Buffer.alloc(1500, 2).toString("base64");
-		const typedDetailImageData = Buffer.alloc(1500, 3).toString("base64");
+		const contentImageData = Buffer.concat([MINIMAL_PNG, Buffer.alloc(1500, 1)]).toString("base64");
+		const generatedImageData = Buffer.concat([MINIMAL_PNG, Buffer.alloc(1500, 2)]).toString("base64");
+		const typedDetailImageData = Buffer.concat([MINIMAL_PNG, Buffer.alloc(1500, 3)]).toString("base64");
 
 		const original = messageEntry({
 			role: "toolResult",
@@ -78,7 +83,7 @@ describe("session image persistence", () => {
 	it("externalizes and restores native Responses images in assistant content and provider history", async () => {
 		using tempDir = TempDir.createSync("@session-native-image-persistence-");
 		const blobStore = new BlobStore(tempDir.path());
-		const data = Buffer.alloc(1500, 4).toString("base64");
+		const data = Buffer.concat([MINIMAL_PNG, Buffer.alloc(1500, 4)]).toString("base64");
 		const original: SessionMessageEntry = {
 			type: "message",
 			id: "entry-native-image",
@@ -140,6 +145,27 @@ describe("session image persistence", () => {
 		expect(resolvedItem?.result).toBe(data);
 	});
 
+	it("replaces a corrupt persisted image with text before provider replay", async () => {
+		using tempDir = TempDir.createSync("@session-corrupt-image-persistence-");
+		const blobStore = new BlobStore(tempDir.path());
+		const original = messageEntry({
+			role: "toolResult",
+			toolCallId: "call-corrupt",
+			toolName: "read",
+			content: [png(Buffer.alloc(1500).toString("base64"))],
+			isError: false,
+			timestamp: 0,
+		} as unknown as ToolResultMessage);
+		const loaded: FileEntry[] = [structuredClone(prepareEntryForPersistence(original, blobStore))];
+
+		await resolveBlobRefsInEntries(loaded, blobStore);
+
+		const resolved = loaded[0] as ToolResultEntry;
+		expect(resolved.message.content).toEqual([
+			{ type: "text", text: "[image omitted: persisted image is unavailable]" },
+		]);
+	});
+
 	it("skips the async resolver for entries without blob refs while still resolving blob-ref entries", async () => {
 		using tempDir = TempDir.createSync("@session-blob-precheck-");
 		const blobStore = new BlobStore(tempDir.path());
@@ -150,7 +176,7 @@ describe("session image persistence", () => {
 			return origGet(hash);
 		};
 
-		const imageData = Buffer.alloc(1500, 7).toString("base64");
+		const imageData = Buffer.concat([MINIMAL_PNG, Buffer.alloc(1500, 7)]).toString("base64");
 		const withImage = messageEntry({
 			role: "toolResult",
 			toolCallId: "call-1",
@@ -196,7 +222,7 @@ describe("snapcompact frame persistence", () => {
 		const blobStore = new BlobStore(tempDir.path());
 		// 400k bytes -> ~533k base64 chars, comfortably past the 500k persist cap
 		// that previously truncated the frame and appended the notice.
-		const frameData = Buffer.alloc(400_000, 7).toString("base64");
+		const frameData = Buffer.concat([MINIMAL_PNG, Buffer.alloc(400_000, 7)]).toString("base64");
 		expect(isStrictBase64(frameData)).toBe(true);
 		expect(frameData.length).toBeGreaterThan(500_000);
 

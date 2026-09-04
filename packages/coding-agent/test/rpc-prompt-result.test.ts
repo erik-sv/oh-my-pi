@@ -379,7 +379,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		expect(output).toEqual([]);
 	});
 
-	test("reports prompt rejection without emitting output", async () => {
+	test("emits a terminalizable prompt_error before reporting an asynchronous rejection", async () => {
 		const output: object[] = [];
 		const thrown = new Error("boom");
 		const prompt = Promise.reject(thrown);
@@ -396,7 +396,7 @@ describe("reportLocalOnlyPromptResult", () => {
 		await waitForPromptHandlers(prompt);
 
 		expect(reported).toBe(thrown);
-		expect(output).toEqual([]);
+		expect(output).toEqual([{ type: "prompt_error", id: "req_1", message: "boom" }]);
 	});
 });
 
