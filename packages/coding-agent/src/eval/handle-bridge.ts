@@ -132,11 +132,16 @@ function cancelResolved(resolved: ResolvedHandle, reason?: unknown): boolean {
 	return true;
 }
 
-function emitProgress(resolved: ResolvedHandle, emitStatus: ((event: JsStatusEvent) => void) | undefined): void {
+function emitProgress(
+	resolved: ResolvedHandle,
+	emitStatus: ((event: JsStatusEvent) => void) | undefined,
+	lastProgress: Map<string, unknown>,
+): void {
 	if (!emitStatus || !("job" in resolved)) return;
 	const progress = resolved.job.latestDetails?.progress;
 	const first = Array.isArray(progress) ? progress[0] : undefined;
-	if (!isUnknownRecord(first)) return;
+	if (!isUnknownRecord(first) || lastProgress.get(resolved.ref.id) === first) return;
+	lastProgress.set(resolved.ref.id, first);
 	const task = typeof first.assignment === "string" ? first.assignment : first.task;
 	const taskPreview = typeof task === "string" ? task.split("\n")[0]?.slice(0, 120) : undefined;
 	emitStatus({
@@ -186,12 +191,13 @@ export async function runEvalWait(
 ): Promise<{ items: EvalHandleSnapshot[] }> {
 	const { items, timeoutMs } = parseRefs(args);
 	const resolved = items.map(item => resolveHandle(item, options));
+	const lastProgress = new Map<string, unknown>();
 	return await withBridgeTimeoutPause(
 		options.emitStatus,
 		async () => {
-			for (const handle of resolved) emitProgress(handle, options.emitStatus);
+			for (const handle of resolved) emitProgress(handle, options.emitStatus, lastProgress);
 			const interval = setInterval(() => {
-				for (const handle of resolved) emitProgress(handle, options.emitStatus);
+				for (const handle of resolved) emitProgress(handle, options.emitStatus, lastProgress);
 			}, 1_000);
 			interval.unref?.();
 			let outcome: "settled" | "timeout" | "aborted";
@@ -200,7 +206,7 @@ export async function runEvalWait(
 			} finally {
 				clearInterval(interval);
 			}
-			for (const handle of resolved) emitProgress(handle, options.emitStatus);
+			for (const handle of resolved) emitProgress(handle, options.emitStatus, lastProgress);
 			if (outcome === "aborted") {
 				for (const handle of resolved) cancelResolved(handle, options.signal?.reason);
 				await Promise.allSettled(

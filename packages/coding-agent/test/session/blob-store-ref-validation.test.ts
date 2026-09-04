@@ -54,9 +54,10 @@ describe("blob resolution path confinement", () => {
 		expect(await resolveImageDataUrl(store, traversalRef)).toBe(traversalRef);
 	});
 
-	it("still resolves a valid stored blob", async () => {
-		const put = store.putSync(Buffer.from("hello"));
-		expect(Buffer.from(resolveImageDataSync(store, put.ref), "base64").toString("utf8")).toBe("hello");
-		expect(Buffer.from(await resolveImageData(store, put.ref), "base64").toString("utf8")).toBe("hello");
+	it("still resolves a valid stored image blob", async () => {
+		const data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+		const put = store.putSync(Buffer.from(data, "base64"));
+		expect(resolveImageDataSync(store, put.ref)).toBe(data);
+		expect(await resolveImageData(store, put.ref)).toBe(data);
 	});
 });

@@ -101,14 +101,20 @@ describe("SessionManager signature persistence", () => {
 	it("externalizes and restores tool result image blocks across reload", async () => {
 		using tempDir = TempDir.createSync("@pi-session-tool-image-persistence-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());
+		const pngBytes = Buffer.from(
+			"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+			"base64",
+		);
+		const contentData = Buffer.concat([pngBytes, Buffer.alloc(2048)]).toString("base64");
+		const detailData = Buffer.concat([pngBytes, Buffer.alloc(2048, 1)]).toString("base64");
 		const contentImage: ImageContent = {
 			type: "image",
-			data: Buffer.from("read-image-payload".repeat(100)).toString("base64"),
+			data: contentData,
 			mimeType: "image/png",
 		};
 		const detailImage: ImageContent = {
 			type: "image",
-			data: Buffer.from("eval-detail-image-payload".repeat(100)).toString("base64"),
+			data: detailData,
 			mimeType: "image/png",
 		};
 
