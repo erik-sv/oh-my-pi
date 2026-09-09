@@ -1,5 +1,9 @@
 import type { CommandMetadata } from "@oh-my-pi/pi-utils/cli";
 
+export const accountHelp = {
+	description: "Show all authenticated provider accounts and their usage limits",
+} satisfies CommandMetadata;
+
 export const acpHelp = {
 	description: "Run Oh My Pi as an ACP (Agent Client Protocol) server over stdio",
 } satisfies CommandMetadata;

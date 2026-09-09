@@ -1,6 +1,11 @@
 import { type AgentMessage, type AgentToolResult, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
-import { type Model, PASTE_CODE_LOGIN_PROVIDERS, type UsageReport } from "@oh-my-pi/pi-ai";
+import {
+	type DisabledCredentialSummary,
+	type Model,
+	PASTE_CODE_LOGIN_PROVIDERS,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
@@ -85,6 +90,7 @@ import { applyHyperlinkSetting } from "../../tui/hyperlink";
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import type { UsageAccountIdentity } from "../../usage-accounts";
 import { getAssistantMessageLinkTargets } from "../utils/interactive-context-helpers";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../components/advisor-config";
 import { AgentHubOverlayComponent } from "../components/agent-hub";
@@ -111,6 +117,7 @@ import { ToolExecutionComponent } from "../components/tool-execution";
 import { TranscriptBlock } from "../components/transcript-container";
 import { TreeSelectorComponent } from "../components/tree-selector";
 import { UsageDashboardComponent } from "../components/usage-dashboard";
+import { renderAccountReports } from "../../slash-commands/helpers/usage-report";
 import { renderUsageReports } from "./command-controller";
 import type { SessionObserverRegistry } from "../session-observer-registry";
 
@@ -305,6 +312,29 @@ export class SelectorController {
 					usageModelSelectors,
 				),
 			loadActivity: loadDailyActivity,
+			requestRender: () => this.ctx.ui.requestRender(),
+			onClose: done,
+		});
+		const overlayHandle = this.#showFullscreenMenu(dashboard);
+	}
+
+	/** Fullscreen `/account` view, grouped provider -> account -> reported windows. */
+	showAccountDashboard(
+		reports: UsageReport[],
+		accounts: UsageAccountIdentity[],
+		disabled: DisabledCredentialSummary[],
+		fetchFailed = false,
+	): void {
+		const done = () => {
+			overlayHandle?.hide();
+			this.focusActiveEditorArea();
+			this.ctx.ui.requestRender();
+		};
+		const dashboard = new UsageDashboardComponent({
+			reports,
+			title: "Accounts",
+			detailOnly: true,
+			renderDetail: () => renderAccountReports(reports, accounts, disabled, Date.now(), fetchFailed),
 			requestRender: () => this.ctx.ui.requestRender(),
 			onClose: done,
 		});

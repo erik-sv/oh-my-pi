@@ -1,6 +1,14 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	DisabledCredentialSummary,
+	ImageContent,
+	Message,
+	Model,
+	Usage,
+	UsageReport,
+} from "@oh-my-pi/pi-ai";
 import type { Component, Container, EditorTheme, Loader, Spacer, Text, TUI } from "@oh-my-pi/pi-tui";
 import type { CollabGuestLink } from "../collab/guest";
 import type { CollabHost } from "../collab/host";
@@ -29,6 +37,7 @@ import type { ShakeMode } from "../session/shake-types";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { LspStartupServerInfo } from "../tools";
 import type { EventBus } from "../utils/event-bus";
+import type { UsageAccountIdentity } from "../usage-accounts";
 import type { AssistantMessageComponent } from "./components/assistant-message";
 import type { BashExecutionComponent } from "./components/bash-execution";
 import type { CustomEditor } from "./components/custom-editor";
@@ -390,6 +399,7 @@ export interface InteractiveModeContext {
 	handleSessionCommand(): Promise<void>;
 	handleAdvisorStatusCommand(): Promise<void>;
 	handleJobsCommand(): Promise<void>;
+	handleAccountCommand(reports?: UsageReport[] | null): Promise<void>;
 	handleUsageCommand(reports?: UsageReport[] | null): Promise<void>;
 	handleChangelogCommand(showFull?: boolean): Promise<void>;
 	handleHotkeysCommand(): void;
@@ -436,6 +446,13 @@ export interface InteractiveModeContext {
 	showSettingsSelector(): void;
 	/** Open the fullscreen `/usage` dashboard overlay for the given reports. */
 	showUsageDashboard(reports: UsageReport[]): void;
+	/** Open the fullscreen `/account` provider -> account -> usage dashboard. */
+	showAccountDashboard(
+		reports: UsageReport[],
+		accounts: UsageAccountIdentity[],
+		disabled: DisabledCredentialSummary[],
+		fetchFailed?: boolean,
+	): void;
 	showAdvisorConfigure(): void;
 	showHistorySearch(): void;
 	showExtensionsDashboard(): void;

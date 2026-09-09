@@ -1,6 +1,20 @@
-import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
+import {
+	resolveUsedFraction,
+	type DisabledCredentialSummary,
+	type UsageLimit,
+	type UsageReport,
+} from "@oh-my-pi/pi-ai";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type { OAuthAccountIdentity } from "../../session/auth-storage";
+import {
+	collectStoredUsageAccounts,
+	collectUnreportedAccounts,
+	disabledUsageAccountLabel,
+	isActionableUsageDisable,
+	shortUsageDisableCause,
+	type UsageAccountIdentity,
+	usageAccountLabel,
+} from "../../usage-accounts";
 import type { SlashCommandRuntime } from "../types";
 import { reportMatchesActiveAccount } from "./active-oauth-account";
 import { formatDuration, formatProviderName, renderAsciiBar } from "./format";
@@ -143,6 +157,201 @@ function renderUsageReports(
 		}
 	}
 	return ["```", ...lines, "```"].join("\n");
+}
+
+function sanitizeAccountText(value: string): string {
+	return sanitizeText(value.replace(/[\r\n]+/g, " ").replace(/\t/g, "  "));
+}
+
+function reportIdentityLabel(report: UsageReport, index: number): string {
+	const meta = report.metadata ?? {};
+	const email = typeof meta.email === "string" && meta.email ? meta.email : undefined;
+	const accountId = typeof meta.accountId === "string" && meta.accountId ? meta.accountId : undefined;
+	const projectId = typeof meta.projectId === "string" && meta.projectId ? meta.projectId : undefined;
+	const scopedAccount = report.limits.find(limit => limit.scope.accountId)?.scope.accountId;
+	const scopedProject = report.limits.find(limit => limit.scope.projectId)?.scope.projectId;
+	const base = email ?? accountId ?? projectId ?? scopedAccount ?? scopedProject ?? `account ${index + 1}`;
+	const orgName = typeof meta.orgName === "string" && meta.orgName ? meta.orgName : undefined;
+	const orgId = typeof meta.orgId === "string" && meta.orgId ? meta.orgId : undefined;
+	const org = orgName ?? orgId;
+	const label = !org || org === base ? base : `${base} (${org})`;
+	return sanitizeAccountText(label);
+}
+
+function formatAccountAmount(limit: UsageLimit): string {
+	const amount = limit.amount;
+	const value = (input: number): string => {
+		if (amount.unit === "usd") return `$${input.toFixed(2)}`;
+		if (amount.unit === "percent") return `${input.toFixed(1)}%`;
+		return `${input.toLocaleString()}${amount.unit === "unknown" ? "" : ` ${amount.unit}`}`;
+	};
+	const parts: string[] = [];
+	if (amount.used !== undefined && amount.limit !== undefined) {
+		parts.push(`${value(amount.used)} / ${value(amount.limit)}`);
+	} else if (amount.used !== undefined) {
+		parts.push(`${value(amount.used)} used`);
+	}
+	if (amount.remaining !== undefined) parts.push(`${value(amount.remaining)} left`);
+	const usedFraction = resolveUsedFraction(limit);
+	const fractionAlreadyShown = amount.unit === "percent" && amount.used !== undefined;
+	if (usedFraction !== undefined && !fractionAlreadyShown) {
+		parts.push(`${(usedFraction * 100).toFixed(1)}% used`);
+	} else if (amount.remainingFraction !== undefined && !fractionAlreadyShown) {
+		parts.push(`${(amount.remainingFraction * 100).toFixed(1)}% left`);
+	}
+	return parts.length > 0 ? parts.join(" · ") : "usage unknown";
+}
+
+/**
+ * Provider -> account -> reported-window view shared by `/account` ACP and TUI
+ * surfaces. Stored accounts without reports and actionable disabled accounts
+ * remain visible under safe identity labels.
+ */
+export function renderAccountReports(
+	reports: UsageReport[],
+	accounts: UsageAccountIdentity[],
+	disabled: DisabledCredentialSummary[],
+	nowMs: number,
+	fetchFailed = false,
+): string {
+	const reportsByProvider = new Map<string, UsageReport[]>();
+	for (const report of reports) {
+		const providerReports = reportsByProvider.get(report.provider) ?? [];
+		providerReports.push(report);
+		reportsByProvider.set(report.provider, providerReports);
+	}
+	const missingByProvider = new Map<string, UsageAccountIdentity[]>();
+	for (const account of collectUnreportedAccounts(reports, accounts)) {
+		const providerAccounts = missingByProvider.get(account.provider) ?? [];
+		providerAccounts.push(account);
+		missingByProvider.set(account.provider, providerAccounts);
+	}
+	const disabledByProvider = new Map<string, DisabledCredentialSummary[]>();
+	for (const summary of disabled) {
+		if (!isActionableUsageDisable(summary, accounts)) continue;
+		const providerAccounts = disabledByProvider.get(summary.provider) ?? [];
+		providerAccounts.push(summary);
+		disabledByProvider.set(summary.provider, providerAccounts);
+	}
+	const providers = [
+		...new Set([...reportsByProvider.keys(), ...missingByProvider.keys(), ...disabledByProvider.keys()]),
+	].sort((left, right) => left.localeCompare(right));
+	const latestFetchedAt = Math.max(0, ...reports.map(report => report.fetchedAt ?? 0));
+	const freshness = latestFetchedAt ? ` (checked ${formatDuration(Math.max(0, nowMs - latestFetchedAt))} ago)` : "";
+	const lines = [`Accounts${freshness}`];
+	if (fetchFailed) lines.push("Usage refresh failed; stored accounts are shown as unavailable.");
+
+	for (const provider of providers) {
+		const providerReports = reportsByProvider.get(provider) ?? [];
+		const missing = missingByProvider.get(provider) ?? [];
+		const disabledAccounts = disabledByProvider.get(provider) ?? [];
+		const count = providerReports.length + missing.length + disabledAccounts.length;
+		lines.push(
+			"",
+			`${sanitizeAccountText(formatProviderName(provider))} - ${count} ${count === 1 ? "account" : "accounts"}`,
+		);
+		const providerNotes = [...new Set(providerReports.flatMap(report => report.notes ?? []))];
+		for (const note of providerNotes) lines.push(`  ${sanitizeAccountText(note)}`);
+
+		const orderedReports = [...providerReports].sort((left, right) =>
+			reportIdentityLabel(left, 0).localeCompare(reportIdentityLabel(right, 0)),
+		);
+		for (const [index, report] of orderedReports.entries()) {
+			const label = reportIdentityLabel(report, index);
+			const plan =
+				typeof report.metadata?.planType === "string" && report.metadata.planType
+					? sanitizeAccountText(report.metadata.planType)
+					: undefined;
+			const age = report.fetchedAt ? ` - checked ${formatDuration(Math.max(0, nowMs - report.fetchedAt))} ago` : "";
+			lines.push(`  ${label}${plan ? ` (${plan})` : ""}${age}`);
+			if (report.limits.length === 0) {
+				lines.push("    no limits reported");
+				continue;
+			}
+			for (const limit of report.limits) {
+				const tier =
+					limit.scope.tier && !limit.label.toLowerCase().includes(limit.scope.tier.toLowerCase())
+						? ` (${limit.scope.tier})`
+						: "";
+				const fraction = resolveUsedFraction(limit);
+				const status =
+					limit.status && limit.status !== "unknown"
+						? limit.status
+						: fraction === undefined
+							? "unknown"
+							: fraction >= 1
+								? "exhausted"
+								: fraction >= 0.8
+									? "warning"
+									: "ok";
+				const window = limit.window?.label ?? limit.scope.windowId;
+				const title = sanitizeAccountText(`${limit.label}${tier}${formatWindowSuffix(limit.label, window)}`);
+				lines.push(`    ${title}`);
+				lines.push(`      ${formatAccountAmount(limit)} · ${status}`);
+				if (limit.window?.resetsAt !== undefined && Number.isFinite(limit.window.resetsAt)) {
+					const resetAt = limit.window.resetsAt;
+					const reset =
+						resetAt > nowMs
+							? `${limit.window.resetLabel ?? "resets"} in ${formatDuration(resetAt - nowMs)}`
+							: `${limit.window.resetLabel ?? "reset"} at ${new Date(resetAt).toISOString()}`;
+					lines.push(`      ${sanitizeAccountText(reset)}`);
+				}
+				if (limit.notes && limit.notes.length > 0) {
+					lines.push(`      ${limit.notes.map(sanitizeAccountText).join(" · ")}`);
+				}
+			}
+		}
+		for (const account of [...missing].sort((left, right) =>
+			usageAccountLabel(left).localeCompare(usageAccountLabel(right)),
+		)) {
+			const label = sanitizeAccountText(usageAccountLabel(account));
+			lines.push(`  ${label} - unavailable (no usage data)`);
+		}
+		for (const summary of [...disabledAccounts].sort((left, right) =>
+			disabledUsageAccountLabel(left).localeCompare(disabledUsageAccountLabel(right)),
+		)) {
+			const age =
+				summary.disabledAtMs !== undefined
+					? ` ${formatDuration(Math.max(0, nowMs - summary.disabledAtMs))} ago`
+					: "";
+			const label = sanitizeAccountText(disabledUsageAccountLabel(summary));
+			const cause = sanitizeAccountText(shortUsageDisableCause(summary.cause));
+			lines.push(`  ${label} - unavailable${age}: ${cause} (re-login to restore)`);
+		}
+	}
+
+	if (providers.length === 0) lines.push("", "No authenticated provider accounts found. Use /login to add one.");
+	return lines.join("\n");
+}
+
+/** Build the `/account` ACP-mode account subscription report. */
+export async function buildAccountReportText(runtime: SlashCommandRuntime): Promise<string> {
+	const provider = runtime.session as SlashCommandRuntime["session"] & {
+		fetchUsageReports?: () => Promise<UsageReport[] | null>;
+	};
+	let reports: UsageReport[] = [];
+	let fetchFailed = false;
+	if (provider.fetchUsageReports) {
+		try {
+			reports = (await provider.fetchUsageReports()) ?? [];
+		} catch {
+			fetchFailed = true;
+		}
+	}
+	const authStorage = runtime.session.modelRegistry.authStorage;
+	try {
+		await authStorage.revalidateCredentials();
+	} catch {
+		// Stale identities beat omitting an account.
+	}
+	const accounts = collectStoredUsageAccounts(authStorage);
+	let disabled: DisabledCredentialSummary[] = [];
+	try {
+		disabled = await authStorage.listDisabledCredentials();
+	} catch {
+		// A broker predating tombstone listing still returns active accounts.
+	}
+	return ["```", renderAccountReports(reports, accounts, disabled, Date.now(), fetchFailed), "```"].join("\n");
 }
 
 /**

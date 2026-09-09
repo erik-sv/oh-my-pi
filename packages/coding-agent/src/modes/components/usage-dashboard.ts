@@ -288,6 +288,9 @@ export function buildHeatmapLayout(points: DailyActivityPoint[], weeks: number, 
 /** Callbacks and data sources for {@link UsageDashboardComponent}. */
 export interface UsageDashboardOptions {
 	reports: UsageReport[];
+	title?: string;
+	/** Render only the detailed report, without the subscriptions/activity overview. */
+	detailOnly?: boolean;
 	/**
 	 * Full classic `/usage` report for the expanded detail view; re-invoked per
 	 * terminal width.
@@ -299,7 +302,7 @@ export interface UsageDashboardOptions {
 	 * settles; rejection renders as a dim unavailable note. `signal` aborts when
 	 * the dashboard closes so an in-flight sync can stop early.
 	 */
-	loadActivity: (push: (points: DailyActivityPoint[]) => void, signal: AbortSignal) => Promise<void>;
+	loadActivity?: (push: (points: DailyActivityPoint[]) => void, signal: AbortSignal) => Promise<void>;
 	requestRender: () => void;
 	onClose: () => void;
 }
@@ -312,11 +315,11 @@ export class UsageDashboardComponent implements Component {
 	#options: UsageDashboardOptions;
 	#cards: ProviderCard[];
 	#nowMs: number;
-	#view: "overview" | "detail" = "overview";
+	#view: "overview" | "detail";
 	#scroll = 0;
 	#activity: DailyActivityPoint[] | null = null;
 	#activityError = false;
-	#syncing = true;
+	#syncing: boolean;
 	#detailCache: { width: number; lines: string[] } | null = null;
 	#lastViewportRows = 10;
 	#closed = false;
@@ -326,12 +329,16 @@ export class UsageDashboardComponent implements Component {
 		this.#options = options;
 		this.#nowMs = Date.now();
 		this.#cards = buildProviderCards(options.reports, this.#nowMs);
-		void this.#loadActivity();
+		this.#view = options.detailOnly ? "detail" : "overview";
+		this.#syncing = !options.detailOnly;
+		if (!options.detailOnly) void this.#loadActivity();
 	}
 
 	async #loadActivity(): Promise<void> {
+		const loadActivity = this.#options.loadActivity;
+		if (!loadActivity) return;
 		try {
-			await this.#options.loadActivity(points => {
+			await loadActivity(points => {
 				if (this.#closed) return;
 				this.#activity = points;
 				this.#options.requestRender();
@@ -561,7 +568,8 @@ export class UsageDashboardComponent implements Component {
 
 		const latestFetchedAt = Math.max(0, ...this.#options.reports.map(report => report.fetchedAt ?? 0));
 		const checkedText = latestFetchedAt ? `checked ${formatDuration(this.#nowMs - latestFetchedAt)} ago` : "";
-		const title = this.#view === "detail" ? "Usage · Details" : "Usage";
+		const baseTitle = this.#options.title ?? "Usage";
+		const title = this.#view === "detail" && !this.#options.detailOnly ? `${baseTitle} · Details` : baseTitle;
 
 		const out: string[] = [];
 		out.push(topBorder(width, title));
@@ -571,7 +579,10 @@ export class UsageDashboardComponent implements Component {
 		}
 		out.push(divider(width));
 		const scrollHint = maxScroll > 0 ? "↑/↓ scroll · " : "";
-		const hint = this.#view === "detail" ? `${scrollHint}Esc back` : `${scrollHint}↵ details · Esc close`;
+		const hint =
+			this.#view === "detail"
+				? `${scrollHint}Esc ${this.#options.detailOnly ? "close" : "back"}`
+				: `${scrollHint}↵ details · Esc close`;
 		out.push(row(theme.fg("dim", hint), width));
 		out.push(bottomBorder(width));
 		return out;
@@ -599,7 +610,7 @@ export class UsageDashboardComponent implements Component {
 			return;
 		}
 		if (matchesSelectCancel(data) || matchesKey(data, "q")) {
-			if (this.#view === "detail") {
+			if (this.#view === "detail" && !this.#options.detailOnly) {
 				this.#setView("overview");
 				return;
 			}
@@ -608,6 +619,7 @@ export class UsageDashboardComponent implements Component {
 			return;
 		}
 		if (
+			!this.#options.detailOnly &&
 			this.#view === "overview" &&
 			(matchesKey(data, "return") || matchesKey(data, "tab") || matchesKey(data, "d"))
 		) {

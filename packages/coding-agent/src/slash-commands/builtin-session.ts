@@ -16,7 +16,7 @@ import { describeRedeemOutcome, type ResetUsageAccount, toResetUsageAccounts } f
 import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
 import { launchStatsDashboard, parseStatsDashboardArgs } from "./helpers/stats-dashboard";
 import { handleTodoAcp } from "./helpers/todo";
-import { buildUsageReportText } from "./helpers/usage-report";
+import { buildAccountReportText, buildUsageReportText } from "./helpers/usage-report";
 import type { SlashCommandRuntime, SlashCommandSpec } from "./types";
 
 async function handleUsageResetCommand(
@@ -292,6 +292,20 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		},
 		handleTui: async (_command, runtime) => {
 			await runtime.ctx.handleJobsCommand();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "account",
+		icon: "session",
+		description: "Show all provider accounts and subscription usage",
+		acpDescription: "Show provider accounts and subscription usage",
+		handle: async (_command, runtime) => {
+			await runtime.output(await buildAccountReportText(runtime));
+			return commandConsumed();
+		},
+		handleTui: async (_command, runtime) => {
+			await runtime.ctx.handleAccountCommand();
 			runtime.ctx.editor.setText("");
 		},
 	},

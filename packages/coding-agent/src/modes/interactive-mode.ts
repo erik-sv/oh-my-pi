@@ -12,7 +12,15 @@ import {
 	ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import type { CompactionOutcome } from "@oh-my-pi/pi-agent-core/compaction";
-import type { AssistantMessage, ImageContent, Message, Model, Usage, UsageReport } from "@oh-my-pi/pi-ai";
+import type {
+	AssistantMessage,
+	DisabledCredentialSummary,
+	ImageContent,
+	Message,
+	Model,
+	Usage,
+	UsageReport,
+} from "@oh-my-pi/pi-ai";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { execReplace } from "@oh-my-pi/pi-natives";
 import type {
@@ -81,6 +89,7 @@ import type {
 import type { CompactOptions } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
+import type { UsageAccountIdentity } from "../usage-accounts";
 import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal, GoalModeState } from "../goals/state";
 import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
@@ -5463,6 +5472,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleJobsCommand();
 	}
 
+	handleAccountCommand(reports?: UsageReport[] | null): Promise<void> {
+		return this.#commandController.handleAccountCommand(reports);
+	}
+
 	handleUsageCommand(reports?: UsageReport[] | null): Promise<void> {
 		return this.#commandController.handleUsageCommand(reports);
 	}
@@ -5704,6 +5717,15 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showUsageDashboard(reports: UsageReport[]): void {
 		this.#selectorController.showUsageDashboard(reports);
+	}
+
+	showAccountDashboard(
+		reports: UsageReport[],
+		accounts: UsageAccountIdentity[],
+		disabled: DisabledCredentialSummary[],
+		fetchFailed?: boolean,
+	): void {
+		this.#selectorController.showAccountDashboard(reports, accounts, disabled, fetchFailed);
 	}
 
 	showAdvisorConfigure(): void {
