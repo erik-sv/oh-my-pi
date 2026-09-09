@@ -127,7 +127,9 @@ describe("renderUsageReports session marker (#5691 org-qualified identity)", () 
 			report("anthropic", email, [limit("Claude 7 Day", "weekly", 7 * 24 * HOUR, 0.4)]),
 		];
 		const text = stripVTControlCharacters(
-			renderUsageReports(reports, theme, Date.now(), 120, provider => (provider === "anthropic" ? { email } : undefined)),
+			renderUsageReports(reports, theme, Date.now(), 120, provider =>
+				provider === "anthropic" ? { email } : undefined,
+			),
 		);
 		const marker = text.split("\n").find(line => line.includes("in use by this session"));
 		expect(marker).toContain(email);
