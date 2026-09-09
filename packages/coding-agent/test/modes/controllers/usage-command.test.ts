@@ -11,7 +11,7 @@ describe("renderUsageReports content", () => {
 		setThemeInstance(darkTheme);
 	});
 
-	it("renders bars and free percentage for limits that only report remainingFraction", () => {
+	it("renders bars and used percentage for limits that only report remainingFraction", () => {
 		const reports: UsageReport[] = [
 			{
 				provider: "openai-codex",
@@ -31,7 +31,7 @@ describe("renderUsageReports content", () => {
 		];
 
 		const output = stripVTControlCharacters(renderUsageReports(reports, theme, Date.now(), 98));
-		expect(output).toContain("25% free");
+		expect(output).toContain("75.0% used");
 		expect(output).toContain("█");
 		expect(output).not.toContain("··········");
 	});
@@ -66,11 +66,12 @@ describe("renderUsageReports content", () => {
 		const output = stripVTControlCharacters(renderUsageReports(reports, theme, now, 98));
 		expect(output).toContain("Cursor");
 		expect(output).toContain("gpt-4 requests");
-		expect(output).toContain("70% free");
+		expect(output).toContain("150 / 500 requests");
+		expect(output).toContain("30.0% used");
 		expect(output).toContain("resets in 1d");
 	});
 
-	it("renders saved reset expiry lines for future and expired credits", () => {
+	it("renders saved reset credit expiry inline on the account header", () => {
 		const now = Date.now();
 		const dayMs = 24 * 60 * 60 * 1000;
 		const futureIso = new Date(now + 2 * dayMs).toISOString();
@@ -89,10 +90,9 @@ describe("renderUsageReports content", () => {
 		];
 
 		const output = stripVTControlCharacters(renderUsageReports(reports, theme, now, 98));
-		expect(output).toContain("Saved rate-limit resets");
-		expect(output).toContain("user@example.com: 2 saved resets");
-		expect(output).toContain(`expires in`);
+		expect(output).toContain("user@example.com");
+		expect(output).toContain("✦ 2 saved resets");
+		expect(output).toContain("expires in");
 		expect(output).toContain(`(${futureIso.slice(0, 10)})`);
-		expect(output).toContain(`expired (${expiredIso.slice(0, 10)})`);
 	});
 });

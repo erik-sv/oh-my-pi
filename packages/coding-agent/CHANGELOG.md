@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `/account` and `omp account` views that group every authenticated provider subscription by account and show all reported usage windows, reset times, freshness, and unavailable or disabled accounts.
+
+### Changed
+
+- Interactive `/usage` shows a per-account breakdown with usage bars, reset times, reporting models, and the active session account, replacing the cross-account matrix.
+
+### Fixed
+
+- Disabled subscriptions remain visible when another organization or member still has an active credential.
+
 ## [18.1.10] - 2026-09-04
 
 ### Changed

@@ -9,7 +9,6 @@
  */
 import {
 	ANTHROPIC_OAUTH_GRANT_TTL_MS,
-	type AuthStorage,
 	type DisabledCredentialSummary,
 	resolveUsedFraction,
 	type UsageHistoryEntry,
@@ -24,6 +23,18 @@ import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
 import { discoverAuthStorage } from "../sdk";
 import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import type { OAuthAccountIdentity } from "../session/auth-storage";
+import { reportMatchesActiveAccount } from "../slash-commands/helpers/active-oauth-account";
+import {
+	collectStoredUsageAccounts,
+	collectUnreportedAccounts,
+	isActionableUsageDisable,
+	selectReportableAccounts,
+	shortUsageDisableCause,
+	type UsageAccountIdentity,
+} from "../usage-accounts";
+
+export { collectUnreportedAccounts, selectReportableAccounts, type UsageAccountIdentity } from "../usage-accounts";
 
 const BAR_WIDTH = 28;
 
@@ -38,20 +49,7 @@ export interface UsageCommandArgs {
 	days?: number;
 }
 
-/** Identity slice of a stored credential, for "every account" coverage. */
-export interface UsageAccountIdentity {
-	provider: string;
-	type: "api_key" | "oauth";
-	email?: string;
-	accountId?: string;
-	projectId?: string;
-	enterpriseUrl?: string;
-	/** Organization/workspace the credential is scoped to (Anthropic multi-subscription). */
-	orgId?: string;
-	orgName?: string;
-	/** Epoch ms of the interactive login that minted the OAuth grant (see `OAuthCredentials.authorizedAt`). */
-	authorizedAt?: number;
-}
+export type AccountCommandArgs = Pick<UsageCommandArgs, "json" | "provider" | "redact">;
 
 /**
  * Minimal-reveal masks for identity strings (`--redact`).
@@ -172,7 +170,7 @@ function collectIdentityStrings(
 	return values;
 }
 
-type LimitStatus = NonNullable<UsageLimit["status"]>;
+export type LimitStatus = NonNullable<UsageLimit["status"]>;
 
 function resolveStatus(limit: UsageLimit): LimitStatus {
 	if (limit.status && limit.status !== "unknown") return limit.status;
@@ -188,6 +186,27 @@ const STATUS_COLOR: Record<LimitStatus, (text: string) => string> = {
 	warning: chalk.yellow,
 	ok: chalk.green,
 	unknown: chalk.dim,
+};
+
+/**
+ * Color abstraction shared by the CLI (chalk) and the interactive TUI (theme)
+ * renderers so both draw the identical per-account breakdown in their native
+ * palette. `status` colors a status glyph/bar by severity.
+ */
+export interface UsageStyler {
+	bold(text: string): string;
+	dim(text: string): string;
+	accent(text: string): string;
+	boldAccent(text: string): string;
+	status(status: LimitStatus, text: string): string;
+}
+
+export const chalkStyler: UsageStyler = {
+	bold: text => chalk.bold(text),
+	dim: text => chalk.dim(text),
+	accent: text => chalk.cyan(text),
+	boldAccent: text => chalk.bold.cyan(text),
+	status: (status, text) => STATUS_COLOR[status](text),
 };
 
 /** Worst-of aggregation: exhausted > warning > ok > unknown. */
@@ -252,13 +271,12 @@ function describeAmount(limit: UsageLimit): string {
 	return parts.join(" · ");
 }
 
-function renderBar(limit: UsageLimit): string {
+function renderBar(limit: UsageLimit, styler: UsageStyler): string {
 	const fraction = resolveUsedFraction(limit);
-	if (fraction === undefined) return chalk.dim("·".repeat(BAR_WIDTH));
+	if (fraction === undefined) return styler.dim("·".repeat(BAR_WIDTH));
 	const clamped = Math.min(Math.max(fraction, 0), 1);
 	const filled = Math.round(clamped * BAR_WIDTH);
-	const color = STATUS_COLOR[resolveStatus(limit)];
-	return color("█".repeat(filled)) + chalk.dim("░".repeat(BAR_WIDTH - filled));
+	return styler.status(resolveStatus(limit), "█".repeat(filled)) + styler.dim("░".repeat(BAR_WIDTH - filled));
 }
 
 /** Append the window label when the limit label doesn't already carry it. */
@@ -286,99 +304,6 @@ function reportAccountLabel(report: UsageReport, index: number): string {
 	return `account ${index + 1}`;
 }
 
-/** Lowercased identity strings a report can be attributed to. */
-function reportIdentifiers(report: UsageReport): Set<string> {
-	const ids = new Set<string>();
-	const add = (value: unknown): void => {
-		if (typeof value === "string" && value) ids.add(value.toLowerCase());
-	};
-	const meta = report.metadata ?? {};
-	add(meta.email);
-	add(meta.accountId);
-	add(meta.projectId);
-	add(meta.orgId);
-	for (const limit of report.limits) {
-		add(limit.scope.accountId);
-		add(limit.scope.projectId);
-		add(limit.scope.orgId);
-	}
-	return ids;
-}
-
-/**
- * Stored credentials that no usage report could be attributed to.
- *
- * Conservative on purpose: when a provider's reports carry no identity at
- * all (or the credential is an API key alongside existing reports), we
- * can't attribute, so we don't claim the account is missing.
- */
-export function collectUnreportedAccounts(
-	reports: UsageReport[],
-	accounts: UsageAccountIdentity[],
-): UsageAccountIdentity[] {
-	const byProvider = new Map<string, UsageReport[]>();
-	for (const report of reports) {
-		const list = byProvider.get(report.provider) ?? [];
-		list.push(report);
-		byProvider.set(report.provider, list);
-	}
-	return accounts.filter(account => {
-		const providerReports = byProvider.get(account.provider) ?? [];
-		if (providerReports.length === 0) return true;
-		if (account.type === "api_key") return false;
-		// Org-decisive attribution when EITHER side carries an org (Anthropic
-		// multi-subscription): two orgs share every other identifier, so an
-		// org-scoped account is covered only by its own org's report, and an
-		// org-less legacy account is never covered by an org-attributed sibling
-		// report — its own fetch failing must surface as "no usage data". Its
-		// own ORG-LESS report still covers it, though: a mixed pool (fresh
-		// org-scoped logins beside pre-org-capture rows) must not duplicate
-		// every legacy account. The shared org is a GATE, not a match: two Team
-		// members share the org id while drawing on per-user pools, so coverage
-		// also requires the account's own base identity inside the same-org
-		// subset (an org-only account, with no base identifiers, is covered by
-		// any same-org report). The email/account fallback below applies only
-		// when both sides are org-less.
-		const accountOrg = account.orgId?.toLowerCase();
-		const ids = [account.email, account.accountId, account.projectId]
-			.filter((value): value is string => typeof value === "string" && value.length > 0)
-			.map(value => value.toLowerCase());
-		const sameOrgReports: UsageReport[] = [];
-		let sawReportOrg = false;
-		for (const report of providerReports) {
-			const metaOrg = report.metadata?.orgId;
-			if (typeof metaOrg === "string" && metaOrg) {
-				sawReportOrg = true;
-				if (accountOrg !== undefined && metaOrg.toLowerCase() === accountOrg) sameOrgReports.push(report);
-			}
-		}
-		if (accountOrg || sawReportOrg) {
-			const candidates = accountOrg
-				? sameOrgReports
-				: providerReports.filter(report => {
-						const metaOrg = report.metadata?.orgId;
-						return !(typeof metaOrg === "string" && metaOrg);
-					});
-			if (candidates.length === 0) return true;
-			if (ids.length === 0) return false;
-			return !candidates.some(report => {
-				const identifiers = reportIdentifiers(report);
-				return ids.some(id => identifiers.has(id));
-			});
-		}
-		if (ids.length === 0) return false;
-		const reported = new Set<string>();
-		let anyIdentified = false;
-		for (const report of providerReports) {
-			const identifiers = reportIdentifiers(report);
-			if (identifiers.size > 0) anyIdentified = true;
-			for (const id of identifiers) reported.add(id);
-		}
-		if (!anyIdentified) return false;
-		return !ids.some(id => reported.has(id));
-	});
-}
-
 /** Compose the account label from parts, masking each part individually so `--redact` cannot be bypassed by the composite string. */
 function accountIdentityLabel(account: UsageAccountIdentity, redaction?: Map<string, string>): string {
 	if (account.type === "api_key") return "API key";
@@ -396,23 +321,29 @@ function formatAccountHeader(
 	report: UsageReport,
 	index: number,
 	nowMs: number,
+	styler: UsageStyler,
 	redaction?: Map<string, string>,
+	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,
 ): string {
 	const status = aggregateStatus(report.limits);
-	const icon = STATUS_COLOR[status]("●");
+	const icon = styler.status(status, "●");
 	const label = reportAccountLabel(report, index);
-	let header = `${icon} ${chalk.bold(redaction?.get(label) ?? label)}`;
+	let header = `${icon} ${styler.bold(redaction?.get(label) ?? label)}`;
+	const activeIdentity = resolveActiveAccount?.(report.provider);
+	if (activeIdentity && reportMatchesActiveAccount(report, activeIdentity)) {
+		header += styler.accent(" ← in use by this session");
+	}
 	const metaOrgName = report.metadata?.orgName;
 	const metaOrgId = report.metadata?.orgId;
 	const org = typeof metaOrgName === "string" && metaOrgName ? metaOrgName : metaOrgId;
 	if (typeof org === "string" && org && org !== label) {
-		header += chalk.dim(` · ${redaction?.get(org) ?? org}`);
+		header += styler.dim(` · ${redaction?.get(org) ?? org}`);
 	}
 	const planType = report.metadata?.planType;
-	if (typeof planType === "string" && planType) header += chalk.dim(` · plan: ${planType}`);
+	if (typeof planType === "string" && planType) header += styler.dim(` · plan: ${planType}`);
 	const savedResets = report.resetCredits?.availableCount ?? 0;
 	if (savedResets > 0) {
-		header += chalk.cyan(` · ✦ ${savedResets} saved reset${savedResets === 1 ? "" : "s"}`);
+		header += styler.accent(` · ✦ ${savedResets} saved reset${savedResets === 1 ? "" : "s"}`);
 		const credits = report.resetCredits?.credits;
 		if (credits) {
 			const expiries = credits
@@ -422,22 +353,22 @@ function formatAccountHeader(
 				.sort((a, b) => a.ms - b.ms);
 			const upcoming = expiries.find(c => c.ms > nowMs);
 			if (upcoming) {
-				header += chalk.dim(
+				header += styler.dim(
 					` · soonest expires in ${formatDuration(upcoming.ms - nowMs)} (${upcoming.date.slice(0, 10)})`,
 				);
 			} else {
 				const lastExpired = expiries.at(-1);
-				if (lastExpired) header += chalk.dim(` · expired (${lastExpired.date.slice(0, 10)})`);
+				if (lastExpired) header += styler.dim(` · expired (${lastExpired.date.slice(0, 10)})`);
 			}
 		}
 	}
 	if (report.fetchedAt && nowMs - report.fetchedAt > 90_000) {
-		header += chalk.dim(` · fetched ${formatDuration(nowMs - report.fetchedAt)} ago`);
+		header += styler.dim(` · fetched ${formatDuration(nowMs - report.fetchedAt)} ago`);
 	}
 	return header;
 }
 
-function formatLimitLine(limit: UsageLimit, labelWidth: number, nowMs: number): string[] {
+function formatLimitLine(limit: UsageLimit, labelWidth: number, nowMs: number, styler: UsageStyler): string[] {
 	const status = resolveStatus(limit);
 	const title = limitTitle(limit);
 	const padded = title.padEnd(labelWidth);
@@ -447,10 +378,10 @@ function formatLimitLine(limit: UsageLimit, labelWidth: number, nowMs: number): 
 		details.push(`${limit.window?.resetLabel ?? "resets"} in ${formatDuration(resetsAt - nowMs)}`);
 	}
 	const lines = [
-		`      ${STATUS_COLOR[status]("●")} ${padded}  ${renderBar(limit)}  ${chalk.dim(details.join(" · "))}`,
+		`      ${styler.status(status, "●")} ${padded}  ${renderBar(limit, styler)}  ${styler.dim(details.join(" · "))}`,
 	];
 	if (limit.notes && limit.notes.length > 0) {
-		lines.push(`        ${chalk.dim(limit.notes.join(" · "))}`);
+		lines.push(`        ${styler.dim(limit.notes.join(" · "))}`);
 	}
 	return lines;
 }
@@ -473,9 +404,9 @@ function collectProviderLimitTemplates(reports: UsageReport[]): ProviderLimitTem
 	return templates;
 }
 
-function formatMissingLimitLine(template: ProviderLimitTemplate, labelWidth: number): string {
+function formatMissingLimitLine(template: ProviderLimitTemplate, labelWidth: number, styler: UsageStyler): string {
 	const padded = template.title.padEnd(labelWidth);
-	return `      ${chalk.dim("○")} ${padded}  ${chalk.dim("·".repeat(BAR_WIDTH))}  ${chalk.dim("not reported")}`;
+	return `      ${styler.dim("○")} ${padded}  ${styler.dim("·".repeat(BAR_WIDTH))}  ${styler.dim("not reported")}`;
 }
 
 /** Per-window capacity stat: how much account quota is burned and left. */
@@ -574,50 +505,6 @@ function formatReloginDeadline(
 	return `  ${chalk.yellow(`⚠ ${label} — re-login within ${formatDuration(remaining)} (Anthropic expires OAuth grants ~30d after login)`)}`;
 }
 
-/**
- * Tombstones worth a row in `omp usage`: OAuth credentials torn down
- * automatically (refresh failure, upstream invalidation). Rows the user
- * replaced or deleted deliberately are lifecycle noise, not lost capacity.
- */
-function isActionableDisable(summary: DisabledCredentialSummary, activeAccounts: UsageAccountIdentity[] = []): boolean {
-	if (summary.type !== "oauth") return false;
-	if (/^(replaced by|deleted by user)/i.test(summary.cause)) return false;
-
-	// Do not display tombstone if there is an active account for the same provider
-	// matching the same identity (email, accountId, or org).
-	const summaryEmail = summary.email?.toLowerCase();
-	const summaryAccountId = summary.accountId?.toLowerCase();
-	const summaryOrgId = summary.orgId?.toLowerCase();
-
-	const matchesActive = activeAccounts.some(account => {
-		if (account.provider !== summary.provider) return false;
-
-		const accountEmail = account.email?.toLowerCase();
-		const accountAccountId = account.accountId?.toLowerCase();
-		const accountOrgId = account.orgId?.toLowerCase();
-
-		// If email or accountId match, it's the same identity
-		if (summaryEmail && accountEmail && summaryEmail === accountEmail) return true;
-		if (summaryAccountId && accountAccountId && summaryAccountId === accountAccountId) return true;
-
-		// Fallback: if orgId matches and neither email nor accountId contradicts
-		if (summaryOrgId && accountOrgId && summaryOrgId === accountOrgId) return true;
-
-		return false;
-	});
-
-	return !matchesActive;
-}
-
-/** Human-sized disable cause: the upstream `error_description` when embedded, else the first clause. */
-function shortDisableCause(cause: string): string {
-	const description = cause.match(/\\?"error_description\\?"\s*:\s*\\?"([^"\\]+)/)?.[1];
-	if (description) return description;
-	const stripped = cause.replace(/^oauth refresh failed:\s*/i, "");
-	const clause = stripped.split(/[;\n]/, 1)[0] ?? stripped;
-	return clause.length > 80 ? `${clause.slice(0, 77)}…` : clause;
-}
-
 /** Label for a disabled tombstone, masking each identity part under `--redact`. */
 function disabledIdentityLabel(summary: DisabledCredentialSummary, redaction?: Map<string, string>): string {
 	const base = summary.email ?? summary.accountId ?? "OAuth account";
@@ -638,6 +525,11 @@ export function formatUsageBreakdown(
 	nowMs: number,
 	redaction?: Map<string, string>,
 	disabled: DisabledCredentialSummary[] = [],
+	styler: UsageStyler = chalkStyler,
+	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,
+	resolveModelSelectors?: (provider: string) => readonly string[],
+	title = "Usage",
+	includeDisabledInCount = false,
 ): string {
 	const reportsByProvider = new Map<string, UsageReport[]>();
 	for (const report of reports) {
@@ -654,7 +546,7 @@ export function formatUsageBreakdown(
 	}
 	const disabledByProvider = new Map<string, DisabledCredentialSummary[]>();
 	for (const summary of disabled) {
-		if (!isActionableDisable(summary, accounts)) continue;
+		if (!isActionableUsageDisable(summary, accounts)) continue;
 		const list = disabledByProvider.get(summary.provider) ?? [];
 		list.push(summary);
 		disabledByProvider.set(summary.provider, list);
@@ -666,29 +558,37 @@ export function formatUsageBreakdown(
 
 	const lines: string[] = [];
 	const latestFetchedAt = Math.max(0, ...reports.map(report => report.fetchedAt ?? 0));
-	const headerSuffix = latestFetchedAt ? chalk.dim(` · fetched ${formatDuration(nowMs - latestFetchedAt)} ago`) : "";
-	lines.push(`${chalk.bold("Usage")}${headerSuffix}`);
+	const headerSuffix = latestFetchedAt ? styler.dim(` · fetched ${formatDuration(nowMs - latestFetchedAt)} ago`) : "";
+	lines.push(`${styler.bold(title)}${headerSuffix}`);
 
 	for (const provider of providers) {
 		const providerReports = reportsByProvider.get(provider) ?? [];
 		const providerUnreported = unreportedByProvider.get(provider) ?? [];
-		const accountCount = providerReports.length + providerUnreported.length;
+		const accountCount =
+			providerReports.length +
+			providerUnreported.length +
+			(includeDisabledInCount ? (disabledByProvider.get(provider)?.length ?? 0) : 0);
 		lines.push("");
 		lines.push(
-			`${chalk.bold.cyan(formatProviderName(provider))} ${chalk.dim(`— ${accountCount} ${accountCount === 1 ? "account" : "accounts"}`)}`,
+			`${styler.boldAccent(formatProviderName(provider))} ${styler.dim(`— ${accountCount} ${accountCount === 1 ? "account" : "accounts"}`)}`,
 		);
+		const modelSelectors = resolveModelSelectors?.(provider) ?? [];
+		if (modelSelectors.length > 0) {
+			lines.push(`  ${styler.accent("Models with usage data")}`);
+			for (const selector of modelSelectors) lines.push(`    ${styler.dim(sanitizeText(selector))}`);
+		}
 		// Provider-wide disclaimers render once per provider, not per limit.
 		const providerNotes = [...new Set(providerReports.flatMap(report => report.notes ?? []))];
 		for (const note of providerNotes)
-			lines.push(`  ${chalk.dim(sanitizeText(note.replace(/[\r\n]+/g, " ").replace(/\t/g, "  ")))}`);
+			lines.push(`  ${styler.dim(sanitizeText(note.replace(/[\r\n]+/g, " ").replace(/\t/g, "  ")))}`);
 
 		const providerLimitTemplates = collectProviderLimitTemplates(providerReports);
 		const labelWidth = providerLimitTemplates.reduce((max, template) => Math.max(max, template.title.length), 0);
 
 		providerReports.forEach((report, index) => {
-			lines.push(`  ${formatAccountHeader(report, index, nowMs, redaction)}`);
+			lines.push(`  ${formatAccountHeader(report, index, nowMs, styler, redaction, resolveActiveAccount)}`);
 			if (report.limits.length === 0) {
-				lines.push(`      ${chalk.dim("no limits reported")}`);
+				lines.push(`      ${styler.dim("no limits reported")}`);
 				return;
 			}
 			const limitsById = new Map<string, UsageLimit>();
@@ -696,23 +596,23 @@ export function formatUsageBreakdown(
 			for (const template of providerLimitTemplates) {
 				const limit = limitsById.get(template.id);
 				if (limit) {
-					lines.push(...formatLimitLine(limit, labelWidth, nowMs));
+					lines.push(...formatLimitLine(limit, labelWidth, nowMs, styler));
 				} else {
-					lines.push(formatMissingLimitLine(template, labelWidth));
+					lines.push(formatMissingLimitLine(template, labelWidth, styler));
 				}
 			}
 		});
 
 		for (const account of providerUnreported) {
 			const label = accountIdentityLabel(account, redaction);
-			lines.push(`  ${chalk.dim("○")} ${chalk.dim(`${label} — no usage data`)}`);
+			lines.push(`  ${styler.dim("○")} ${styler.dim(`${label} — no usage data`)}`);
 		}
 
 		for (const summary of disabledByProvider.get(provider) ?? []) {
 			const label = disabledIdentityLabel(summary, redaction);
 			const ago = summary.disabledAtMs !== undefined ? ` ${formatDuration(nowMs - summary.disabledAtMs)} ago` : "";
 			lines.push(
-				`  ${chalk.red(`✗ ${label} — disabled${ago}: ${sanitizeText(shortDisableCause(summary.cause))}`)} ${chalk.dim("(re-login to restore)")}`,
+				`  ${chalk.red(`✗ ${label} — disabled${ago}: ${sanitizeText(shortUsageDisableCause(summary.cause))}`)} ${chalk.dim("(re-login to restore)")}`,
 			);
 		}
 
@@ -728,10 +628,56 @@ export function formatUsageBreakdown(
 				const meterLabel = stat.meter ? ` (${stat.meter.charAt(0).toUpperCase()}${stat.meter.slice(1)})` : "";
 				return `${stat.window}${meterLabel} → ${stat.usedAccounts.toFixed(2)}/${stat.accounts} ${stat.accounts === 1 ? "account" : "accounts"} used (${stat.remainingAccounts.toFixed(2)}× quota left)`;
 			});
-			lines.push(`  ${chalk.dim(`capacity: ${parts.join(" · ")}`)}`);
+			lines.push(`  ${styler.dim(`capacity: ${parts.join(" · ")}`)}`);
 		}
 	}
 
+	return lines.join("\n");
+}
+
+/**
+ * Account-first variant of the classic usage breakdown. Providers and their
+ * account rows are sorted by safe display identity; every reported window,
+ * missing credential, and actionable disabled credential remains visible.
+ */
+export function formatAccountBreakdown(
+	reports: UsageReport[],
+	accounts: UsageAccountIdentity[],
+	nowMs: number,
+	redaction?: Map<string, string>,
+	disabled: DisabledCredentialSummary[] = [],
+	fetchFailed = false,
+): string {
+	const sortedReports = [...reports].sort((left, right) => {
+		const providerOrder = left.provider.localeCompare(right.provider);
+		if (providerOrder !== 0) return providerOrder;
+		return reportAccountLabel(left, 0).localeCompare(reportAccountLabel(right, 0));
+	});
+	const sortedAccounts = [...accounts].sort((left, right) => {
+		const providerOrder = left.provider.localeCompare(right.provider);
+		if (providerOrder !== 0) return providerOrder;
+		return accountIdentityLabel(left).localeCompare(accountIdentityLabel(right));
+	});
+	const sortedDisabled = [...disabled].sort((left, right) => {
+		const providerOrder = left.provider.localeCompare(right.provider);
+		if (providerOrder !== 0) return providerOrder;
+		return disabledIdentityLabel(left).localeCompare(disabledIdentityLabel(right));
+	});
+	const output = formatUsageBreakdown(
+		sortedReports,
+		sortedAccounts,
+		nowMs,
+		redaction,
+		sortedDisabled,
+		chalkStyler,
+		undefined,
+		undefined,
+		"Accounts",
+		true,
+	);
+	if (!fetchFailed) return output;
+	const lines = output.split("\n");
+	lines.splice(1, 0, chalk.yellow("Usage refresh failed; stored accounts are shown as unavailable."));
 	return lines.join("\n");
 }
 
@@ -874,55 +820,6 @@ export function formatUsageHistory(
 	return lines.join("\n");
 }
 
-function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
-	const accounts: UsageAccountIdentity[] = [];
-	const all = authStorage.getAll();
-	for (const provider in all) {
-		const entry = all[provider];
-		const credentials = Array.isArray(entry) ? entry : [entry];
-		for (const credential of credentials) {
-			if (credential.type === "oauth") {
-				accounts.push({
-					provider,
-					type: "oauth",
-					email: credential.email,
-					accountId: credential.accountId,
-					projectId: credential.projectId,
-					enterpriseUrl: credential.enterpriseUrl,
-					orgId: credential.orgId,
-					orgName: credential.orgName,
-					authorizedAt: credential.authorizedAt,
-				});
-			} else {
-				accounts.push({ provider, type: "api_key" });
-			}
-		}
-	}
-	return accounts;
-}
-
-/**
- * Keep only accounts worth a usage row: those whose provider has a usage
- * provider, so a missing report is a real gap rather than the absence of any
- * usage concept. Providers with no usage endpoint (web-search keys, local /
- * keyless servers, inference providers without a usage API) would only ever
- * render as noise, so they are dropped.
- *
- * `hasUsageProvider` is injected (in practice {@link AuthStorage.usageProviderFor})
- * so custom/broker resolvers stay authoritative — no provider list is duplicated
- * here. An explicit `--provider` request bypasses the cull, so
- * `omp usage --provider xai` can still confirm the stored credential has no
- * usage endpoint.
- */
-export function selectReportableAccounts(
-	accounts: UsageAccountIdentity[],
-	hasUsageProvider: (provider: string) => boolean,
-	explicitProvider?: string,
-): UsageAccountIdentity[] {
-	if (explicitProvider) return accounts;
-	return accounts.filter(account => hasUsageProvider(account.provider));
-}
-
 /** Apply a redaction mask to an optional identity field. */
 function maskIdentity(redaction: Map<string, string>, value: string | undefined): string | undefined {
 	return value === undefined ? undefined : (redaction.get(value) ?? value);
@@ -1026,7 +923,7 @@ export function formatClientUsage(clients: ClientUsageClientSummary[], sinceMs: 
 	return lines.join("\n");
 }
 
-export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
+async function runUsageCommandInternal(cmd: UsageCommandArgs, accountView: boolean): Promise<void> {
 	const authStorage = await discoverAuthStorage();
 	try {
 		if (cmd.action === "invalidate") {
@@ -1101,10 +998,17 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 			return;
 		}
 		const modelRegistry = new ModelRegistry(authStorage);
-		const reports =
-			(await authStorage.fetchUsageReports({
-				baseUrlResolver: provider => modelRegistry.getProviderBaseUrl(provider),
-			})) ?? [];
+		let reports: UsageReport[] = [];
+		let fetchFailed = false;
+		try {
+			reports =
+				(await authStorage.fetchUsageReports({
+					baseUrlResolver: provider => modelRegistry.getProviderBaseUrl(provider),
+				})) ?? [];
+		} catch (error) {
+			if (!accountView) throw error;
+			fetchFailed = true;
+		}
 		// Reports are always fresh (broker-side fetch) but the account list can
 		// come from a disk-cached snapshot up to an hour old — revalidate so a
 		// just-logged-in (or just-rotated-identity) credential isn't rendered
@@ -1114,12 +1018,14 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 		} catch {
 			// Stale identities beat no output.
 		}
-		const storedAccounts = collectStoredAccounts(authStorage);
-		let accounts = selectReportableAccounts(
-			storedAccounts,
-			provider => authStorage.usageProviderFor(provider) !== undefined,
-			cmd.provider,
-		);
+		const storedAccounts = collectStoredUsageAccounts(authStorage);
+		let accounts = accountView
+			? storedAccounts
+			: selectReportableAccounts(
+					storedAccounts,
+					provider => authStorage.usageProviderFor(provider) !== undefined,
+					cmd.provider,
+				);
 		// Tombstones ride alongside the live pool so an auto-disabled account
 		// (e.g. an expired Anthropic grant) is loudly visible instead of just
 		// missing. Best-effort: a broker predating the endpoint yields [].
@@ -1164,7 +1070,7 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 				const stats = computeProviderWindowStats(filteredReports.filter(peer => peer.provider === report.provider));
 				if (stats.length > 0) capacity[report.provider] = stats;
 			}
-			let disabledForJson = disabled.filter(summary => isActionableDisable(summary, accounts));
+			let disabledForJson = disabled.filter(summary => isActionableUsageDisable(summary, accounts));
 			if (redaction) {
 				disabledForJson = disabledForJson.map(summary => ({
 					...summary,
@@ -1185,7 +1091,8 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 			return;
 		}
 
-		if (filteredReports.length === 0 && accounts.length === 0) {
+		const hasVisibleDisabled = accountView && disabled.some(summary => isActionableUsageDisable(summary, accounts));
+		if (filteredReports.length === 0 && accounts.length === 0 && !hasVisibleDisabled) {
 			const scope = cmd.provider ? ` for provider "${cmd.provider}"` : "";
 			// Credentials exist but every one is for a provider without a usage
 			// endpoint — say so rather than implying nothing is logged in.
@@ -1198,8 +1105,20 @@ export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
 			return;
 		}
 
-		process.stdout.write(`${formatUsageBreakdown(filteredReports, accounts, Date.now(), redaction, disabled)}\n`);
+		const output = accountView
+			? formatAccountBreakdown(filteredReports, accounts, Date.now(), redaction, disabled, fetchFailed)
+			: formatUsageBreakdown(filteredReports, accounts, Date.now(), redaction, disabled);
+		process.stdout.write(`${output}\n`);
 	} finally {
 		authStorage.close();
 	}
+}
+
+export async function runUsageCommand(cmd: UsageCommandArgs): Promise<void> {
+	await runUsageCommandInternal(cmd, false);
+}
+
+/** Standalone account command. JSON intentionally matches `omp usage --json`. */
+export async function runAccountCommand(cmd: AccountCommandArgs): Promise<void> {
+	await runUsageCommandInternal(cmd, true);
 }

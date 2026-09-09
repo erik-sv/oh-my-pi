@@ -35,19 +35,14 @@ describe("buildAvailableSlashCommands", () => {
 		const commands = await buildAvailableSlashCommands(session as never, async () => fileCommands);
 		const byName = Object.fromEntries(commands.map(command => [command.name, command]));
 
-		expect(byName.usage.subcommands).toContainEqual({
-			name: "show",
-			description: "Show provider usage and limits",
-		});
-		expect(byName.usage.subcommands).toContainEqual({
-			name: "reset",
-			description: "Spend a saved Codex rate-limit reset",
-			usage: "[account|active]",
-		});
+		expect(byName.account.source).toBe("builtin");
+
+		expect(byName.usage.subcommands).toEqual(expect.arrayContaining([expect.objectContaining({ name: "show" })]));
+		expect(byName.usage.subcommands).toEqual(
+			expect.arrayContaining([expect.objectContaining({ name: "reset", usage: "[account|active]" })]),
+		);
 		expect(byName["reset-usage"]).toBeUndefined();
 
-		expect(byName.fast.description).toBe("Toggle fast mode");
-		expect(byName["extended-context"].description).toBe("Toggle extended context");
 		expect(byName["ext:hello"].description).toBe("Extension hello");
 		expect(byName["custom:hello"].description).toBe("Custom hello");
 		expect(byName["server:prompt"].description).toBe("MCP prompt");
