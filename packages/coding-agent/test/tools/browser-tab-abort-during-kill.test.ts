@@ -54,12 +54,12 @@ const registry = getTabsMapForTest() as Map<string, TabSession>;
 let workerSeq = 0;
 
 /**
- * Stands in for one Bun `Worker` generation. `send` mirrors the platform
- * contract that produced the incident: posting to a terminated worker throws
- * `InvalidStateError`.
+ * Stands in for one subprocess generation. `send` deliberately preserves the
+ * old terminated-worker throw so this regression proves stale cancellation is
+ * never dispatched to a dead generation.
  */
 class FakeTabWorker {
-	readonly mode = "worker" as const;
+	readonly mode = "process" as const;
 	readonly id = ++workerSeq;
 	readonly received: WorkerInbound[] = [];
 	#terminated = false;
@@ -85,6 +85,13 @@ class FakeTabWorker {
 
 	onError(): () => void {
 		return () => undefined;
+	}
+	async close(): Promise<boolean> {
+		if (this.#terminated) return false;
+		this.send({ type: "close" });
+		await Promise.resolve();
+		await this.terminate();
+		return true;
 	}
 
 	async terminate(): Promise<void> {
