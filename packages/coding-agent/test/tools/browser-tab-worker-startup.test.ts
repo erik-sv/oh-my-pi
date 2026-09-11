@@ -15,6 +15,7 @@ import {
 	initializeTabWorkerForTest,
 	releaseTab,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import type { WorkerHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker-host";
 import { chromiumAvailable, visibleBrowserAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -22,14 +23,17 @@ const CHROMIUM_AVAILABLE = await chromiumAvailable();
 // proves the binary execs (`chrome --version` exits 0 with no X server).
 const VISIBLE_BROWSER_AVAILABLE = await visibleBrowserAvailable();
 
-class FakeStartupWorker {
+class FakeStartupWorker implements WorkerHandle {
 	#errorHandlers = new Set<(error: Error) => void>();
 	#messageHandlers = new Set<(msg: WorkerOutbound) => void>();
 	readonly sent: WorkerInbound[] = [];
 	readonly mode = "worker" as const;
+	readonly id = 1;
+	readonly alive = true;
 
-	send(msg: WorkerInbound): void {
+	send(msg: WorkerInbound): boolean {
 		this.sent.push(msg);
+		return true;
 	}
 
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void {
