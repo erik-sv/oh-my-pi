@@ -39,6 +39,10 @@ import { STATS_ACTIVITY_WORKER_ARG } from "./stats/activity-protocol";
 import rootLicense from "./tools/browser/relay/extension-assets/LICENSE.txt" with { type: "text" };
 import thirdPartyNotices from "./tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
+import type {
+	WorkerInbound as TabWorkerInbound,
+	WorkerOutbound as TabWorkerOutbound,
+} from "./tools/browser/tab-protocol";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -98,6 +102,7 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestTtsWorker } = await import("./tts/tts-client");
 	const { smokeTestMnemopiEmbedWorker } = await import("./mnemopi/embed-client");
 	const { smokeTestStatsActivityWorker } = await import("./stats/activity-client");
+	const { smokeTestTabWorker } = await import("./tools/browser/tab-worker-host");
 	const { smokeTestJsEvalWorker } = await import("./eval/js/context-manager");
 	// Other smoke dependencies stay lazy so normal CLI startup does not load their worker clients.
 	const { smokeTestDaemonBroker } = await import("./launch/client");
@@ -121,6 +126,7 @@ async function runSmokeTest(): Promise<void> {
 
 	await smokeTestTinyTitleWorker();
 	await smokeTestSttWorker();
+	await smokeTestTabWorker();
 	await smokeTestJsEvalWorker();
 	const { smokeTestComputerWorker } = await import("./tools/computer/supervisor");
 	await smokeTestComputerWorker();
@@ -135,7 +141,7 @@ async function runSmokeTest(): Promise<void> {
 
 const TINY_WORKER_ARG = "__omp_worker_tiny_inference";
 const STATS_SYNC_WORKER_ARG = "__omp_worker_stats_sync";
-const TAB_WORKER_ARG = "__omp_worker_tab";
+const TAB_PROCESS_WORKER_ARG = "__omp_worker_tab_process";
 const JS_EVAL_WORKER_ARG = "__omp_worker_js_eval";
 const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
 const STT_WORKER_ARG = "__omp_worker_stt";
@@ -169,16 +175,9 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		}
 		return true;
 	}
-	// Bun flushes messages the parent posted before spawn once this entry's
-	// top-level evaluation completes. Install a buffering inbox synchronously
-	// before binding the selected worker's real handler so the parent's
-	// synchronous `init` survives. The dynamically imported tab/eval modules
-	// consume the same inbox after their module evaluation begins.
-	if (arg === TAB_WORKER_ARG) {
-		if (parentPort) installWorkerInbox(parentPort);
-		await import("./tools/browser/tab-worker-entry");
-		return true;
-	}
+	// Bun flushes messages the parent posted before worker-thread spawn once
+	// this entry's top-level evaluation completes. Install a buffering inbox
+	// synchronously before binding the selected worker's real handler.
 	if (arg === COMPUTER_WORKER_ARG) {
 		if (parentPort) installWorkerInbox(parentPort);
 		const { startComputerWorker } = await import("./tools/computer/worker-entry");
@@ -200,6 +199,13 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 			transport => startJsEvalProcess(transport, interceptUnhandledRejections),
 			{ rethrowConnectedSendErrors: true },
 		);
+		return true;
+	}
+	if (arg === TAB_PROCESS_WORKER_ARG) {
+		// Dynamic by design: normal CLI startup must not eagerly load Puppeteer
+		// and the browser execution runtime into the parent process.
+		const { startTabProcess } = await import("./tools/browser/tab-process-entry");
+		await runIpcSubprocessWorker<TabWorkerInbound, TabWorkerOutbound>(startTabProcess);
 		return true;
 	}
 	if (arg === STT_WORKER_ARG) {
@@ -390,7 +396,7 @@ export async function runCli(argv: string[]): Promise<void> {
 		return;
 	}
 
-	// Worker-thread entry dispatch must run before the first `await`: the
+	// Worker-host entry dispatch must run before the first `await`: the
 	// stats sync worker's buffering onmessage handler is installed in the
 	// synchronous prefix of `runWorkerEntrypoint`, and Bun flushes the
 	// worker's parked initial messages as soon as the entry module's
@@ -411,8 +417,8 @@ export async function runCli(argv: string[]): Promise<void> {
 	// worker host. Worker-thread re-entry already returned above at the
 	// `__omp_worker_` dispatch, and importers (`runCli` in profile-CLI tests,
 	// SDK embedding) have `import.meta.main === false` — declaring there would
-	// poison `workerHostEntry()` for the whole test process, forcing eval/stats/
-	// browser workers onto the same-realm inline fallback.
+	// poison `workerHostEntry()` for the whole test process, forcing worker
+	// clients onto invalid source-resolution paths.
 	if (isProcessEntry) declareWorkerHostEntry();
 
 	// `PI_PROXY` must reach the bare global `fetch` before any provider call:

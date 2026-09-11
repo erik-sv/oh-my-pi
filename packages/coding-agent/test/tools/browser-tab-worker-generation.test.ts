@@ -16,12 +16,11 @@
  *     would resurrect it outside the registry and leak the new worker.
  *  3. A generation that can no longer be talked to (crashed, or a reply that
  *     cannot be posted) settles its runs immediately instead of letting each
- *     caller wait out the grace window, and leaves no worker thread, no page
- *     target, and no browser hold behind.
+ *     caller wait out the grace window, and leaves no worker process, page
+ *     target, or browser hold behind.
  *
- * The fake worker is a raw Bun-`Worker`-shaped object driven through the real
- * `wrapBunWorker`, so it reproduces the platform contract that caused the
- * incident: `postMessage` after `terminate()` throws `InvalidStateError`.
+ * The fake process handle preserves generation identity and undeliverable-send
+ * behavior without sharing a native runtime with the test process.
  */
 
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
@@ -34,6 +33,7 @@ import {
 	runInTab,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import * as tabWorkerHost from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker-host";
+import type { WorkerHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker-host";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 
 const READY: ReadyInfo = {
@@ -44,24 +44,64 @@ const READY: ReadyInfo = {
 
 const RUN_TIMEOUT_MS = 5_000;
 
-/** Mirrors Bun's `Worker`: post after terminate throws, listeners are real. */
-class FakeBunWorker extends EventTarget {
+class FakeProcessWorker extends EventTarget implements WorkerHandle {
+	readonly mode = "process" as const;
+	readonly id = ++workerSeq;
 	readonly received: WorkerInbound[] = [];
 	terminated = false;
-	#respond: (msg: WorkerInbound, worker: FakeBunWorker) => void;
+	#respond: (msg: WorkerInbound, worker: FakeProcessWorker) => void;
 
-	constructor(respond: (msg: WorkerInbound, worker: FakeBunWorker) => void) {
+	constructor(respond: (msg: WorkerInbound, worker: FakeProcessWorker) => void) {
 		super();
 		this.#respond = respond;
 	}
 
-	postMessage(msg: WorkerInbound): void {
-		if (this.terminated) throw new DOMException("Worker has been terminated", "InvalidStateError");
-		this.received.push(msg);
-		queueMicrotask(() => this.#respond(msg, this));
+	get alive(): boolean {
+		return !this.terminated;
 	}
 
-	terminate(): void {
+	send(msg: WorkerInbound): boolean {
+		if (this.terminated) return false;
+		this.received.push(msg);
+		queueMicrotask(() => this.#respond(msg, this));
+		return true;
+	}
+
+	onMessage(handler: (msg: WorkerOutbound) => void): () => void {
+		const wrapped = (event: Event): void => handler((event as MessageEvent).data as WorkerOutbound);
+		this.addEventListener("message", wrapped);
+		return () => this.removeEventListener("message", wrapped);
+	}
+
+	onError(handler: (error: Error) => void): () => void {
+		const wrapped = (event: Event): void => {
+			const error = (event as ErrorEvent).error;
+			handler(error instanceof Error ? error : new Error((event as ErrorEvent).message));
+		};
+		this.addEventListener("error", wrapped);
+		return () => this.removeEventListener("error", wrapped);
+	}
+
+	async close(): Promise<boolean> {
+		if (this.terminated) return false;
+		const { promise, resolve } = Promise.withResolvers<boolean>();
+		const unsubscribe = this.onMessage(message => {
+			if (message.type !== "closed") return;
+			unsubscribe();
+			resolve(true);
+		});
+		if (!this.send({ type: "close" })) {
+			unsubscribe();
+			return false;
+		}
+		return await promise;
+	}
+
+	async terminate(): Promise<void> {
+		this.terminated = true;
+	}
+
+	drop(): void {
 		this.terminated = true;
 	}
 
@@ -77,6 +117,8 @@ class FakeBunWorker extends EventTarget {
 		return this.received.map(msg => msg.type);
 	}
 }
+
+let workerSeq = 0;
 
 /**
  * Headless-shaped browser handle. `closedTargets` records the ids the
@@ -124,7 +166,7 @@ function makeSession(): ToolSession {
 }
 
 /** Answers the init handshake with `setup` + `ready` and `close` with `closed`. */
-function standardReplies(msg: WorkerInbound, worker: FakeBunWorker): boolean {
+function standardReplies(msg: WorkerInbound, worker: FakeProcessWorker): boolean {
 	if (msg.type === "init") {
 		worker.emit({ type: "setup" });
 		worker.emit({ type: "ready", info: READY });
@@ -137,12 +179,12 @@ function standardReplies(msg: WorkerInbound, worker: FakeBunWorker): boolean {
 	return false;
 }
 
-function queueSpawns(workers: FakeBunWorker[]): void {
+function queueSpawns(workers: FakeProcessWorker[]): void {
 	const pendingSpawns = [...workers];
 	spyOn(tabWorkerHost, "spawnTabWorker").mockImplementation(async () => {
 		const next = pendingSpawns.shift();
 		if (!next) throw new Error("unexpected tab worker spawn");
-		return tabWorkerHost.wrapBunWorker(next as unknown as Worker);
+		return next;
 	});
 }
 
@@ -163,7 +205,7 @@ describe("browser tab-supervisor: worker generations", () => {
 
 		const recycleReached = Promise.withResolvers<void>();
 		const recycleGate = Promise.withResolvers<void>();
-		const wedged = new FakeBunWorker((msg, worker) => {
+		const wedged = new FakeProcessWorker((msg, worker) => {
 			if (standardReplies(msg, worker)) return;
 			if (msg.type !== "run") return;
 			// What a wedged page reports: the worker's own cell budget expired.
@@ -179,7 +221,7 @@ describe("browser tab-supervisor: worker generations", () => {
 				},
 			});
 		});
-		const replacement = new FakeBunWorker((msg, worker) => {
+		const replacement = new FakeProcessWorker((msg, worker) => {
 			if (msg.type === "close") {
 				worker.emit({ type: "closed" });
 				return;
@@ -249,7 +291,7 @@ describe("browser tab-supervisor: worker generations", () => {
 	it("discards a recycled worker that lost the race to releaseTab", async () => {
 		const recycleReached = Promise.withResolvers<void>();
 		const recycleGate = Promise.withResolvers<void>();
-		const wedged = new FakeBunWorker((msg, worker) => {
+		const wedged = new FakeProcessWorker((msg, worker) => {
 			if (standardReplies(msg, worker)) return;
 			if (msg.type !== "run") return;
 			worker.emit({
@@ -264,7 +306,7 @@ describe("browser tab-supervisor: worker generations", () => {
 				},
 			});
 		});
-		const replacement = new FakeBunWorker((msg, worker) => {
+		const replacement = new FakeProcessWorker((msg, worker) => {
 			if (msg.type === "close") {
 				worker.emit({ type: "closed" });
 				return;
@@ -309,10 +351,10 @@ describe("browser tab-supervisor: worker generations", () => {
 	});
 
 	it("settles an in-flight run when its worker generation dies", async () => {
-		const crashing = new FakeBunWorker((msg, worker) => {
+		const crashing = new FakeProcessWorker((msg, worker) => {
 			if (standardReplies(msg, worker)) return;
-			// The worker thread dies without ever answering the run: no
-			// `result` message will arrive, only the runtime's error event.
+			// The worker process dies without ever answering the run: no `result`
+			// message will arrive, only the runtime's error event.
 			if (msg.type === "run") worker.crash(new Error("Worker exited with code 134"));
 		});
 		queueSpawns([crashing]);
@@ -342,7 +384,7 @@ describe("browser tab-supervisor: worker generations", () => {
 			(error: unknown) => error,
 		);
 		expect((reopenFailure as Error).message).toContain("was killed: Browser tab worker failed");
-		// Nothing of the dead generation survives: thread terminated, its page
+		// Nothing of the dead generation survives: process terminated, its page
 		// target closed by the release, browser hold returned.
 		expect(crashing.terminated).toBe(true);
 		await releaseTab("eval", { kill: false });
@@ -351,14 +393,14 @@ describe("browser tab-supervisor: worker generations", () => {
 	});
 
 	it("settles the run when a tool reply can no longer be delivered", async () => {
-		const dying = new FakeBunWorker((msg, worker) => {
+		const dying = new FakeProcessWorker((msg, worker) => {
 			if (standardReplies(msg, worker)) return;
 			if (msg.type !== "run") return;
 			// The worker asks the host for a tool and dies before the answer
 			// can be posted back. The run is now waiting on a reply nobody can
 			// deliver.
 			worker.emit({ type: "tool-call", id: "call-1", runId: msg.id, name: "read", args: {} });
-			worker.terminate();
+			worker.drop();
 		});
 		queueSpawns([dying]);
 
@@ -386,7 +428,7 @@ describe("browser tab-supervisor: worker generations", () => {
 
 		const toolStarted = Promise.withResolvers<void>();
 		const toolCancelled = Promise.withResolvers<string>();
-		const crashing = new FakeBunWorker((msg, worker) => {
+		const crashing = new FakeProcessWorker((msg, worker) => {
 			if (standardReplies(msg, worker)) return;
 			if (msg.type !== "run") return;
 			worker.emit({ type: "tool-call", id: "call-1", runId: msg.id, name: "read", args: {} });
@@ -426,8 +468,8 @@ describe("browser tab-supervisor: worker generations", () => {
 
 			const failure = await settled;
 			// Contained to the affected tool call: the run reports the worker's
-			// death, the host work it delegated is cancelled, the dead thread is
-			// gone, and the process saw no uncaught exception.
+			// death, the host work it delegated is cancelled, the dead process is
+			// gone, and the parent saw no uncaught exception.
 			expect((failure as Error).message).toContain("Browser tab worker failed: Worker exited with code 134");
 			expect(await toolCancelled.promise).toContain("Browser tab worker failed");
 			expect(uncaught).toEqual([]);

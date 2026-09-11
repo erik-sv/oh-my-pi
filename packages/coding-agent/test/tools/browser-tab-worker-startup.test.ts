@@ -27,7 +27,7 @@ class FakeStartupWorker implements WorkerHandle {
 	#errorHandlers = new Set<(error: Error) => void>();
 	#messageHandlers = new Set<(msg: WorkerOutbound) => void>();
 	readonly sent: WorkerInbound[] = [];
-	readonly mode = "worker" as const;
+	readonly mode = "process" as const;
 	readonly id = 1;
 	readonly alive = true;
 
@@ -44,6 +44,9 @@ class FakeStartupWorker implements WorkerHandle {
 	onError(handler: (error: Error) => void): () => void {
 		this.#errorHandlers.add(handler);
 		return () => this.#errorHandlers.delete(handler);
+	}
+	async close(): Promise<boolean> {
+		return true;
 	}
 
 	async terminate(): Promise<void> {}
@@ -76,9 +79,9 @@ describe("browser tab worker startup", () => {
 		const worker = new FakeStartupWorker();
 		const pending = initializeTabWorkerForTest(worker, initPayload, 1_000);
 
-		worker.emitError(new Error("Cannot find tab-worker-entry.ts"));
+		worker.emitError(new Error("Cannot start browser tab subprocess"));
 
-		await expect(pending).rejects.toThrow("Tab worker failed during startup: Cannot find tab-worker-entry.ts");
+		await expect(pending).rejects.toThrow("Tab worker failed during startup: Cannot start browser tab subprocess");
 		expect(worker.sent).toEqual([{ type: "init", payload: initPayload }]);
 	});
 
@@ -93,9 +96,8 @@ describe("browser tab worker startup", () => {
 		const pending = initializeTabWorkerForTest(worker, initPayload, 1_000);
 
 		worker.emitSetup();
-		// The inline transport delivers messages on microtasks, so `ready` can
-		// land in the same tick as `setup`; the single listener spanning both
-		// phases must resolve it instead of dropping it.
+		// IPC can deliver `ready` in the same tick as `setup`; the single
+		// listener spanning both phases must resolve it instead of dropping it.
 		worker.emitReady(info);
 
 		await expect(pending).resolves.toEqual(info);
@@ -123,10 +125,10 @@ describe("browser tab worker startup", () => {
 		await expect(pending).rejects.toThrow("connect failed");
 	});
 
-	it("bounds a retried attempt by the caller's remaining budget, not a fresh budget", async () => {
+	it("bounds an init attempt by the caller's remaining budget, not a fresh budget", async () => {
 		const worker = new FakeStartupWorker();
-		// Simulate the inline-fallback retry: the failed isolated attempt
-		// already consumed 25 s of the caller's 30 s init budget.
+		// Simulate earlier acquisition work sharing one deadline: it already
+		// consumed 25 s of the caller's 30 s init budget.
 		const pending = initializeTabWorkerForTest(worker, initPayload, 30_000, performance.now() - 25_000);
 		const startedAt = performance.now();
 
@@ -183,7 +185,7 @@ describe("browser init deadline carry-over", () => {
 				// `deadlineStartMs`): `acquireTabImpl` must count that elapsed time
 				// against the worker-init budget instead of starting a fresh
 				// `timeoutMs + GRACE_MS` clock. An exhausted budget fails fast with
-				// the original init error — never the wrapped inline-fallback error.
+				// the original initialization error.
 				const deadlineStart = performance.now() - 60_000;
 				const started = performance.now();
 				// Mirror the browser prelude host's outer acquisition lease. Its timeout can
@@ -212,9 +214,8 @@ describe("browser init deadline carry-over", () => {
 				const elapsed = performance.now() - started;
 				expect(connectedAfterCallerRelease).toBeTrue();
 				expect(failure).toBeDefined();
-				expect(String((failure as Error).message)).not.toContain("inline fallback also failed");
-				// Only the first attempt's floors are spent (setup floor 2 s + ready
-				// floor 500 ms), never a second full budget cycle.
+				expect(String((failure as Error).message)).toContain("Timed out");
+				// Only one subprocess attempt's phase floors are spent.
 				expect(elapsed).toBeLessThan(4_000);
 			} finally {
 				await server.stop(true);
