@@ -310,6 +310,12 @@ export declare class Process {
   children(): Array<Process>
   /** Current status of this process reference. */
   status(): ProcessStatus
+  /**
+   * Opaque token identifying this exact process, comparable across restarts
+   * of the observer. `null` when the platform cannot supply every component,
+   * so a caller that cannot compare must fail closed rather than trust a pid.
+   */
+  identity(): string | null
 }
 
 /** Stateful PTY session for interactive stdin/stdout passthrough. */

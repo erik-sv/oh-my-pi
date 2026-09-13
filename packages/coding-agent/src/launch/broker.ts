@@ -2,6 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ReadableStream, ReadableStreamDefaultReader } from "node:stream/web";
 import { Process, type PtyRunResult, PtySession } from "@oh-my-pi/pi-natives";
 import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText, setProcessName } from "@oh-my-pi/pi-utils";
 import { TerminalQueryResponder } from "@oh-my-pi/pi-utils/vterm";
@@ -40,6 +41,13 @@ const READINESS_BUFFER_CHARS = 64 * 1024;
 const RESTART_MAX_DELAY_MS = 30_000;
 const RESTART_BACKOFF_BASE_MS = 1_000;
 /**
+ * Window granted to stdout/stderr after a pipe daemon exits, for flushing
+ * output that is already buffered. Output can outlive the child indefinitely
+ * when a descendant inherited the write end, so this is a bound, not a wait
+ * for end-of-stream.
+ */
+const PIPE_FLUSH_GRACE_MS = 2_000;
+/**
  * Cap on terminal (exited/failed) daemons surfaced by `list`. Active daemons
  * are always shown in full; older history is truncated so the response stays
  * bounded over a long-lived project (issue #6517).
@@ -66,6 +74,7 @@ const SIGNAL_NUMBER: Record<DaemonSignal, number> = {
 interface ManagedProcess {
 	pid: number;
 	exited: Promise<number>;
+	kill(signal?: number): void;
 	unref(): void;
 }
 
@@ -75,6 +84,10 @@ interface ManagedDaemon {
 	dir: string;
 	log?: DaemonLog;
 	process?: ManagedProcess;
+	/** Signal-authorized reference; see {@link DaemonBroker.pin}. */
+	processRef?: Process;
+	/** Opaque native identity of {@link ManagedDaemon.processRef}, persisted so a later broker can revalidate the pid. */
+	identity?: string;
 	input?: Bun.FileSink;
 	pty?: PtySession;
 	generation: number;
@@ -85,6 +98,14 @@ interface ManagedDaemon {
 	outputOffset: number;
 	readyPattern?: RegExp;
 	restartTimer?: NodeJS.Timeout;
+	/**
+	 * What the last stop or exit could not finish — descendants the kill waves
+	 * did not reach, or output still held after the child was gone. Carried on
+	 * the record because the settlement that publishes it can land afterwards,
+	 * and cleared on relaunch so one generation's warning never describes the
+	 * next.
+	 */
+	residue?: string;
 	consecutiveFailures: number;
 	completionCapable: boolean;
 	pendingCompletions: DaemonCompletionNotification[];
@@ -690,6 +711,9 @@ class DaemonBroker {
 		record.generation++;
 		const generation = record.generation;
 		record.stopRequested = false;
+		record.processRef = undefined;
+		record.identity = undefined;
+		record.residue = undefined;
 		record.snapshot.state = record.spec.ready ? "starting" : "running";
 		record.snapshot.startedAt = Date.now();
 		record.snapshot.readyAt = undefined;
@@ -751,7 +775,13 @@ class DaemonBroker {
 				started.resolve(undefined);
 				return;
 			}
-			started.resolve(Number.isSafeInteger(pid) && pid > 0 ? pid : undefined);
+			const startedPid = Number.isSafeInteger(pid) && pid > 0 ? pid : undefined;
+			// Pin from inside the session's own run: it does not reap the child until
+			// that run resolves, so the number still denotes this child here.
+			if (startedPid !== undefined && generation === record.generation) {
+				this.#pin(record, startedPid);
+			}
+			started.resolve(startedPid);
 		};
 		let run: Promise<PtyRunResult>;
 		if (process.platform === "win32") {
@@ -782,14 +812,11 @@ class DaemonBroker {
 		);
 
 		const pid = await started.promise;
-		if (pid !== undefined && generation === record.generation) {
-			record.snapshot.pid = pid;
-			this.#persist(record);
-		}
+		if (pid !== undefined && generation === record.generation) this.#persist(record);
 	}
 
 	#launchPipe(record: ManagedDaemon, generation: number): void {
-		const process = Bun.spawn([record.spec.application, ...record.spec.args], {
+		const child = Bun.spawn([record.spec.application, ...record.spec.args], {
 			cwd: record.spec.cwd,
 			env: workerEnvFromParent(record.spec.env),
 			stdin: "pipe",
@@ -797,17 +824,75 @@ class DaemonBroker {
 			stderr: "pipe",
 			...DAEMON_SPAWN_OPTIONS,
 		});
-		record.process = process;
-		record.input = process.stdin;
-		record.snapshot.pid = process.pid;
+		record.process = child;
+		record.input = child.stdin;
+		this.#pin(record, child.pid);
 		this.#persist(record);
-		const stdout = this.#drain(record, generation, process.stdout);
-		const stderr = this.#drain(record, generation, process.stderr);
-		void Promise.all([stdout, stderr, process.exited])
-			.then(([, , exitCode]) => this.#settle(record, generation, exitCode))
-			.catch(error =>
-				this.#settle(record, generation, undefined, error instanceof Error ? error.message : String(error)),
-			);
+		const readers = [child.stdout, child.stderr].map(stream => (stream as ReadableStream<Uint8Array>).getReader());
+		// Fold the drains into a value the moment they are created. Their result is
+		// not consumed until the child exits, and an unhandled reader rejection in
+		// that window would escape as a process-level unhandled rejection.
+		const drained = Promise.all(readers.map(reader => this.#drain(record, generation, reader))).then(
+			() => undefined,
+			(error: unknown) => (error instanceof Error ? error : new Error(String(error))),
+		);
+		void this.#settlePipe(record, generation, child, readers, drained).catch(error =>
+			this.#settle(record, generation, undefined, error instanceof Error ? error.message : String(error)),
+		);
+	}
+
+	/**
+	 * Settle a pipe daemon on the child's own exit rather than on end-of-output:
+	 * stdout stays open while *any* process holds the write end, so a grandchild
+	 * that inherited it keeps the drains pending indefinitely and the record
+	 * never reaches a terminal state. The drains get a bounded window afterwards
+	 * to flush what is already buffered, then are released.
+	 */
+	async #settlePipe(
+		record: ManagedDaemon,
+		generation: number,
+		child: ManagedProcess,
+		readers: ReadableStreamDefaultReader<Uint8Array>[],
+		drained: Promise<Error | undefined>,
+	): Promise<void> {
+		const exitCode = await child.exited;
+		// An explicit timer, not `Bun.sleep`: the loser of this race must not keep a
+		// two-second timer alive in the broker after every exit.
+		const expired = Promise.withResolvers<null>();
+		const timer = setTimeout(() => expired.resolve(null), PIPE_FLUSH_GRACE_MS);
+		let outcome: { error: Error | undefined } | null;
+		try {
+			outcome = await Promise.race([drained.then(error => ({ error })), expired.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
+		// The waits above can outlive this generation; only the current one may
+		// describe the record.
+		if (generation === record.generation) {
+			if (outcome?.error) {
+				// The exit code stays authoritative — a broken read end is our defect,
+				// not the daemon's outcome — but the loss of output is reported.
+				record.residue = `output capture failed: ${outcome.error.message}`;
+				logger.warn("Daemon output capture failed", {
+					name: record.snapshot.name,
+					error: outcome.error.message,
+				});
+			} else if (outcome === null) {
+				// Held output means those descendants are still running.
+				record.residue = "exited, but descendants still hold its output and are still running";
+				record.log?.append("\n[daemon exited; output still held by surviving descendants]\n");
+				logger.warn("Daemon exited with output still held by surviving descendants", {
+					name: record.snapshot.name,
+				});
+			}
+		}
+		// Only a clean finish proves every read end was released: `Promise.all`
+		// rejects on the first failure, leaving the sibling drain still holding its
+		// reader. Cancelling an already-released reader rejects harmlessly.
+		if (outcome?.error !== undefined || outcome === null) {
+			await Promise.all(readers.map(reader => reader.cancel().catch(() => {})));
+		}
+		await this.#settle(record, generation, exitCode);
 	}
 
 	async #launchDetached(record: ManagedDaemon, generation: number): Promise<void> {
@@ -821,7 +906,7 @@ class DaemonBroker {
 				...DAEMON_SPAWN_OPTIONS,
 			});
 			record.process = process;
-			record.snapshot.pid = process.pid;
+			this.#pin(record, process.pid);
 			this.#persist(record);
 			process.unref();
 			void process.exited
@@ -834,8 +919,11 @@ class DaemonBroker {
 		}
 	}
 
-	async #drain(record: ManagedDaemon, generation: number, stream: ReadableStream<Uint8Array>): Promise<void> {
-		const reader = stream.getReader();
+	async #drain(
+		record: ManagedDaemon,
+		generation: number,
+		reader: ReadableStreamDefaultReader<Uint8Array>,
+	): Promise<void> {
 		const decoder = new TextDecoder();
 		try {
 			for (;;) {
@@ -898,8 +986,9 @@ class DaemonBroker {
 		const generation = record.generation;
 		await this.#readDetachedOutput(record, generation);
 		if (generation !== record.generation || record.process) return;
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef?.status() === "running") return;
+		// A detached record that survives recovery is pinned; an unverified one was
+		// already reaped. So the pinned reference is the whole liveness question.
+		if (this.#processRef(record)?.status() === "running") return;
 		await this.#settle(record, generation);
 	}
 
@@ -957,12 +1046,16 @@ class DaemonBroker {
 		// The output read yields, so a concurrent refresh may settle this generation first.
 		if (generation !== record.generation || settledState(record.snapshot.state)) return;
 		record.process = undefined;
+		record.processRef = undefined;
+		record.identity = undefined;
 		record.input = undefined;
 		record.pty = undefined;
 		record.snapshot.pid = undefined;
 		record.snapshot.exitedAt = Date.now();
 		record.snapshot.exitCode = exitCode;
-		record.snapshot.exitReason = error;
+		// A launch error outranks the note, but a stop that left survivors behind
+		// must still reach the caller when settlement lands after the stop returned.
+		record.snapshot.exitReason = error ?? record.residue;
 		record.snapshot.readyPending = undefined;
 		const failed = error !== undefined || (exitCode !== undefined && exitCode !== 0);
 		const shouldRestart =
@@ -1142,9 +1235,10 @@ class DaemonBroker {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
-				const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-				if (!processRef) throw new Error(`Daemon ${operation.name} process is unavailable`);
-				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
+				const processRef = this.#processRef(record);
+				if (processRef) processRef.killTree(SIGNAL_NUMBER[operation.signal]);
+				else if (record.process) this.#signalHandle(record, SIGNAL_NUMBER[operation.signal]);
+				else throw new Error(`Daemon ${operation.name} process is unavailable`);
 			}
 		}
 		return { op: "send", daemon: record.snapshot };
@@ -1166,11 +1260,78 @@ class DaemonBroker {
 		}
 		record.snapshot.state = "stopping";
 		this.#persist(record);
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef) await processRef.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
-		else record.pty?.kill();
+		const processRef = this.#processRef(record);
+		if (processRef) {
+			// Note a shortfall before the wait below: the settlement that publishes
+			// it can land during that wait.
+			const treeExited = await processRef.terminate({
+				group: true,
+				gracefulMs: timeoutMs,
+				timeoutMs: timeoutMs + 1_000,
+			});
+			if (!treeExited) {
+				record.residue = "descendants were still running after the termination waves";
+				logger.warn("Daemon stop left descendants running", { name: record.snapshot.name });
+			}
+		} else {
+			// Unauthorized pid: only handles we own may be signalled, and the
+			// narrower stop is recorded rather than presented as a completed one.
+			record.pty?.kill();
+			this.#signalHandle(record, SIGNAL_NUMBER.SIGTERM);
+			record.residue =
+				record.process || record.pty
+					? "signalled the supervised child directly; its descendants could not be enumerated"
+					: "no verified reference to the recorded process; nothing was signalled";
+			logger.warn("Daemon stop had no authorized process-tree reference", {
+				name: record.snapshot.name,
+			});
+		}
 		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
-		if (!settled && record.pty) record.pty.kill();
+		if (!settled) {
+			record.pty?.kill();
+			this.#signalHandle(record, SIGNAL_NUMBER.SIGKILL);
+		}
+		// Settlement already publishes the note; a record still in `stopping` has to
+		// carry it on the snapshot the stop response returns.
+		if (record.residue !== undefined && record.snapshot.exitReason === undefined) {
+			record.snapshot.exitReason = record.residue;
+			this.#persist(record);
+		}
+	}
+
+	/**
+	 * Record `pid` and pin what may be signalled for it.
+	 *
+	 * A pid is not identity — reopened later it names whoever holds the number
+	 * now — so signal authority comes only from a reference opened while the
+	 * process was known to be ours, together with the native identity that lets a
+	 * later broker revalidate the same number.
+	 */
+	#pin(record: ManagedDaemon, pid: number): void {
+		record.snapshot.pid = pid;
+		record.processRef = Process.fromPid(pid) ?? undefined;
+		record.identity = record.processRef?.identity() ?? undefined;
+	}
+
+	/** The reference a signal may be aimed at; see {@link DaemonBroker.pin}. */
+	#processRef(record: ManagedDaemon): Process | null {
+		return record.processRef ?? null;
+	}
+
+	/**
+	 * Signal the direct child through the retained spawn handle. The handle
+	 * stays valid until the child is reaped, so unlike a pid lookup it can never
+	 * resolve to a stranger and never silently disappears.
+	 */
+	#signalHandle(record: ManagedDaemon, signal: number): void {
+		try {
+			record.process?.kill(signal);
+		} catch (error) {
+			logger.debug("Daemon handle signal failed", {
+				name: record.snapshot.name,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	async #restart(name: string): Promise<DaemonRpcResult> {
@@ -1209,6 +1370,7 @@ class DaemonBroker {
 		const metadata = {
 			daemon: { ...record.snapshot },
 			spec: record.spec,
+			identity: record.identity,
 			completionEvents: record.completionCapable,
 			completionSubscriptionId: record.completionSubscriptionId,
 			completionPending: record.pendingCompletions.length > 0,
@@ -1269,18 +1431,35 @@ class DaemonBroker {
 				}
 				const snapshot = parseDaemonSnapshot(decoded.daemon);
 				const spec = parseDaemonSpec(decoded.spec);
+				const identity =
+					"identity" in decoded && typeof decoded.identity === "string" ? decoded.identity : undefined;
 				const processRef = snapshot.pid === undefined ? null : Process.fromPid(snapshot.pid);
+				const alive = processRef?.status() === "running";
+				// The recorded pid is only this daemon again if the process behind it
+				// still reports the identity we pinned when we spawned it. Records
+				// written before identities were persisted have nothing to compare and
+				// stay unverified.
+				const verified = alive && identity !== undefined && processRef?.identity() === identity;
 				const recoverableExit = !terminalState(snapshot.state) && snapshot.state !== "stopping";
-				const detached = spec.detached && recoverableExit && processRef?.status() === "running";
+				const detached = spec.detached && recoverableExit && verified;
 				const recoveredDead = recoverableExit && !detached;
 				if (!detached) {
 					// Reap only records that were still alive when the previous broker
 					// exited; already-terminal records keep their real exit time so
 					// `list` ranks exited history by true recency (issue #6517).
-					if (!terminalState(snapshot.state) && processRef) {
+					//
+					// A verified process is provably the daemon this record spawned, so a
+					// non-detached one is torn down with it. An unverified pid is never
+					// signalled — whatever holds that number now, this broker cannot show
+					// it is the daemon — and is reported instead, where `omp ps` sees it.
+					if (!terminalState(snapshot.state) && verified && processRef) {
 						await processRef.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
 					}
-					reapRecoveredSnapshot(snapshot, Date.now());
+					const reaped = reapRecoveredSnapshot(snapshot, Date.now());
+					if (reaped && alive && !verified) {
+						snapshot.exitReason =
+							"previous broker exited; a process still holds the recorded pid and was left running because its identity could not be verified";
+					}
 				} else if (snapshot.state === "restarting") {
 					snapshot.state = spec.ready ? "starting" : "running";
 				}
@@ -1290,6 +1469,9 @@ class DaemonBroker {
 					spec,
 					snapshot,
 					dir,
+					// Signal authority is restored only for a revalidated process.
+					processRef: detached && processRef !== null ? processRef : undefined,
+					identity: detached ? identity : undefined,
 					generation: 0,
 					stopRequested: !detached || snapshot.state === "stopping",
 					logReady: detached && (!spec.ready?.log || snapshot.state === "ready"),

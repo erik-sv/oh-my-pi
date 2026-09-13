@@ -99,6 +99,15 @@ impl ChildProcess {
 		#[allow(unused_mut, reason = "only mutated on some platforms")]
 		let mut sigchld = sys::signal::chld_signal_listener()?;
 
+		// Register for SIGCHLD before checking for an already-stopped child.
+		// A fast child can stop before wait() begins; its wait status persists,
+		// but the signal edge does not. Checking after listener registration
+		// closes both sides of that race: an earlier stop is found here, while a
+		// later stop wakes sigchld below.
+		if sys::signal::poll_for_stopped_children()? {
+			return Ok(ProcessWaitResult::Stopped);
+		}
+
 		let cancelled = async {
 			match &cancel_token {
 				Some(token) => token.cancelled().await,
