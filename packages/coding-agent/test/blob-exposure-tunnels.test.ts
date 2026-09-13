@@ -36,7 +36,10 @@ function exposure(kind: ExposureConfig["kind"], overrides: Partial<ExposureConfi
 	} as ExposureConfig;
 }
 
-function prepareFake(output: string, options: { exitCode?: number; restartOnce?: boolean } = {}): FakeInvocation {
+function prepareFake(
+	output: string,
+	options: { exitCode?: number; restartOnce?: boolean; restartWithoutOutput?: boolean } = {},
+): FakeInvocation {
 	const suffix = String(invocationSequence++);
 	const argsFile = path.join(fakeBinDir, `args-${suffix}.json`);
 	const runsFile = path.join(fakeBinDir, `runs-${suffix}.txt`);
@@ -50,6 +53,8 @@ function prepareFake(output: string, options: { exitCode?: number; restartOnce?:
 	const restartMarker = options.restartOnce ? path.join(fakeBinDir, `restart-${suffix}.txt`) : undefined;
 	if (restartMarker === undefined) delete process.env.OMP_FAKE_TUNNEL_RESTART_MARKER;
 	else process.env.OMP_FAKE_TUNNEL_RESTART_MARKER = restartMarker;
+	if (options.restartWithoutOutput) process.env.OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT = "1";
+	else delete process.env.OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT;
 	return { argsFile, runsFile, signalsFile, restartMarker };
 }
 
@@ -106,13 +111,16 @@ beforeAll(() => {
 			`printf 'run\\n' >> "$OMP_FAKE_TUNNEL_RUNS"\n` +
 			`trap 'printf "SIGINT\\n" >> "$OMP_FAKE_TUNNEL_SIGNALS"; exit 0' INT\n` +
 			`trap 'printf "SIGTERM\\n" >> "$OMP_FAKE_TUNNEL_SIGNALS"; exit 0' TERM\n` +
-			`if [ -n "$OMP_FAKE_TUNNEL_OUTPUT" ]; then printf '%s\\n' "$OMP_FAKE_TUNNEL_OUTPUT"; fi\n` +
+			`if [ -z "$OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT" ] || [ ! -e "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
+			`  if [ -n "$OMP_FAKE_TUNNEL_OUTPUT" ]; then printf '%s\\n' "$OMP_FAKE_TUNNEL_OUTPUT"; fi\n` +
+			`fi\n` +
 			`if [ -n "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
 			`  if [ ! -e "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
 			`    printf 'first\\n' > "$OMP_FAKE_TUNNEL_RESTART_MARKER"\n` +
 			`    exit 23\n` +
 			`  fi\n` +
 			`  printf 'restarted\\n' >> "$OMP_FAKE_TUNNEL_RESTART_MARKER"\n` +
+			`  if [ -n "$OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT" ]; then while :; do /bin/sleep 1; done; fi\n` +
 			`fi\n` +
 			`if [ -n "$OMP_FAKE_TUNNEL_EXIT_CODE" ]; then exit "$OMP_FAKE_TUNNEL_EXIT_CODE"; fi\n` +
 			`while :; do /bin/sleep 1; done\n`,
@@ -135,6 +143,7 @@ afterAll(async () => {
 	delete process.env.OMP_FAKE_TUNNEL_OUTPUT;
 	delete process.env.OMP_FAKE_TUNNEL_EXIT_CODE;
 	delete process.env.OMP_FAKE_TUNNEL_RESTART_MARKER;
+	delete process.env.OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT;
 	fs.rmSync(fakeBinDir, { recursive: true, force: true });
 });
 
@@ -247,6 +256,25 @@ describe("startExposure tunnel adapters", () => {
 		await waitForRestart(invocation.restartMarker!);
 		expect(fs.readFileSync(invocation.runsFile, "utf8")).toBe("run\nrun\n");
 		expect(active.baseUrl).toBe("https://stable.example.test");
+		await stopAndObserve(active, invocation);
+	});
+
+	it("stops an authenticated Pinggy reconnect while it is waiting to report its URL", async () => {
+		const invocation = prepareFake("Tunnel established at https://different-random.a.pinggy.link", {
+			restartOnce: true,
+			restartWithoutOutput: true,
+		});
+		const active = await startExposure(
+			exposure("pinggy", {
+				publicBaseUrl: "https://stable.example.test/",
+				credentials: { token: "fake-pinggy-token" },
+			}),
+			PORT,
+		);
+		activeExposures.push(active);
+		expect(active.baseUrl).toBe("https://stable.example.test");
+		await waitForRestart(invocation.restartMarker!);
+		expect(fs.readFileSync(invocation.runsFile, "utf8")).toBe("run\nrun\n");
 		await stopAndObserve(active, invocation);
 	});
 

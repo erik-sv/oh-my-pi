@@ -24,17 +24,27 @@ mod platform {
 		fs,
 		os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 		ptr,
-		sync::Arc,
+		sync::{Arc, LazyLock},
 	};
 
 	use super::ProcessStatus;
 
 	/// Stable Linux process reference backed by a pidfd.
+	///
+	/// Two distinct PID spaces meet in this type and must never be conflated.
+	/// `pid` is the identifier in *our* PID namespace: the only number
+	/// `pidfd_open`, `kill`, and `getpgid` accept. `proc_pid` is the identifier
+	/// used by the procfs actually mounted at `/proc`, which belongs to the PID
+	/// namespace that mounted it — not necessarily ours. A supervisor running
+	/// inside a child PID namespace that inherited the host's `/proc` sees the
+	/// two diverge for every process it owns, so building `/proc/<pid>/…` paths
+	/// out of `pid` reads a stranger's entry, or none at all.
 	#[derive(Clone)]
 	pub struct Process {
 		pid:        i32,
 		pidfd:      Arc<OwnedFd>,
-		start_time: u64,
+		proc_pid:   Option<i32>,
+		start_time: Option<u64>,
 	}
 
 	impl Process {
@@ -42,24 +52,68 @@ mod platform {
 			if pid <= 0 {
 				return None;
 			}
+			// The pidfd is the identity anchor: it names one `struct pid` for the
+			// lifetime of this reference and can never be recycled onto another
+			// process, so it — not a `/proc` lookup — decides whether `pid` exists.
+			// Failing construction on an unreadable `/proc` entry (the normal case
+			// when procfs belongs to an ancestor PID namespace) left supervisors
+			// with no process reference at all, so a requested stop signalled
+			// nothing and the record parked in `stopping` forever.
 			let pidfd = open_pidfd(pid)?;
-			let start_time = read_start_time(pid)?;
-			Some(Self { pid, pidfd, start_time })
+			// fdinfo answers this directly and correctly whatever the namespace
+			// layout is, and costs the one read a depth check would have cost.
+			let proc_pid = procfs_pid(pidfd.as_raw_fd());
+			let start_time = proc_pid.and_then(read_start_time);
+			Some(Self { pid, pidfd, proc_pid, start_time })
+		}
+
+		/// This process as named by the mounted procfs, when it is visible there.
+		pub const fn procfs_pid(&self) -> Option<i32> {
+			self.proc_pid
 		}
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
 		}
 
+		/// Opaque identity for this exact process: boot, the PID namespace it
+		/// belongs to, the pid procfs names it by, and the start time procfs
+		/// reported for it.
+		///
+		/// Both discriminators are load-bearing. The start time is measured in
+		/// ticks since boot, so the boot id is what stops a persisted token from
+		/// matching after a reboot; and a pid is unique only within one
+		/// namespace, so without the namespace two processes born on the same
+		/// tick in sibling namespaces could carry the same token. Absent when
+		/// any component is unreadable, so a caller comparing tokens fails
+		/// closed.
+		pub fn identity(&self) -> Option<String> {
+			let proc_pid = self.proc_pid?;
+			let namespace = fs::read_link(format!("/proc/{proc_pid}/ns/pid")).ok()?;
+			Some(format!(
+				"linux:{}:{}:{proc_pid}:{}",
+				BOOT_ID.as_deref()?,
+				namespace.to_string_lossy(),
+				self.start_time?,
+			))
+		}
+
 		pub fn children(&self) -> Vec<Self> {
 			if !self.live_identity() {
 				return Vec::new();
 			}
+			// Every child list procfs can offer is written in procfs pid numbers. With
+			// no procfs view of ourselves there is nothing to enumerate; returning an
+			// empty list keeps the caller signalling only the identity-pinned root
+			// instead of guessing at numbers from a foreign namespace.
+			let Some(proc_pid) = self.proc_pid else {
+				return Vec::new();
+			};
 
 			// `/proc/{pid}/task/{tid}/children` is per-task: a child fork()ed from a
 			// worker thread appears under that thread's `tid`, not the tgid. Walk
 			// every task subdir and union the lists, then re-validate parentage.
-			let task_dir = format!("/proc/{}/task", self.pid);
+			let task_dir = format!("/proc/{proc_pid}/task");
 			let Ok(entries) = fs::read_dir(&task_dir) else {
 				return Vec::new();
 			};
@@ -75,17 +129,17 @@ mod platform {
 				if tid_str.parse::<i32>().is_err() {
 					continue;
 				}
-				let children_path = format!("/proc/{}/task/{}/children", self.pid, tid_str);
+				let children_path = format!("/proc/{proc_pid}/task/{tid_str}/children");
 				let Ok(content) = fs::read_to_string(&children_path) else {
 					continue;
 				};
 				// The file is readable -> this kernel has CONFIG_PROC_CHILDREN.
 				children_file_available = true;
 				for part in content.split_whitespace() {
-					let Ok(child_pid) = part.parse::<i32>() else {
+					let Ok(child_proc_pid) = part.parse::<i32>() else {
 						continue;
 					};
-					self.push_validated_child(child_pid, &mut seen, &mut out);
+					self.push_validated_child(child_proc_pid, &mut seen, &mut out);
 				}
 			}
 
@@ -102,47 +156,72 @@ mod platform {
 					let Some(pid_str) = name.to_str() else {
 						continue;
 					};
-					let Ok(child_pid) = pid_str.parse::<i32>() else {
+					let Ok(child_proc_pid) = pid_str.parse::<i32>() else {
 						continue;
 					};
-					self.push_validated_child(child_pid, &mut seen, &mut out);
+					self.push_validated_child(child_proc_pid, &mut seen, &mut out);
 				}
 			}
 			out
 		}
 
-		/// Validate a candidate child pid — dedup, still running, and currently
+		/// Validate a candidate child, named in procfs pid numbers — dedup,
+		/// translatable into our PID namespace, still running, and currently
 		/// parented to `self` — then push it onto `out`. Shared by the
 		/// `/proc/<pid>/task/<tid>/children` fast path and the `/proc`-scan
 		/// fallback for kernels without `CONFIG_PROC_CHILDREN`.
-		fn push_validated_child(&self, child_pid: i32, seen: &mut HashSet<i32>, out: &mut Vec<Self>) {
-			if child_pid == self.pid || !seen.insert(child_pid) {
+		fn push_validated_child(
+			&self,
+			child_proc_pid: i32,
+			seen: &mut HashSet<i32>,
+			out: &mut Vec<Self>,
+		) {
+			if Some(child_proc_pid) == self.proc_pid || !seen.insert(child_proc_pid) {
 				return;
 			}
+			// A process that has no entry for our namespace level is not ours to
+			// signal: it lives in an ancestor namespace that only the shared procfs
+			// can see.
+			let Some(child_pid) = local_pid_from_procfs(child_proc_pid) else {
+				return;
+			};
 			let Some(child) = Self::from_pid(child_pid) else {
 				return;
 			};
+			// The reverse mapping is authoritative and closes the translation race:
+			// the child's own pidfd must name the very procfs entry we translated
+			// from. If the numbers were recycled between the two reads, or the
+			// translation picked the wrong namespace level, the round trip disagrees
+			// and the candidate is dropped rather than signalled.
+			if child.proc_pid != Some(child_proc_pid) {
+				return;
+			}
 			if child.status() == ProcessStatus::Running
-				&& current_parent_pid(child.pid) == Some(self.pid)
+				&& current_parent_pid(child_proc_pid) == self.proc_pid
 			{
 				out.push(child);
 			}
 		}
 
 		pub fn parent_pid(&self) -> Option<i32> {
-			if self.status() == ProcessStatus::Running {
-				current_parent_pid(self.pid)
-			} else {
-				None
+			if self.status() != ProcessStatus::Running {
+				return None;
 			}
+			// Reported in our PID namespace, like every other pid this type hands
+			// out. A parent outside our namespace has no such number and is reported
+			// as absent.
+			local_pid_from_procfs(current_parent_pid(self.proc_pid?)?)
 		}
 
 		pub fn args(&self) -> Vec<String> {
 			if !self.live_identity() {
 				return Vec::new();
 			}
+			let Some(proc_pid) = self.proc_pid else {
+				return Vec::new();
+			};
 
-			let cmdline_path = format!("/proc/{}/cmdline", self.pid);
+			let cmdline_path = format!("/proc/{proc_pid}/cmdline");
 			let Ok(content) = fs::read(cmdline_path) else {
 				return Vec::new();
 			};
@@ -233,9 +312,20 @@ mod platform {
 			}
 		}
 
+		/// True while this reference still names a live process *and* procfs can
+		/// be read for it under proof that the entry is still ours.
+		///
+		/// The pidfd pins identity for signalling, so `kill`, `status`, and
+		/// `group_id` never consult this. The `/proc` reads do: they address the
+		/// process by number, so without both a procfs view and a start time
+		/// captured from it there is nothing to compare a later read against, and
+		/// metadata and descendant enumeration fail closed rather than trust an
+		/// entry that a recycled number could have replaced.
 		fn live_identity(&self) -> bool {
-			self.status() == ProcessStatus::Running
-				&& read_start_time(self.pid) == Some(self.start_time)
+			let (Some(proc_pid), Some(start_time)) = (self.proc_pid, self.start_time) else {
+				return false;
+			};
+			self.status() == ProcessStatus::Running && read_start_time(proc_pid) == Some(start_time)
 		}
 	}
 
@@ -247,8 +337,8 @@ mod platform {
 			.collect()
 	}
 
-	fn current_parent_pid(pid: i32) -> Option<i32> {
-		let status_path = format!("/proc/{pid}/status");
+	fn current_parent_pid(proc_pid: i32) -> Option<i32> {
+		let status_path = format!("/proc/{proc_pid}/status");
 		let content = fs::read_to_string(status_path).ok()?;
 		content.lines().find_map(|line| {
 			line
@@ -257,15 +347,108 @@ mod platform {
 		})
 	}
 
-	fn read_start_time(pid: i32) -> Option<u64> {
+	fn read_start_time(proc_pid: i32) -> Option<u64> {
 		// `/proc/[pid]/stat` field 22 is the process start time in clock ticks since
 		// boot. The comm field (between parens) may itself contain spaces and parens,
 		// so locate the *last* `)` and split the trailing whitespace-separated fields.
-		let stat_path = format!("/proc/{pid}/stat");
+		let stat_path = format!("/proc/{proc_pid}/stat");
 		let content = fs::read_to_string(stat_path).ok()?;
 		let last_paren = content.rfind(')')?;
 		let rest = &content[last_paren + 1..];
 		rest.split_whitespace().nth(19)?.parse().ok()
+	}
+
+	/// Translate a pidfd into the pid number the mounted procfs uses.
+	///
+	/// The kernel renders `Pid:` in a pidfd's fdinfo relative to the PID
+	/// namespace that owns the procfs superblock being read, which is exactly
+	/// the namespace every `/proc/<n>/…` path in this module is interpreted in.
+	/// That makes fdinfo the authoritative bridge from our namespace to
+	/// procfs's, with no reliance on the two agreeing. `Pid: -1` means the task
+	/// is gone.
+	fn procfs_pid(pidfd: RawFd) -> Option<i32> {
+		parse_fdinfo_pid(&fs::read_to_string(format!("/proc/self/fdinfo/{pidfd}")).ok()?)
+	}
+
+	pub(super) fn parse_fdinfo_pid(content: &str) -> Option<i32> {
+		content
+			.lines()
+			.find_map(|line| line.strip_prefix("Pid:"))
+			.and_then(|pid| pid.trim().parse::<i32>().ok())
+			.filter(|pid| *pid > 0)
+	}
+
+	/// This boot, as procfs names it. Constant for the life of the kernel, so it
+	/// is read once.
+	static BOOT_ID: LazyLock<Option<String>> = LazyLock::new(|| {
+		fs::read_to_string("/proc/sys/kernel/random/boot_id")
+			.ok()
+			.map(|id| id.trim().to_owned())
+			.filter(|id| !id.is_empty())
+	});
+
+	/// Depth of our own PID namespace within the `NSpid:` lists procfs reports,
+	/// or `None` when procfs will not say.
+	///
+	/// `NSpid` starts at the namespace owning the procfs superblock and descends
+	/// one nested namespace per entry. Our own status file therefore ends at our
+	/// namespace, so the index of that last entry is the index at which any
+	/// other process's entry for our namespace appears. `Some(0)` is the
+	/// proven-aligned case and the only one that may skip translation; `None`
+	/// is an unreadable answer, not an aligned one, and every by-number mapping
+	/// fails closed under it rather than reviving the wrong-procfs lookup this
+	/// module exists to fix.
+	///
+	/// Read every time, never cached. This process image can be forked into a
+	/// deeper namespace, and the obvious cache key does not survive it: a parent
+	/// that is pid 1 in its namespace forks a child that is pid 1 in a new one,
+	/// so the pids match while the depths differ.
+	fn namespace_depth() -> Option<usize> {
+		read_namespace_pids("self").map(|pids| pids.len() - 1)
+	}
+
+	fn read_namespace_pids(entry: &str) -> Option<Vec<i32>> {
+		parse_namespace_pids(&fs::read_to_string(format!("/proc/{entry}/status")).ok()?)
+	}
+
+	/// Parse a `NSpid:` list whole. A dropped or malformed entry would shift
+	/// every later index onto the wrong namespace level, so one bad token
+	/// rejects the list instead of silently renumbering it.
+	fn parse_namespace_pids(content: &str) -> Option<Vec<i32>> {
+		let line = content
+			.lines()
+			.find_map(|line| line.strip_prefix("NSpid:"))?;
+		let mut pids = Vec::new();
+		for token in line.split_whitespace() {
+			let pid = token.parse::<i32>().ok()?;
+			if pid <= 0 {
+				return None;
+			}
+			pids.push(pid);
+		}
+		(!pids.is_empty()).then_some(pids)
+	}
+
+	/// Pick the pid a `/proc/<n>/status` body reports for namespace level
+	/// `depth`, or `None` when the process has no entry that deep — meaning it
+	/// lives above our namespace and is visible only because the procfs mount
+	/// belongs to an ancestor.
+	pub(super) fn namespace_pid_at(status: &str, depth: usize) -> Option<i32> {
+		parse_namespace_pids(status)?.get(depth).copied()
+	}
+
+	/// Translate a procfs pid into the pid number our own namespace uses, or
+	/// `None` when that mapping cannot be proven — the process lives above our
+	/// namespace and is visible only through the shared procfs, or procfs will
+	/// not tell us where our own namespace sits. Neither case is ours to signal.
+	fn local_pid_from_procfs(proc_pid: i32) -> Option<i32> {
+		match namespace_depth() {
+			Some(0) => Some(proc_pid),
+			Some(depth) => {
+				namespace_pid_at(&fs::read_to_string(format!("/proc/{proc_pid}/status")).ok()?, depth)
+			},
+			None => None,
+		}
 	}
 
 	fn open_pidfd(pid: i32) -> Option<Arc<OwnedFd>> {
@@ -304,16 +487,24 @@ mod platform {
 			let Some(name_str) = name.to_str() else {
 				continue;
 			};
-			let Ok(pid) = name_str.parse::<i32>() else {
+			let Ok(proc_pid) = name_str.parse::<i32>() else {
 				continue;
 			};
-			let exe_path = format!("/proc/{pid}/exe");
+			let exe_path = format!("/proc/{proc_pid}/exe");
 			let Ok(resolved) = fs::read_link(&exe_path) else {
 				continue;
 			};
-			if resolved.as_os_str() == target_os
-				&& let Some(process) = Process::from_pid(pid)
-			{
+			if resolved.as_os_str() != target_os {
+				continue;
+			}
+			// `/proc` names processes in its own namespace. Opening those numbers
+			// directly would hand back a reference to whichever unrelated process
+			// holds the same number in our namespace, so translate first and keep
+			// only candidates whose pidfd maps back to the entry we matched.
+			let Some(process) = local_pid_from_procfs(proc_pid).and_then(Process::from_pid) else {
+				continue;
+			};
+			if process.procfs_pid() == Some(proc_pid) {
 				matches.push(process);
 			}
 		}
@@ -360,6 +551,13 @@ mod platform {
 
 		pub const fn pid(&self) -> i32 {
 			self.pid
+		}
+
+		/// Opaque identity for this exact process. The kernel reports the start
+		/// time as an absolute wall-clock instant, so it already separates
+		/// reboots.
+		pub fn identity(&self) -> Option<String> {
+			Some(format!("macos:{}:{}.{:06}", self.pid, self.start_tvsec, self.start_tvusec))
 		}
 
 		pub fn children(&self) -> Vec<Self> {
@@ -876,6 +1074,12 @@ mod platform {
 			self.pid
 		}
 
+		/// Opaque identity for this exact process. The creation `FILETIME` is an
+		/// absolute instant, so it already separates reboots.
+		pub fn identity(&self) -> Option<String> {
+			Some(format!("windows:{}:{}", self.pid, self.creation_time))
+		}
+
 		pub fn parent_pid(&self) -> Option<i32> {
 			process_basic_information(self.handle.as_raw())
 				.and_then(|info| i32::try_from(info.inherited_from_unique_process_id).ok())
@@ -1346,6 +1550,15 @@ impl Process {
 	#[must_use]
 	pub fn status(&self) -> ProcessStatus {
 		self.inner.status()
+	}
+
+	/// Opaque token identifying this exact process, comparable across restarts
+	/// of the observer. Equality is the only supported operation; `None` means
+	/// the platform could not supply every component, and a caller that cannot
+	/// compare must fail closed rather than fall back to the pid.
+	#[must_use]
+	pub fn identity(&self) -> Option<String> {
+		self.inner.identity()
 	}
 
 	/// Gracefully terminate this process and its descendants.
@@ -1898,6 +2111,289 @@ const fn platform_process_group_alive(_pgid: i32) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// Regression coverage for supervised processes that could not be stopped
+	/// when the supervisor runs in a child PID namespace that inherited an
+	/// ancestor's `/proc` mount (AgentDesk's layout).
+	///
+	/// Both fixtures are verbatim kernel output captured from that layout: the
+	/// supervisor is pid 214147 to procfs and pid 66 to itself, and a supervised
+	/// pytest is 957245 to procfs and 178362 to the supervisor. Reading
+	/// `/proc/178362/...` there reaches an unrelated process or nothing at all,
+	/// so a stop either signalled a stranger or signalled nobody and the daemon
+	/// record parked in `stopping` while the tree kept its memory.
+	#[cfg(target_os = "linux")]
+	mod namespace_translation {
+		use super::super::platform::{namespace_pid_at, parse_fdinfo_pid};
+
+		// One complete line per `concat!` argument. A single long literal invites the
+		// formatter to wrap it on a `\` continuation, and a wrap landing on an escape
+		// silently rewrites the fixture — which is how `\nNSpid:` once became a
+		// literal backslash followed by `nNSpid:`.
+		const SUPERVISED_STATUS: &str = concat!(
+			"Name:\tpytest\n",
+			"State:\tS (sleeping)\n",
+			"Tgid:\t957245\n",
+			"Pid:\t957245\n",
+			"PPid:\t957193\n",
+			"NSpid:\t957245\t178362\n",
+		);
+		const UNSHARED_ANCESTOR_STATUS: &str = concat!(
+			"Name:\tsystemd\n",
+			"State:\tS (sleeping)\n",
+			"Tgid:\t1\n",
+			"Pid:\t1\n",
+			"PPid:\t0\n",
+			"NSpid:\t1\n",
+		);
+
+		/// A procfs entry must resolve to the pid of *our* namespace level, never
+		/// to the number procfs printed: signalling 957245 from inside the child
+		/// namespace hits whatever local process holds that number.
+		#[test]
+		fn resolves_the_pid_of_our_own_namespace_level() {
+			assert_eq!(namespace_pid_at(SUPERVISED_STATUS, 1), Some(178362));
+			assert_eq!(namespace_pid_at(SUPERVISED_STATUS, 0), Some(957245));
+		}
+
+		/// A process that exists only above our namespace has no entry at our
+		/// level. It is never ours to signal, so translation must refuse it
+		/// rather than fall back to the procfs number.
+		#[test]
+		fn refuses_processes_absent_from_our_namespace() {
+			assert_eq!(namespace_pid_at(UNSHARED_ANCESTOR_STATUS, 1), None);
+		}
+
+		/// pidfd fdinfo is the authoritative bridge from a pid we hold to the
+		/// number the mounted procfs uses for it; the kernel renders `Pid:`
+		/// against the procfs superblock's namespace. `Pid: -1` marks a dead
+		/// task and must not be mistaken for a live procfs entry.
+		#[test]
+		fn reads_the_procfs_pid_of_a_held_pidfd() {
+			assert_eq!(
+				parse_fdinfo_pid(concat!(
+					"pos:\t0\n",
+					"flags:\t02000002\n",
+					"mnt_id:\t15\n",
+					"Pid:\t957245\n",
+					"NSpid:\t957245\t178362\n",
+				)),
+				Some(957245),
+			);
+			assert_eq!(parse_fdinfo_pid("pos:\t0\nflags:\t02000002\nPid:\t-1\n"), None);
+		}
+
+		/// A `NSpid:` list we cannot parse whole must be refused, not compacted.
+		/// Dropping one unreadable token would slide every later entry one level
+		/// up, and the pid that then looks like "our namespace" belongs to a
+		/// different process entirely.
+		#[test]
+		fn refuses_a_malformed_namespace_list_instead_of_renumbering_it() {
+			assert_eq!(namespace_pid_at("NSpid:\t957245\tbogus\t178362\n", 1), None);
+			assert_eq!(namespace_pid_at("NSpid:\t957245\t0\n", 1), None);
+			assert_eq!(namespace_pid_at("Name:\tpytest\nPid:\t957245\n", 0), None);
+		}
+	}
+
+	/// Environment marker naming the re-executed in-namespace half of
+	/// [`terminates_owned_tree_when_procfs_belongs_to_an_ancestor_namespace`].
+	#[cfg(target_os = "linux")]
+	const NS_PROBE_ENV: &str = "OMP_PI_SHELL_NS_PROBE";
+
+	/// End-to-end regression for the AgentDesk layout: a supervisor inside a
+	/// child PID namespace whose `/proc` still belongs to an ancestor
+	/// namespace.
+	///
+	/// The test re-executes itself under `unshare --user --map-root-user --pid
+	/// --fork` *without* `--mount-proc`, which is precisely the layout that
+	/// broke supervised stop. In it, `Process::from_pid` of our own child
+	/// returned `None`, because `/proc/<local pid>` names nothing in the
+	/// inherited procfs, so a stop had no reference to signal and the daemon
+	/// record parked in `stopping` while its tree kept running. The inner half
+	/// asserts the full path through the real API — open, read args, enumerate
+	/// the child, kill the tree — and that a sibling process outside that tree
+	/// is untouched.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn terminates_owned_tree_when_procfs_belongs_to_an_ancestor_namespace() {
+		use std::process::Command;
+
+		if std::env::var_os(NS_PROBE_ENV).is_some() {
+			namespaced_tree_probe();
+			return;
+		}
+
+		let unshare = ["--user", "--map-root-user", "--pid", "--fork", "--"];
+		match Command::new("unshare").args(unshare).arg("true").status() {
+			Ok(status) if status.success() => {},
+			Ok(_) => {
+				eprintln!("skipping: unprivileged user+PID namespaces are not permitted on this host");
+				return;
+			},
+			Err(error) => {
+				eprintln!("skipping: `unshare` is unavailable on this host ({error})");
+				return;
+			},
+		}
+
+		let exe = std::env::current_exe().expect("path of the running test binary");
+		let module = module_path!()
+			.split_once("::")
+			.expect("crate-qualified module path")
+			.1;
+		let test =
+			format!("{module}::terminates_owned_tree_when_procfs_belongs_to_an_ancestor_namespace");
+		let output = Command::new("unshare")
+			.args(unshare)
+			.arg(&exe)
+			.args(["--exact", &test, "--nocapture", "--test-threads=1"])
+			.env(NS_PROBE_ENV, "1")
+			.output()
+			.expect("re-execute the test binary inside a new PID namespace");
+		assert!(
+			output.status.success(),
+			"the in-namespace half failed ({}):\n{}{}",
+			output.status,
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr),
+		);
+	}
+
+	/// The half that runs inside the new namespaces. Panics on failure, which
+	/// the outer half observes as a non-zero exit status.
+	#[cfg(target_os = "linux")]
+	fn namespaced_tree_probe() {
+		use std::{process::Command, thread, time::Duration};
+
+		let ours = self_namespace_pids();
+		assert!(
+			ours.len() > 1,
+			"the probe must run in a nested PID namespace that inherited an ancestor's /proc, \
+			 otherwise it proves nothing; NSpid was {ours:?}",
+		);
+
+		// A live process outside the target tree, sharing our process group. Nothing
+		// in this test may signal it — neither a stray group kill nor a descendant
+		// walk that followed numbers from the wrong namespace.
+		let mut sentinel = Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.expect("spawn the sentinel");
+		// A genuine two-level tree: `sh` stays alive with `sleep` as its child.
+		let mut target = Command::new("sh")
+			.args(["-c", "sleep 30 & wait"])
+			.spawn()
+			.expect("spawn the target tree");
+		let sentinel_pid = i32::try_from(sentinel.id()).expect("sentinel pid fits in i32");
+		let target_pid = i32::try_from(target.id()).expect("target pid fits in i32");
+
+		let process = Process::from_pid(target_pid)
+			.expect("a supervisor must be able to open a reference to its own child");
+		assert_eq!(process.pid(), target_pid, "pids are reported in our namespace, not procfs's");
+
+		let args = process.args();
+		assert!(
+			args.iter().any(|arg| arg.contains("sleep 30 & wait")),
+			"args must be read from the process we opened, got {args:?}",
+		);
+
+		let mut children = Vec::new();
+		for _ in 0..80 {
+			children = process.children().iter().map(Process::pid).collect();
+			if !children.is_empty() {
+				break;
+			}
+			thread::sleep(Duration::from_millis(25));
+		}
+		assert!(!children.is_empty(), "the target's `sleep` child must be enumerated");
+		assert!(
+			!children.contains(&sentinel_pid),
+			"a sibling process must never enumerate as a descendant",
+		);
+
+		let signaled = process.kill_tree(None);
+		assert!(signaled >= 2, "the root and its child must both be signalled, signalled {signaled}");
+
+		for pid in std::iter::once(target_pid).chain(children.iter().copied()) {
+			let mut gone = false;
+			for _ in 0..80 {
+				if Process::from_pid(pid).is_none_or(|entry| entry.status() != ProcessStatus::Running) {
+					gone = true;
+					break;
+				}
+				thread::sleep(Duration::from_millis(25));
+			}
+			let _ = target.try_wait();
+			assert!(gone, "process {pid} survived the tree kill");
+		}
+		assert_eq!(
+			Process::from_pid(sentinel_pid).map(|entry| entry.status()),
+			Some(ProcessStatus::Running),
+			"the sentinel outside the tree must be untouched",
+		);
+
+		let _ = target.wait();
+		let _ = sentinel.kill();
+		let _ = sentinel.wait();
+	}
+
+	/// Where procfs and this process share a namespace, no translation may be
+	/// applied and the start-time guard must stay armed: a reference whose pid
+	/// has been reaped — and is therefore free for reuse — must refuse to read
+	/// or enumerate anything rather than answer for whoever inherits the
+	/// number.
+	#[cfg(target_os = "linux")]
+	#[test]
+	fn aligned_namespace_keeps_identity_validation_armed() {
+		use std::{process::Command, thread, time::Duration};
+
+		if self_namespace_pids().len() > 1 {
+			eprintln!("skipping: this suite is itself running in a nested PID namespace");
+			return;
+		}
+
+		let mut child = Command::new("sleep")
+			.arg("30")
+			.spawn()
+			.expect("spawn sleep");
+		let child_pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let pinned = Process::from_pid(child_pid).expect("pin the live child");
+		assert_eq!(
+			pinned.inner.procfs_pid(),
+			Some(child_pid),
+			"an aligned namespace must address /proc by the same number it signals",
+		);
+		assert!(!pinned.args().is_empty(), "a live child's command line must be readable");
+
+		let _ = child.kill();
+		let _ = child.wait();
+		for _ in 0..80 {
+			if pinned.status() != ProcessStatus::Running {
+				break;
+			}
+			thread::sleep(Duration::from_millis(25));
+		}
+
+		assert_eq!(pinned.status(), ProcessStatus::Exited);
+		assert!(pinned.args().is_empty(), "a reaped pid must not answer with anyone else's args");
+		assert!(
+			pinned.children().is_empty(),
+			"a reaped pid must not enumerate anyone else's children into a kill set",
+		);
+	}
+
+	/// Our own `NSpid:` list, innermost entry last.
+	#[cfg(target_os = "linux")]
+	fn self_namespace_pids() -> Vec<i32> {
+		let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+		status
+			.lines()
+			.find_map(|line| line.strip_prefix("NSpid:"))
+			.expect("the kernel reports NSpid for every task")
+			.split_whitespace()
+			.map(|pid| pid.parse::<i32>().expect("NSpid entries are integers"))
+			.collect()
+	}
 
 	/// The harness pid must be the only protected pid. Including its recorded
 	/// parent would be unsafe on Windows: that stale numeric pid can have been

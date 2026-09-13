@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { AsyncJobError, AsyncJobManager, getAsyncJobDurationMs } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/tools/hub/jobs";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
 	const deadline = Date.now() + 2_000;
@@ -385,6 +387,76 @@ describe("AsyncJobManager", () => {
 
 		expect(manager.getJob(jobId)?.status).toBe("cancelled");
 		expect(completions).toHaveLength(0);
+	});
+
+	test("freezes successful and failed durations at their settlement boundary", async () => {
+		let now = 1_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const completedGate = Promise.withResolvers<void>();
+		const failedGate = Promise.withResolvers<void>();
+		const completedId = manager.register("task", "complete", async () => {
+			await completedGate.promise;
+			return "done";
+		});
+		const failedId = manager.register("task", "fail", async () => {
+			await failedGate.promise;
+			throw new Error("failed");
+		});
+
+		now = 1_600;
+		expect(getAsyncJobDurationMs(manager.getJob(completedId)!, now)).toBe(600);
+		expect(getAsyncJobDurationMs(manager.getJob(failedId)!, now)).toBe(600);
+
+		now = 1_700;
+		completedGate.resolve();
+		failedGate.resolve();
+		await manager.waitForAll();
+		const completed = manager.getJob(completedId)!;
+		const failed = manager.getJob(failedId)!;
+		expect(completed.status).toBe("completed");
+		expect(failed.status).toBe("failed");
+		const session = { asyncJobManager: manager } as unknown as ToolSession;
+		expect(snapshotJobs(session, [completed, failed]).map(job => job.durationMs)).toEqual([700, 700]);
+		now = 9_000;
+		expect(snapshotJobs(session, [completed, failed]).map(job => job.durationMs)).toEqual([700, 700]);
+	});
+
+	test("excludes queued age and freezes cancellation when execution stops", async () => {
+		let now = 10_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const queuedGate = Promise.withResolvers<void>();
+		const queuedId = manager.register(
+			"task",
+			"queued",
+			async ({ markRunning }) => {
+				await queuedGate.promise;
+				markRunning();
+				return "cancelled before start";
+			},
+			{ queued: true },
+		);
+		const runningId = manager.register("bash", "running", async ({ signal }) => {
+			await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+			return "cancelled";
+		});
+
+		now = 10_400;
+		expect(getAsyncJobDurationMs(manager.getJob(queuedId)!, now)).toBe(0);
+		expect(getAsyncJobDurationMs(manager.getJob(runningId)!, now)).toBe(400);
+		expect(manager.cancel(queuedId)).toBe(true);
+		expect(manager.cancel(runningId)).toBe(true);
+		queuedGate.resolve();
+		await manager.waitForAll();
+
+		const queued = manager.getJob(queuedId)!;
+		const running = manager.getJob(runningId)!;
+		expect(queued.startedAt).toBeUndefined();
+		const session = { asyncJobManager: manager } as unknown as ToolSession;
+		expect(snapshotJobs(session, [queued, running]).map(job => job.durationMs)).toEqual([0, 400]);
+		now = 50_000;
+		expect(snapshotJobs(session, [queued, running]).map(job => job.durationMs)).toEqual([0, 400]);
 	});
 
 	test("bounds owner-job reap while preserving late settlement", async () => {

@@ -1,0 +1,124 @@
+name: "Provision pinned cargo-deny"
+description: >
+   Put the pinned cargo-deny on PATH for the `cargo deny` license and source
+   checks, from a GitHub cache entry when one matches, otherwise from a pinned
+   `cargo install` build.
+
+   Building cargo-deny from source is most of the license step's ~134 s median
+   and every PR run is cold, so the executable is cached. The key covers the
+   tool version, the runner OS/arch, the runner image (ImageOS) and a
+   `rustc -vV` fingerprint, so an entry is not reused across those axes.
+
+   Before anything goes on PATH, `--version` must exit 0 and print exactly the
+   pinned version. That establishes which version will run; it says nothing
+   about where the file came from. A restored file that fails the check is
+   discarded and rebuilt.
+
+   Only non-PR runs save. PR refs get their own cache scope, so a PR-side save
+   duplicates the entry per PR against the shared repo quota and no other PR
+   can read it.
+
+runs:
+   using: composite
+   steps:
+      - name: Resolve cargo-deny cache identity
+        id: tool
+        shell: bash
+        run: |
+           set -euo pipefail
+           version=0.20.2
+           if ! command -v cargo >/dev/null 2>&1; then
+             echo "::error::cargo is not on PATH; cannot provision cargo-deny $version"
+             exit 1
+           fi
+           # `rustc -vV` carries the resolved toolchain (rust-toolchain.toml
+           # pins a nightly by date) and the host triple, so a toolchain bump
+           # or another host does not reuse this entry. It costs nothing extra:
+           # the license step's own cargo calls already make rustup resolve the
+           # same pinned toolchain. ImageOS stands in for the glibc the binary
+           # links against, which a restore onto another image can be too old
+           # to satisfy.
+           fingerprint="$(rustc -vV | sha256sum | cut -c1-12)"
+           # Sibling of the bazel cache dirs. Not ~/.cargo/bin, which is
+           # rustup-managed and on a self-hosted pool can be a shared mount
+           # that a cache archive must not write into.
+           root="$HOME/.cache/omp-cargo-tools"
+           {
+             echo "version=$version"
+             echo "root=$root"
+             echo "dir=$root/bin"
+             echo "bin=$root/bin/cargo-deny"
+             echo "cache-key=cargo-deny-v1-$version-${{ runner.os }}-${{ runner.arch }}-${ImageOS:-selfhosted}-$fingerprint"
+           } >> "$GITHUB_OUTPUT"
+
+      - name: Restore cargo-deny
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+           path: ${{ steps.tool.outputs.bin }}
+           key: ${{ steps.tool.outputs.cache-key }}
+           # No restore-keys: a prefix hit could only be a binary for another
+           # version or toolchain, which the version check below rejects, so
+           # downloading it first costs time and buys nothing.
+
+      - name: Verify or install cargo-deny
+        id: provision
+        shell: bash
+        env:
+           BIN: ${{ steps.tool.outputs.bin }}
+           DIR: ${{ steps.tool.outputs.dir }}
+           ROOT: ${{ steps.tool.outputs.root }}
+           VERSION: ${{ steps.tool.outputs.version }}
+           RESTORED: ${{ steps.cache.outputs.cache-hit }}
+        run: |
+           set -euo pipefail
+           expect="cargo-deny $VERSION"
+           probe_out=""
+           probe_status=0
+           # Both paths, restored and freshly installed, clear the same bar: a
+           # successful `--version` printing exactly the pin. A non-zero exit
+           # or any other output is a reject, never a warning we run past.
+           probe() {
+             probe_status=0
+             probe_out="$("$BIN" --version 2>/dev/null)" || probe_status=$?
+             [ "$probe_status" -eq 0 ] && [ "$probe_out" = "$expect" ]
+           }
+
+           accepted=false
+           installed=false
+           # The save step stores one regular file, so a restored path that is
+           # not one did not come from it.
+           if [ "$RESTORED" = "true" ] && [ -f "$BIN" ] && [ ! -L "$BIN" ] && [ -x "$BIN" ]; then
+             if probe; then
+               accepted=true
+               echo "$expect restored from cache"
+             else
+               echo "::warning title=cargo-deny cache rejected::restored file exited $probe_status printing '$probe_out', want '$expect'; building from source"
+             fi
+           fi
+
+           if [ "$accepted" != true ]; then
+             # --force: a persistent runner HOME can hold a `.crates.toml`
+             # claiming this version while the executable is gone or wrong, and
+             # without it cargo reports "already installed" and installs
+             # nothing.
+             cargo install --locked --force --version "$VERSION" --root "$ROOT" cargo-deny
+             if ! probe; then
+               echo "::error::installed cargo-deny exited $probe_status printing '$probe_out', want '$expect'"
+               exit 1
+             fi
+             installed=true
+           fi
+
+           echo "$DIR" >> "$GITHUB_PATH"
+           echo "installed=$installed" >> "$GITHUB_OUTPUT"
+
+      # Producer half of the split cache. A rejected exact-key hit is not
+      # re-saved: the key is already taken, so the remedy for a bad entry is a
+      # key-version bump (cargo-deny-v1-), not a racing write.
+      - name: Save cargo-deny
+        if: github.event_name != 'pull_request' && steps.cache.outputs.cache-hit != 'true' && steps.provision.outputs.installed == 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+           path: ${{ steps.tool.outputs.bin }}
+           key: ${{ steps.tool.outputs.cache-key }}

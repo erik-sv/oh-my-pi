@@ -269,16 +269,18 @@ export class AgentRunCollector {
 		this.#invokedTools.add(init.toolName);
 	}
 
-	endTool(span: Span, fields: { readonly status: ToolStatus; readonly errorType: string | undefined }): void {
+	endTool(span: Span, fields: { readonly status: ToolStatus; readonly errorType: string | undefined }): ToolRecord {
 		const start = (span as SpanWithToolStart)[kToolStart];
 		(span as SpanWithToolStart)[kToolStart] = undefined;
-		this.#tools.push({
+		const record: ToolRecord = {
 			toolCallId: start?.toolCallId ?? "",
 			toolName: start?.toolName ?? "",
 			status: fields.status,
 			latencyMs: start ? Math.max(0, performance.now() - start.startedAtMs) : 0,
 			errorType: fields.errorType,
-		});
+		};
+		this.#tools.push(record);
+		return record;
 	}
 
 	/**

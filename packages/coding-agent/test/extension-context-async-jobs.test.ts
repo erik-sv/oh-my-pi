@@ -28,7 +28,7 @@ describe("ExtensionRunner async job context", () => {
 
 	it("exposes the owning session snapshot", () => {
 		const snapshot: AsyncJobSnapshot = {
-			running: [{ id: "bg-1", type: "bash", status: "running", label: "sleep 30", startTime: 1 }],
+			running: [{ id: "bg-1", type: "bash", status: "running", label: "sleep 30", durationMs: 1 }],
 			recent: [],
 			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
 		};

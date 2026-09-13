@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `Process.identity()`, an opaque platform-qualified token for one exact process (boot id, pid, and kernel start time on Linux; absolute creation time on macOS and Windows). Equality is the only supported operation, and it is `null` when a component is unreadable so callers fail closed instead of trusting a bare pid.
+
+### Fixed
+
+- Fixed process references resolving against the wrong PID namespace when `/proc` belongs to an ancestor namespace, as it does for a supervisor running inside a child PID namespace with the host `/proc` still mounted. `Process` pinned identity through a pidfd but read `/proc/<pid>` with the same number, so `fromPid` returned `null` for a live owned child - leaving stops with nothing to signal - and, where a host process held the same number, validated against a stranger and enumerated that stranger's children as descendants. Both PID spaces are now tracked separately: the procfs number comes from the pidfd's fdinfo, discovered children are translated back through `NSpid` and re-verified by reverse mapping, and processes absent from our namespace are refused.
+- Fixed native shell sessions hanging when foreground pipeline children stopped before SIGCHLD monitoring began.
+
 ## [18.1.9] - 2026-09-04
 
 ### Added

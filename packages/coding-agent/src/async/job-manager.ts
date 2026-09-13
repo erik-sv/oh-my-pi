@@ -83,7 +83,12 @@ export interface AsyncJob {
 	id: string;
 	type: AsyncJobType;
 	status: "running" | "completed" | "failed" | "cancelled";
-	startTime: number;
+	/** Wall-clock registration boundary, including any time parked in a queue. */
+	registeredAt: number;
+	/** Wall-clock execution boundary. Undefined while a queued job remains parked. */
+	startedAt?: number;
+	/** Wall-clock terminal-state boundary. Set once and never advanced. */
+	settledAt?: number;
 	label: string;
 	abortController: AbortController;
 	promise: Promise<void>;
@@ -126,6 +131,19 @@ export interface AsyncJob {
 	 * outlive the job row it was kept alive for.
 	 */
 	retainedArtifactsCleanup?: () => Promise<void>;
+}
+/**
+ * Execution time for a job. Queued time is excluded; terminal jobs use their
+ * frozen settlement boundary while live jobs advance to `now`.
+ */
+export function getAsyncJobDurationMs(
+	job: Pick<AsyncJob, "status" | "startedAt" | "settledAt">,
+	now: number = Date.now(),
+): number {
+	const startedAt = job.startedAt;
+	if (startedAt === undefined) return 0;
+	const endedAt = job.status === "running" ? now : (job.settledAt ?? startedAt);
+	return Math.max(0, endedAt - startedAt);
 }
 
 /** Delivery callback for a settled job's result text. */
@@ -176,7 +194,18 @@ interface AsyncJobDelivery {
 	 * retrying) — without it, a recovered delivery would silently drop
 	 * `structured` even though `text` survives on the delivery itself.
 	 */
-	jobSnapshot?: Pick<AsyncJob, "type" | "status" | "startTime" | "label" | "structured" | "agentId" | "latestDetails">;
+	jobSnapshot?: Pick<
+		AsyncJob,
+		| "type"
+		| "status"
+		| "registeredAt"
+		| "startedAt"
+		| "settledAt"
+		| "label"
+		| "structured"
+		| "agentId"
+		| "latestDetails"
+	>;
 }
 
 export interface AsyncJobDeliveryState {
@@ -314,13 +343,14 @@ export class AsyncJobManager {
 		this.#suppressedDeliveries.delete(id);
 		this.#consumedJobResults.delete(id);
 		const abortController = new AbortController();
-		const startTime = Date.now();
+		const registeredAt = Date.now();
 
 		const job: AsyncJob = {
 			id,
 			type,
 			status: "running",
-			startTime,
+			registeredAt,
+			startedAt: options?.queued === true ? undefined : registeredAt,
 			label,
 			abortController,
 			promise: Promise.resolve(),
@@ -348,7 +378,9 @@ export class AsyncJobManager {
 					signal: abortController.signal,
 					reportProgress,
 					markRunning: () => {
+						if (job.status !== "running" || !job.queued) return;
 						job.queued = false;
+						job.startedAt ??= Date.now();
 					},
 				});
 				const text = typeof outcome === "string" ? outcome : outcome.text;
@@ -360,6 +392,7 @@ export class AsyncJobManager {
 					return;
 				}
 				job.status = "completed";
+				job.settledAt = Date.now();
 				job.resultText = text;
 				this.#enqueueDelivery(id, text);
 				this.#scheduleEviction(id);
@@ -372,6 +405,7 @@ export class AsyncJobManager {
 				}
 				const errorText = error instanceof Error ? error.message : String(error);
 				job.status = "failed";
+				job.settledAt = Date.now();
 				job.errorText = errorText;
 				this.#enqueueDelivery(id, errorText);
 				this.#scheduleEviction(id);
@@ -393,6 +427,7 @@ export class AsyncJobManager {
 		if (filter?.ownerId && job.ownerId !== filter.ownerId) return false;
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
+		job.settledAt = Date.now();
 		job.abortController.abort();
 		this.#scheduleEviction(id);
 		return true;
@@ -409,7 +444,7 @@ export class AsyncJobManager {
 	getRecentJobs(limit = 10, filter?: AsyncJobFilter): AsyncJob[] {
 		return this.#filterJobs(this.#jobs.values(), filter)
 			.filter(job => job.status !== "running")
-			.sort((a, b) => b.startTime - a.startTime)
+			.sort((a, b) => b.registeredAt - a.registeredAt)
 			.slice(0, limit);
 	}
 
@@ -559,6 +594,7 @@ export class AsyncJobManager {
 	#cancelJobs(filter?: AsyncJobFilter, reason?: unknown): void {
 		for (const job of this.getRunningJobs(filter)) {
 			job.status = "cancelled";
+			job.settledAt = Date.now();
 			job.abortController.abort(reason);
 			this.#scheduleEviction(job.id);
 		}
@@ -980,7 +1016,9 @@ export class AsyncJobManager {
 				? {
 						type: job.type,
 						status: job.status,
-						startTime: job.startTime,
+						registeredAt: job.registeredAt,
+						startedAt: job.startedAt,
+						settledAt: job.settledAt,
 						label: job.label,
 						structured: job.structured,
 						agentId: job.agentId,
@@ -1107,7 +1145,9 @@ export class AsyncJobManager {
 			id: delivery.jobId,
 			type: snapshot.type,
 			status: snapshot.status,
-			startTime: snapshot.startTime,
+			registeredAt: snapshot.registeredAt,
+			startedAt: snapshot.startedAt,
+			settledAt: snapshot.settledAt,
 			label: snapshot.label,
 			abortController: new AbortController(),
 			promise: Promise.resolve(),

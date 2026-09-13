@@ -142,9 +142,9 @@ build --tls_certificate=infra/bazel-remote/ca.crt
 
 `.github/workflows/ci.yml` separates `rust_validate` from `native_addons`; TypeScript jobs depend only on `native_addons`.
 
-**Pull requests never build or validate Rust.** Native-affecting PRs are rare enough that they don't warrant a PR-side bazel build: `rust_validate` is skipped entirely (`if: github.event_name != 'pull_request'`), and `native_addons` fetches the latest release's Linux x64 addon pair from the `@oh-my-pi/pi-natives-linux-x64` npm leaf, smoke-loads both, and uploads them as the `native-addons` workflow artifact. The loader skips its version sentinel for workspace loads, so release-versioned addons load fine under a newer checkout. A PR whose TypeScript tests depend on changed native behavior fails visibly (and CI emits a notice on any native-touching PR); the Rust side is validated post-merge on main and again at release.
+**Pull requests build the host addons from source; they never install a published release.** `native_addons` builds `//:natives-linux-x64-baseline` and `//:natives-linux-x64-modern` from the PR's own sources and uploads them as the `native-addons` workflow artifact, so the TypeScript suites exercise the native code under review. PRs used to install the latest release's pair from the `@oh-my-pi/pi-natives-linux-x64` npm leaf; that breaks as soon as workspace code consumes a NAPI export no release carries yet, because the PR adding the export fails and so does every later PR until someone publishes. `rust_validate` is still skipped on PRs (`if: github.event_name != 'pull_request'`), so the Rust test, clippy, and rustfmt suites run post-merge on main, at release, or on a trusted pre-merge dispatch.
 
-On non-PR events both jobs run on `omp-kata` pods against the cluster remote cache. `rust_validate` runs:
+Non-PR jobs run wherever the `OMP_CI_RUNNER` repository variable points: `omp-kata` against the cluster remote cache when it is set, GitHub-hosted with the `actions/cache`-backed disk cache when it is not. `rust_validate` runs:
 
 ```bash
 bazelisk --bazelrc="$rc" test //crates/...                 # full Rust suite
@@ -160,7 +160,7 @@ bazelisk --bazelrc="$rc" build --config=rustfmt //crates/...
 - `--config=clippy` = rules_rust clippy aspect + `-Dwarnings`; `--config=clippy-strict` layers the generated `bazel/clippy.bazelrc` for crates with `[lints] workspace = true`.
 - `--config=rustfmt` = rustfmt aspect against the workspace `rustfmt.toml`.
 
-`native_addons` on main builds the six Linux-hosted targets one at a time to avoid concurrent-link OOMs, then builds `//:natives-linux-all` as an aggregate consistency check. It uploads every `.node` output as the `native-addons` workflow artifact. Downstream jobs use `.github/actions/native-artifacts` to download that artifact and install the requested target set without invoking Bazel.
+`native_addons` builds one target per `bazelisk` invocation to avoid concurrent-link OOMs: the two host addons on a PR, the six Linux-hosted targets plus `//:natives-linux-all` as an aggregate consistency check on trusted events. It uploads every `.node` output as the `native-addons` workflow artifact. Downstream jobs use `.github/actions/native-artifacts` to download that artifact and install the requested target set without invoking Bazel. Cache access is asymmetric: PR runs restore the `linux` disk-cache scope but never save it, so PR code cannot poison the archive trusted runs produce.
 
 Bazel native jobs need no toolchain setup: bazelisk is on the GitHub images and baked into the kata runner image, while Bazel fetches Rust/zig/LLVM/xwin hermetically. The Windows ARM64 host build uses the Rust, Ninja, CMake, and Visual Studio ARM64 tools installed on `windows-11-arm`; `rust-toolchain.toml` selects the pinned nightly.
 
@@ -229,7 +229,7 @@ bazelisk build --nobuild //:natives-win32-x64-baseline
 ### Cache behavior
 
 - **omp-kata:** read-write gRPC to the in-cluster bazel-remote (`grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092`, TLS via the committed `infra/bazel-remote/ca.crt`, htpasswd user `ci`). `--remote_local_fallback` plus retries make an outage degrade to local execution rather than fail the build.
-- **GitHub-hosted:** no cluster access; only the darwin release/warm jobs build with bazel here. The v3 `actions/cache` disk key separates config and source generations with prefix + bare fallbacks (see the `bazel-cache` action section above); `.github/workflows/bazel-cache-warm.yml` publishes the `release-darwin-*` archives from the same macOS images as the release consumers.
+- **GitHub-hosted:** no cluster access. Every bazel job lands here unless `OMP_CI_RUNNER` routes it to a self-hosted pool: the PR host-addon build, the trusted `rust_validate` and `native_addons` builds, and the darwin release/warm jobs. The v3 `actions/cache` disk key separates config and source generations with prefix + bare fallbacks (see the `bazel-cache` action section above); each scope has one producer (`native_addons` → `linux`, `rust_validate` → `linux-validate`), and `.github/workflows/bazel-cache-warm.yml` publishes the `release-darwin-*` archives from the same macOS images as the release consumers.
 - **msvc repos:** the ~2 GiB LLVM download is sha256-pinned and repository-cache backed; the ~1 GiB xwin CRT/SDK splat is fetched from the Microsoft CDN inside the repo rule and is **not** repo-cache backed — a cold output base re-downloads it. Microsoft advances the VS channel payload over time, so remote-cache hit rates for win32 actions degrade gracefully after an MS bump (same property the previous cross toolchain had). Win32 link actions also don't share cache entries across host OSes (linux vs mac clang binaries).
 - Server-side operations (deploy, TLS/auth, egress, poisoning boundary): `infra/docs/04-arc-and-caching.md` §5.
 

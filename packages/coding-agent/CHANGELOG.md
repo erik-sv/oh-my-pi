@@ -16,6 +16,11 @@
 - Browser timeouts and tab shutdown no longer post cancellation to a terminated or replacement worker, crash the parent, or evict a tab reopened during cleanup.
 - Browser worker failures now release worker/page resources and log bounded run, worker-generation, and timeout context without recording evaluated code.
 - Browser tab execution now runs in a subprocess, containing Bun and native-addon faults to one tab generation instead of terminating the parent agent.
+- Background job runtimes now exclude time spent queued and remain fixed after completion, failure, or cancellation.
+- OTLP tool-duration histograms now observe each real tool call separately and omit synthetic or skipped calls.
+- Sharpshooter extraction regressions now synchronize on actual extraction completion instead of racing background queue writes.
+- Stopping an authenticated Pinggy exposure now terminates a reconnect that is still waiting to report its URL instead of leaving the child alive until the readiness timeout.
+- Supervised `launch` stops now reach a terminal state and take their process tree with them. A pipe daemon settled only when its output ended, so a descendant holding stdout kept the record out of any terminal state and parked a requested stop in `stopping` for the life of the broker; settlement now follows the child's own exit with a bounded flush window. Signals are aimed only at a reference pinned while the process was known to be ours - never at a reopened pid - and a daemon recovered from a previous broker is revalidated against its persisted native identity before it can be signalled. A stop that cannot reach descendants, or cannot verify what it would signal, is reported on the record instead of presented as a completed stop.
 
 ## [18.1.10] - 2026-09-04
 

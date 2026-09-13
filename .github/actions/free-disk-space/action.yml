@@ -1,0 +1,56 @@
+name: "Reclaim runner disk space"
+description: >
+   Delete preinstalled toolchains this repo never builds against (Android SDK,
+   .NET, GHC/Haskell, Swift, the CodeQL bundle) when a GitHub-hosted runner has
+   less free space than the caller needs on the filesystem holding Bazel's
+   output base, repository cache and disk cache.
+
+   The hosted Linux image leaves only tens of GiB free on `/`, and a cold
+   native-addon build wants noticeably more: ~2 GiB LLVM plus the ~1 GiB xwin
+   CDN payload (~800 MiB splatted) for the win32 cross toolchain, the zig and
+   rust toolchains, one output tree per cross target, and a second copy of every
+   output under --disk_cache. None of the deleted trees is a build input.
+
+   No-op off GitHub-hosted runners (RUNNER_ENVIRONMENT is empty on the omp-kata
+   ARC pods, whose caches live on mounted PVCs) and no-op when the runner is
+   already above the floor, so callers can use it unconditionally regardless of
+   where a job was routed. Never fails the job: a runner that stays below the
+   floor is reported as a warning, and the build decides whether it fits.
+
+inputs:
+   required-gb:
+      description: Free GiB the caller needs on the filesystem holding $HOME
+      required: false
+      default: "40"
+
+runs:
+   using: composite
+   steps:
+      - name: Reclaim disk space
+        shell: bash
+        env:
+           REQUIRED_GB: ${{ inputs.required-gb }}
+        run: |
+           set -euo pipefail
+           if [ "${RUNNER_ENVIRONMENT:-}" != "github-hosted" ]; then
+             echo "not a GitHub-hosted runner (RUNNER_ENVIRONMENT='${RUNNER_ENVIRONMENT:-}'); nothing to reclaim."
+             exit 0
+           fi
+           # GNU df: skip the header row, keep the integer GiB count.
+           free_gb() { df -BG --output=avail "$HOME" | tail -n1 | tr -dc '0-9'; }
+           df -h "$HOME"
+           before="$(free_gb)"
+           if [ "$before" -ge "$REQUIRED_GB" ]; then
+             echo "${before} GiB free, floor is ${REQUIRED_GB} GiB; nothing to reclaim."
+             exit 0
+           fi
+           for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL; do
+             [ -e "$dir" ] || continue
+             echo "removing $dir ($(sudo du -sh "$dir" 2>/dev/null | cut -f1 || echo '?'))"
+             sudo rm -rf "$dir"
+           done
+           after="$(free_gb)"
+           echo "::notice title=Runner disk reclaimed::${before} GiB -> ${after} GiB free (floor ${REQUIRED_GB} GiB)"
+           if [ "$after" -lt "$REQUIRED_GB" ]; then
+             echo "::warning title=Disk floor not met::${after} GiB free, wanted ${REQUIRED_GB} GiB"
+           fi

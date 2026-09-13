@@ -18,7 +18,7 @@ function makeSession(): ToolSession {
 }
 
 describe("tab worker subprocess lifetime", () => {
-	it("closes through an acknowledged subprocess handshake", async () => {
+	it("waits for process readiness before an immediate acknowledged close", async () => {
 		const worker = await spawnTabWorker();
 
 		expect(worker.mode).toBe("process");

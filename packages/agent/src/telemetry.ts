@@ -258,6 +258,15 @@ export interface ChatUsageEvent {
 	readonly headers: Readonly<Record<string, string>> | undefined;
 }
 
+/** Metadata-only event fired when one real `execute_tool` span finishes. */
+export interface ToolUsageEvent {
+	readonly toolName: string;
+	readonly status: ToolStatus;
+	/** Monotonic elapsed time measured by the per-run collector. */
+	readonly durationMs: number;
+	readonly errorType: string | undefined;
+}
+
 export type TelemetryContentCapture = boolean | "none" | "summary" | "full";
 
 export type ResolvedTelemetryContentCapture = "none" | "summary" | "full";
@@ -283,6 +292,7 @@ export interface AgentTelemetryWarning {
 		| "content_serializer_failed"
 		| "on_cost_delta_failed"
 		| "on_chat_usage_failed"
+		| "on_tool_usage_failed"
 		| "cost_estimator_failed"
 		| "on_run_end_failed"
 		| "on_span_start_failed"
@@ -368,6 +378,14 @@ export interface AgentTelemetryConfig {
 	 * via {@link onTelemetryWarning}, and swallowed.
 	 */
 	readonly onChatUsage?: (event: ChatUsageEvent) => void | Promise<void>;
+	/**
+	 * Fired once for each real tool execution that entered the execute-tool
+	 * span lifecycle. Synthetic tail-sweep records do not fire this hook.
+	 *
+	 * **Non-fatal.** Failures are surfaced through
+	 * {@link onTelemetryWarning} and swallowed.
+	 */
+	readonly onToolUsage?: (event: ToolUsageEvent) => void;
 	/** Override provider labels before they are emitted or passed to cost hooks. */
 	readonly normalizeProvider?: (provider: string | undefined) => string | undefined;
 	/** Override agent names before they are emitted on spans. */
@@ -1875,7 +1893,24 @@ export function finishExecuteToolSpan(
 	if (options.errorObject instanceof Error) {
 		span.recordException(options.errorObject);
 	}
-	telemetry?.collector.endTool(span, { status, errorType });
+	const toolRecord = telemetry?.collector.endTool(span, { status, errorType });
+	const onToolUsage = telemetry?.config.onToolUsage;
+	if (telemetry && toolRecord && onToolUsage) {
+		try {
+			onToolUsage({
+				toolName: toolRecord.toolName,
+				status: toolRecord.status,
+				durationMs: toolRecord.latencyMs,
+				errorType: toolRecord.errorType,
+			});
+		} catch (err) {
+			emitTelemetryWarning(telemetry, {
+				code: "on_tool_usage_failed",
+				message: "onToolUsage threw; swallowing telemetry callback failure",
+				error: err,
+			});
+		}
+	}
 	span.end();
 }
 

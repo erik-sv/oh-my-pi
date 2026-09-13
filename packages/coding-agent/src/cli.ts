@@ -39,9 +39,10 @@ import { STATS_ACTIVITY_WORKER_ARG } from "./stats/activity-protocol";
 import rootLicense from "./tools/browser/relay/extension-assets/LICENSE.txt" with { type: "text" };
 import thirdPartyNotices from "./tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
-import type {
-	WorkerInbound as TabWorkerInbound,
-	WorkerOutbound as TabWorkerOutbound,
+import {
+	TAB_PROCESS_WORKER_ARG,
+	type WorkerInbound as TabWorkerInbound,
+	type WorkerOutbound as TabWorkerOutbound,
 } from "./tools/browser/tab-protocol";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
@@ -141,7 +142,6 @@ async function runSmokeTest(): Promise<void> {
 
 const TINY_WORKER_ARG = "__omp_worker_tiny_inference";
 const STATS_SYNC_WORKER_ARG = "__omp_worker_stats_sync";
-const TAB_PROCESS_WORKER_ARG = "__omp_worker_tab_process";
 const JS_EVAL_WORKER_ARG = "__omp_worker_js_eval";
 const JS_EVAL_PROCESS_ARG = "__omp_worker_js_eval_process";
 const STT_WORKER_ARG = "__omp_worker_stt";

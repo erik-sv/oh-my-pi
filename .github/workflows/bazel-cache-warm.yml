@@ -19,13 +19,17 @@ name: Warm bazel disk cache
 #                             copies of the ~500 MB store once ate ~9.4 GB of
 #                             the 10 GB repo cache quota and evicted every
 #                             bazel archive).
+#   warm_cargo_deny        -> the pinned cargo-deny executable the check
+#     (ubuntu-22.04)          job's license step restores. Same split as the
+#                             bun store: PR jobs restore, non-PR runs save.
 #
 # The v3 key embeds a crates/** source fingerprint, so a native change on
 # main means an exact miss: the build seeds from a previous generation via
 # the prefix/bare restore keys and the refreshed archive is saved. An exact
 # hit makes every invocation a cache replay and saves nothing.
 #
-# Paths mirror the cache-key inputs (bazel-cache action) plus bun.lock — a
+# Paths mirror the cache-key inputs (bazel-cache action) plus bun.lock and,
+# for cargo-deny, rust-toolchain.toml and the pin under .github/**. A
 # packages/** push cannot change any archive, so it does not trigger a warm.
 
 on:
@@ -87,11 +91,27 @@ jobs:
               cache-scope: ${{ matrix.scope }}
 
    # Produces the shared bun store entry PR jobs restore. bun-install's save
-   # half only runs on non-PR events, and main CI jobs run on omp-kata (PVC
-   # store, no GitHub cache), so this is the sole hosted-runner producer.
+   # half only runs on non-PR events, so this job guarantees the entry exists
+   # even when main CI is routed to a self-hosted pool (OMP_CI_RUNNER), whose
+   # mounted PVC store bypasses the GitHub cache entirely. When main CI runs
+   # hosted it produces the same entry; a duplicate save is a no-op.
    warm_bun:
       name: Seed bun store cache
       runs-on: ubuntu-22.04
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
+
+   # Produces the cargo-deny entry the check job's license step restores. Same
+   # reason as warm_bun: that action's save half only runs on non-PR events,
+   # and when main CI is routed to a self-hosted pool (OMP_CI_RUNNER) it saves
+   # an entry keyed to that pool's image and toolchain, which no hosted PR run
+   # can restore. ubuntu-22.04 is the image every PR job gets, so warming here
+   # keeps the PR path warm either way. Cargo ships on that image, so the job
+   # needs only a checkout for rust-toolchain.toml.
+   warm_cargo_deny:
+      name: Seed cargo-deny cache
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/cargo-deny

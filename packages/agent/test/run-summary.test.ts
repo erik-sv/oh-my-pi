@@ -16,7 +16,12 @@ import {
 	emptyAgentRunCoverage,
 	emptyAgentRunSummary,
 } from "@oh-my-pi/pi-agent-core/run-collector";
-import { EXECUTE_TOOL_STATUS_ATTR, GenAIAttr, PiGenAIAggregateAttr } from "@oh-my-pi/pi-agent-core/telemetry";
+import {
+	EXECUTE_TOOL_STATUS_ATTR,
+	GenAIAttr,
+	PiGenAIAggregateAttr,
+	type ToolUsageEvent,
+} from "@oh-my-pi/pi-agent-core/telemetry";
 import type { AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core/types";
 import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
@@ -500,7 +505,7 @@ describe("aggregateAgentRunSummaries / aggregateAgentRunCoverage", () => {
 	});
 });
 
-describe("onRunEnd is non-fatal", () => {
+describe("telemetry callbacks are non-fatal", () => {
 	it("swallows thrown errors and still resolves agentLoop().result() normally", async () => {
 		const tracer = new RecordingTracer();
 		const warnings: { code: string; message: string }[] = [];
@@ -535,6 +540,39 @@ describe("onRunEnd is non-fatal", () => {
 
 		expect(warnings.length).toBeGreaterThanOrEqual(1);
 		expect(warnings.some(w => w.code === "on_run_end_failed" && w.message.includes("onRunEnd"))).toBe(true);
+	});
+
+	it("swallows onToolUsage errors after a real tool execution", async () => {
+		const tracer = new RecordingTracer();
+		const warnings: string[] = [];
+		const tool = buildTool({ name: "alpha", behavior: "ok" });
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "a-1", name: "alpha", arguments: {} }] },
+				{ content: ["done"] },
+			],
+		});
+		const stream = agentLoop(
+			[createUserMessage("hi")],
+			{ systemPrompt: ["sys"], messages: [], tools: [tool] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				telemetry: {
+					tracer,
+					onToolUsage: () => {
+						throw new Error("tool observer failed");
+					},
+					onTelemetryWarning: warning => warnings.push(warning.code),
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+
+		const messages = await stream.result();
+		expect(messages.at(-1)?.role).toBe("assistant");
+		expect(warnings).toContain("on_tool_usage_failed");
 	});
 });
 
@@ -628,6 +666,7 @@ describe("skipped tools without spans", () => {
 describe("regressions: agent loop telemetry/run summary", () => {
 	it("counts each interrupted tool call exactly once (no double-counting via tail sweep)", async () => {
 		const tracer = new RecordingTracer();
+		const toolEvents: ToolUsageEvent[] = [];
 		// `concurrency: "exclusive"` serializes the batch so we can deterministically
 		// reach the `interruptState.triggered` early-return inside `runTool` for
 		// the second and third call (only interruptible waits are skipped there).
@@ -666,7 +705,7 @@ describe("regressions: agent loop telemetry/run summary", () => {
 			{
 				model: mock.model,
 				convertToLlm: identityConverter,
-				telemetry: { tracer },
+				telemetry: { tracer, onToolUsage: event => toolEvents.push(event) },
 				interruptMode: "immediate",
 				// Peek triggers `interruptState.triggered` after the first call
 				// completes; the remaining two exclusive calls hit the early-return
@@ -689,6 +728,8 @@ describe("regressions: agent loop telemetry/run summary", () => {
 		expect(telemetry?.tools.total).toBe(3);
 		expect(telemetry?.tools.ok).toBe(1);
 		expect(telemetry?.tools.skipped).toBe(2);
+		expect(toolEvents).toHaveLength(1);
+		expect(toolEvents[0]).toMatchObject({ toolName: "fast", status: "ok", durationMs: expect.any(Number) });
 	});
 
 	it("records aborted assistant tool calls in coverage.toolsInvoked + tools.aborted", async () => {

@@ -187,6 +187,14 @@ impl Process {
 	pub fn status(&self) -> ProcessStatus {
 		self.inner.status().into()
 	}
+
+	/// Opaque token identifying this exact process, comparable across restarts
+	/// of the observer. `null` when the platform cannot supply every component,
+	/// so a caller that cannot compare must fail closed rather than trust a pid.
+	#[napi]
+	pub fn identity(&self) -> Option<String> {
+		self.inner.identity()
+	}
 }
 
 impl Process {

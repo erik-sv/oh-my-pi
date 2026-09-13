@@ -4,11 +4,12 @@ import {
 	createWorkerHandle,
 	createWorkerSubprocess,
 	resolveWorkerSpawnCmd,
+	SMOKE_TEST_TIMEOUT_MS,
 	workerEnvFromParent,
 } from "../../subprocess/worker-client";
 import { shouldDetachKernel } from "../../eval/py/spawn-options";
 import { isThenable } from "../../utils/ipc";
-import type { WorkerInbound, WorkerOutbound } from "./tab-protocol";
+import { TAB_PROCESS_WORKER_ARG, type WorkerInbound, type WorkerOutbound } from "./tab-protocol";
 
 // Coding-agent binary/bundle workers route through the CLI entrypoint with a
 // hidden argv mode, so compiled/npm builds only need one JavaScript entry.
@@ -28,8 +29,9 @@ export interface WorkerHandle {
 	/** False once {@link terminate} ran or the runtime dropped the worker. */
 	readonly alive: boolean;
 	/**
-	 * Deliver a message to this generation; `false` means the generation is
-	 * gone and nothing was delivered.
+	 * Accept a message for this generation; messages submitted during process
+	 * startup are held until its inbound listener is ready. `false` means the
+	 * generation is gone and nothing was accepted.
 	 *
 	 * NEVER throws. Process IPC can fail after the subprocess exits or reject a
 	 * payload that advanced serialization cannot clone. Payload buffers are
@@ -50,7 +52,6 @@ export interface WorkerHandle {
 	close(): Promise<boolean>;
 }
 
-const TAB_PROCESS_WORKER_ARG = "__omp_worker_tab_process";
 const WORKER_CLOSE_TIMEOUT_MS = 750;
 
 class ProcessWorkerHandle implements WorkerHandle {
@@ -60,6 +61,9 @@ class ProcessWorkerHandle implements WorkerHandle {
 	#usable = true;
 	#terminated = false;
 	#detachers = new Set<() => void>();
+	#ready = Promise.withResolvers<boolean>();
+	#readyReceived = false;
+	#pending: WorkerInbound[] = [];
 
 	constructor() {
 		const spawned = createWorkerSubprocess<WorkerOutbound>({
@@ -75,8 +79,22 @@ class ProcessWorkerHandle implements WorkerHandle {
 			if (isThenable(result)) result.then(undefined, () => {});
 		});
 		this.#track(
+			this.#base.onMessage(message => {
+				if (message.type !== "process-ready" || this.#readyReceived) return;
+				this.#readyReceived = true;
+				this.#ready.resolve(true);
+				const pending = this.#pending;
+				this.#pending = [];
+				for (const queued of pending) {
+					if (!this.#sendNow(queued)) break;
+				}
+			}),
+		);
+		this.#track(
 			this.#base.onError(() => {
 				this.#usable = false;
+				this.#pending = [];
+				this.#ready.resolve(false);
 			}),
 		);
 	}
@@ -87,18 +105,11 @@ class ProcessWorkerHandle implements WorkerHandle {
 
 	send(msg: WorkerInbound): boolean {
 		if (!this.#usable) return false;
-		try {
-			this.#base.send(msg);
+		if (!this.#readyReceived) {
+			this.#pending.push(msg);
 			return true;
-		} catch (error) {
-			this.#usable = false;
-			logger.debug("Tab worker IPC send failed", {
-				worker: this.id,
-				message: msg.type,
-				errorName: error instanceof Error ? error.name : "UnknownError",
-			});
-			return false;
 		}
+		return this.#sendNow(msg);
 	}
 
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void {
@@ -110,7 +121,10 @@ class ProcessWorkerHandle implements WorkerHandle {
 	}
 
 	async close(): Promise<boolean> {
+		// Cold module loading is a startup phase, not cleanup. Arm the 750ms
+		// cleanup deadline only after the child confirms its inbox is installed.
 		if (!this.#usable || this.#terminated) return false;
+		if (!(await this.#waitForReady()) || !this.#usable || this.#terminated) return false;
 		const { promise, resolve } = Promise.withResolvers<boolean>();
 		let settled = false;
 		const finish = (closed: boolean): void => {
@@ -135,8 +149,37 @@ class ProcessWorkerHandle implements WorkerHandle {
 		if (this.#terminated) return;
 		this.#terminated = true;
 		this.#usable = false;
+		this.#pending = [];
+		this.#ready.resolve(false);
 		this.#detachAll();
 		await this.#base.terminate();
+	}
+
+	#sendNow(msg: WorkerInbound): boolean {
+		try {
+			this.#base.send(msg);
+			return true;
+		} catch (error) {
+			this.#usable = false;
+			this.#pending = [];
+			logger.debug("Tab worker IPC send failed", {
+				worker: this.id,
+				message: msg.type,
+				errorName: error instanceof Error ? error.name : "UnknownError",
+			});
+			return false;
+		}
+	}
+
+	async #waitForReady(): Promise<boolean> {
+		if (this.#readyReceived) return true;
+		const timeout = Promise.withResolvers<boolean>();
+		const timer = setTimeout(() => timeout.resolve(false), SMOKE_TEST_TIMEOUT_MS);
+		try {
+			return await Promise.race([this.#ready.promise, timeout.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
 	}
 
 	#track(detach: () => void): () => void {

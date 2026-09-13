@@ -18,6 +18,7 @@ import type {
 	AgentTelemetryWarning,
 	ChatUsageEvent,
 	ToolStatus,
+	ToolUsageEvent,
 } from "@oh-my-pi/pi-agent-core";
 import { logger, postmortem } from "@oh-my-pi/pi-utils";
 import {
@@ -99,6 +100,13 @@ export function createTelemetryExportConfig(
 		onChatUsage: async event => {
 			await config?.onChatUsage?.(event);
 			metricRecorder?.recordChatUsage(event);
+		},
+		onToolUsage: event => {
+			try {
+				config?.onToolUsage?.(event);
+			} finally {
+				metricRecorder?.recordToolUsage(event);
+			}
 		},
 		onRunEnd: (summary, coverage) => {
 			config?.onRunEnd?.(summary, coverage);
@@ -218,7 +226,7 @@ class AgentMetricRecorder {
 			unit: "{call}",
 		});
 		this.#toolDurationMs = meter.createHistogram("pi.omp.agent.tool.duration", {
-			description: "Total tool latency observed in an agent run.",
+			description: "Execution latency observed for individual tool calls.",
 			unit: "ms",
 		});
 		this.#errors = meter.createCounter("pi.omp.agent.errors", {
@@ -249,6 +257,11 @@ class AgentMetricRecorder {
 		}
 	}
 
+	recordToolUsage(event: ToolUsageEvent): void {
+		if (event.status === "skipped") return;
+		this.#toolDurationMs.record(event.durationMs, metricAttributes({ "gen_ai.tool.name": event.toolName }));
+	}
+
 	recordRun(summary: AgentRunSummary, coverage: AgentRunCoverage): void {
 		const runAttrs = metricAttributes({
 			"pi.omp.agent.models_used.count": coverage.modelsUsed.length,
@@ -270,7 +283,6 @@ class AgentMetricRecorder {
 		for (const toolName in summary.tools.byName) {
 			const counters = summary.tools.byName[toolName];
 			const toolAttrs = metricAttributes({ ...runAttrs, "gen_ai.tool.name": toolName });
-			if (counters.totalLatencyMs > 0) this.#toolDurationMs.record(counters.totalLatencyMs, toolAttrs);
 			for (const status of TOOL_STATUSES) {
 				const count = counters[status];
 				if (count > 0) this.#toolCalls.add(count, metricAttributes({ ...toolAttrs, "pi.omp.tool.status": status }));

@@ -26,6 +26,7 @@ const metricPayloads: Uint8Array[] = [];
 
 interface ProtobufField {
 	readonly number: number;
+	readonly wireType: number;
 	readonly bytes?: Uint8Array;
 }
 
@@ -50,20 +51,22 @@ function protobufFields(bytes: Uint8Array): ProtobufField[] {
 		const number = tag >>> 3;
 		if (wireType === 0) {
 			[, offset] = readVarint(bytes, offset);
-			fields.push({ number });
+			fields.push({ number, wireType });
 		} else if (wireType === 1) {
-			offset += 8;
-			fields.push({ number });
+			const end = offset + 8;
+			if (end > bytes.length) throw new Error("Truncated protobuf fixed64 field");
+			fields.push({ number, wireType, bytes: bytes.slice(offset, end) });
+			offset = end;
 		} else if (wireType === 2) {
 			const [length, valueOffset] = readVarint(bytes, offset);
 			offset = valueOffset;
 			const end = offset + length;
 			if (end > bytes.length) throw new Error("Truncated protobuf field");
-			fields.push({ number, bytes: bytes.slice(offset, end) });
+			fields.push({ number, wireType, bytes: bytes.slice(offset, end) });
 			offset = end;
 		} else if (wireType === 5) {
 			offset += 4;
-			fields.push({ number });
+			fields.push({ number, wireType });
 		} else {
 			throw new Error(`Unsupported protobuf wire type ${wireType}`);
 		}
@@ -97,6 +100,63 @@ function assertSingleMetricPoint(metricName: string): void {
 	const counts = metricPayloads.map(payload => pointCountForMetric(payload, metricName));
 	if (!counts.includes(1)) {
 		throw new Error(`${metricName} expected one dimensioned point, got ${counts.join(",")}`);
+	}
+}
+
+function histogramObservationForMetric(
+	bytes: Uint8Array,
+	metricName: string,
+): { points: number; count: number; sum: number } | undefined {
+	const fields = protobufFields(bytes);
+	const isMetric = fields.some(
+		field =>
+			field.number === 1 &&
+			field.wireType === 2 &&
+			field.bytes &&
+			new TextDecoder().decode(field.bytes) === metricName,
+	);
+	if (isMetric) {
+		const histogram = fields.find(field => field.number === 9 && field.wireType === 2)?.bytes;
+		if (!histogram) return undefined;
+		const points = protobufFields(histogram).filter(
+			field => field.number === 1 && field.wireType === 2 && field.bytes,
+		);
+		let count = 0;
+		let sum = 0;
+		for (const point of points) {
+			const pointFields = protobufFields(point.bytes!);
+			const countBytes = pointFields.find(field => field.number === 4 && field.wireType === 1)?.bytes;
+			const sumBytes = pointFields.find(field => field.number === 5 && field.wireType === 1)?.bytes;
+			if (countBytes) {
+				const view = new DataView(countBytes.buffer, countBytes.byteOffset, countBytes.byteLength);
+				count += view.getUint32(0, true) + view.getUint32(4, true) * 2 ** 32;
+			}
+			if (sumBytes) {
+				sum += new DataView(sumBytes.buffer, sumBytes.byteOffset, sumBytes.byteLength).getFloat64(0, true);
+			}
+		}
+		return { points: points.length, count, sum };
+	}
+	for (const field of fields) {
+		if (field.wireType !== 2 || !field.bytes) continue;
+		try {
+			const observation = histogramObservationForMetric(field.bytes, metricName);
+			if (observation) return observation;
+		} catch {
+			// Scalar string/bytes field, not a nested protobuf message.
+		}
+	}
+	return undefined;
+}
+
+function assertIndividualToolDurations(metricName: string): void {
+	const observations = metricPayloads
+		.map(payload => histogramObservationForMetric(payload, metricName))
+		.filter((value): value is { points: number; count: number; sum: number } => value !== undefined);
+	if (!observations.some(value => value.points === 1 && value.count === 2 && value.sum === 100)) {
+		throw new Error(
+			`${metricName} expected two individual observations summing to 100ms: ${JSON.stringify(observations)}`,
+		);
 	}
 }
 
@@ -170,16 +230,16 @@ const summary: AgentRunSummary = {
 	...emptyAgentRunSummary(),
 	chats: { total: 1, byStopReason: { end_turn: 1 }, totalLatencyMs: 1500 },
 	tools: {
-		total: 1,
-		ok: 1,
+		total: 2,
+		ok: 2,
 		error: 0,
 		skipped: 0,
 		blocked: 0,
 		timeout: 0,
 		aborted: 0,
-		totalLatencyMs: 42,
+		totalLatencyMs: 100,
 		byName: {
-			read: { total: 1, ok: 1, error: 0, skipped: 0, blocked: 0, timeout: 0, aborted: 0, totalLatencyMs: 42 },
+			read: { total: 2, ok: 2, error: 0, skipped: 0, blocked: 0, timeout: 0, aborted: 0, totalLatencyMs: 100 },
 		},
 	},
 	stepCount: 1,
@@ -192,6 +252,9 @@ const coverage: AgentRunCoverage = {
 	modelsUsed: ["claude-haiku-4-5"],
 	providersUsed: ["anthropic"],
 };
+config.onToolUsage?.({ toolName: "read", status: "ok", durationMs: 42, errorType: undefined });
+config.onToolUsage?.({ toolName: "read", status: "ok", durationMs: 58, errorType: undefined });
+config.onToolUsage?.({ toolName: "read", status: "skipped", durationMs: 999, errorType: "tool_skipped" });
 config.onRunEnd?.(summary, coverage);
 
 await flushTelemetryExport();
@@ -200,7 +263,7 @@ await Bun.sleep(700);
 await flushTelemetryExport();
 assertSingleMetricPoint("pi.omp.agent.chat.calls");
 assertSingleMetricPoint("pi.omp.agent.tool.calls");
-assertSingleMetricPoint("pi.omp.agent.tool.duration");
+assertIndividualToolDurations("pi.omp.agent.tool.duration");
 await server.stop(true);
 
 const ok = seen.has("logs") && seen.has("metrics");
