@@ -97,7 +97,7 @@ import {
 	withTimeout,
 } from "@oh-my-pi/pi-utils";
 import { type AdvisorConfig, loadAdvisorTranscriptCosts } from "../advisor";
-import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
+import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager, getAsyncJobDurationMs } from "../async";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
@@ -2054,22 +2054,17 @@ export class AgentSession {
 		const manager = this.#asyncJobManager;
 		if (!manager) return null;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
-		const running = manager.getRunningJobs(ownerFilter).map(job => ({
+		const now = Date.now();
+		const snapshot = (job: AsyncJob) => ({
 			id: job.id,
 			type: job.type,
 			status: job.status,
 			label: job.label,
-			startTime: job.startTime,
 			agentId: job.agentId,
-		}));
-		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(job => ({
-			id: job.id,
-			type: job.type,
-			status: job.status,
-			label: job.label,
-			startTime: job.startTime,
-			agentId: job.agentId,
-		}));
+			durationMs: getAsyncJobDurationMs(job, now),
+		});
+		const running = manager.getRunningJobs(ownerFilter).map(snapshot);
+		const recent = manager.getRecentJobs(options?.recentLimit ?? 5, ownerFilter).map(snapshot);
 		const delivery = manager.getDeliveryState(ownerFilter);
 		return { running, recent, delivery };
 	}
@@ -2176,7 +2171,7 @@ export class AgentSession {
 		if (this.#isDisposed) return;
 		if (epoch !== this.#asyncDeliveryEpoch) return;
 		if (manager.isDeliverySuppressed(jobId)) return;
-		const durationMs = job ? Math.max(0, Date.now() - job.startTime) : undefined;
+		const durationMs = job ? getAsyncJobDurationMs(job) : undefined;
 		await this.yieldQueue.enqueueWithReceipt<AsyncResultEntry>("async-result", {
 			jobId,
 			result: formatted,

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the metadata-only `onToolUsage` telemetry hook for monotonic per-call tool duration observations without retaining tool arguments or results.
+
 ## [18.1.10] - 2026-09-04
 
 ### Fixed

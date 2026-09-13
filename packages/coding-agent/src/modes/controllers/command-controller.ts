@@ -585,7 +585,6 @@ export class CommandController {
 			return;
 		}
 
-		const now = Date.now();
 		const lineWidth = Math.max(24, (this.ctx.ui.terminal.columns ?? 100) - 24);
 		let info = `${theme.bold("Background Jobs")}\n\n`;
 		info += `${theme.fg("dim", "Running:")} ${snapshot.running.length}\n`;
@@ -599,7 +598,7 @@ export class CommandController {
 		if (snapshot.running.length > 0) {
 			info += `\n${theme.bold("Running Jobs")}\n`;
 			for (const job of snapshot.running) {
-				info += `${renderJobLine(job, now)}\n`;
+				info += `${renderJobLine(job)}\n`;
 				info += `  ${theme.fg("dim", truncateJobLabel(job.label, lineWidth))}\n`;
 			}
 		}
@@ -607,7 +606,7 @@ export class CommandController {
 		if (snapshot.recent.length > 0) {
 			info += `\n${theme.bold("Recent Jobs")}\n`;
 			for (const job of snapshot.recent) {
-				info += `${renderJobLine(job, now)}\n`;
+				info += `${renderJobLine(job)}\n`;
 				info += `  ${theme.fg("dim", truncateJobLabel(job.label, lineWidth))}\n`;
 			}
 		}
@@ -1700,10 +1699,9 @@ export class CommandController {
 	}
 }
 
-function renderJobLine(job: AsyncJobSnapshotItem, now: number): string {
-	const duration = formatDuration(Math.max(0, now - job.startTime));
+function renderJobLine(job: AsyncJobSnapshotItem): string {
 	const status = formatJobStatus(job.status);
-	return `${theme.fg("dim", job.id)} ${theme.fg("dim", `[${job.type}]`)} ${status} ${theme.fg("dim", `(${duration})`)}`;
+	return `${theme.fg("dim", job.id)} ${theme.fg("dim", `[${job.type}]`)} ${status} ${theme.fg("dim", `(${formatDuration(job.durationMs)})`)}`;
 }
 
 function formatJobStatus(status: AsyncJobSnapshotItem["status"]): string {

@@ -271,19 +271,18 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				);
 				return commandConsumed();
 			}
-			const now = Date.now();
 			const lines: string[] = ["Background Jobs", `Running: ${snapshot.running.length}`];
 			if (snapshot.running.length > 0) {
 				lines.push("", "Running Jobs");
 				for (const job of snapshot.running) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(now - job.startTime)}`);
+					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(job.durationMs)}`);
 					lines.push(`    ${job.label}`);
 				}
 			}
 			if (snapshot.recent.length > 0) {
 				lines.push("", "Recent Jobs");
 				for (const job of snapshot.recent) {
-					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(now - job.startTime)}`);
+					lines.push(`  [${job.id}] ${job.type} (${job.status}) — ${formatDuration(job.durationMs)}`);
 					lines.push(`    ${job.label}`);
 				}
 			}

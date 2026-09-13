@@ -27,7 +27,7 @@ function runningJob(type: AsyncJobType, index: number): AsyncJobSnapshotItem {
 		type,
 		status: "running",
 		label: `${type} ${index}`,
-		startTime: index,
+		durationMs: index,
 		agentId: type === "task" ? id : undefined,
 	};
 }

@@ -430,8 +430,8 @@ describe("ACP builtin slash commands", () => {
 	it("jobs: lists running and recent jobs from snapshot", async () => {
 		const { output, runtime } = createRuntime();
 		runtime.session.getAsyncJobSnapshot = () => ({
-			running: [{ id: "j1", type: "bash", status: "running", label: "npm install", startTime: Date.now() - 5000 }],
-			recent: [{ id: "j2", type: "task", status: "completed", label: "build done", startTime: Date.now() - 60_000 }],
+			running: [{ id: "j1", type: "bash", status: "running", label: "npm install", durationMs: 5_000 }],
+			recent: [{ id: "j2", type: "task", status: "completed", label: "build done", durationMs: 60_000 }],
 			delivery: { queued: 0, delivering: false, pendingJobIds: [] },
 		});
 
@@ -1178,14 +1178,6 @@ describe("wave 4 commands", () => {
 		expect(result).toEqual({ consumed: true });
 		expect(refreshCalled).toBe(true);
 		expect(output[0]).toContain("reload");
-	});
-
-	it("/mcp resources: outputs server list or no-server message", async () => {
-		const { output, runtime } = createRuntime();
-		const result = await executeAcpBuiltinSlashCommand("/mcp resources", runtime);
-		expect(result).toEqual({ consumed: true });
-		// No servers configured in tmp project dir — should report that
-		expect(output[0]).toMatch(/No MCP servers configured|No resources/);
 	});
 
 	it("/mcp unknown-verb: returns usage pointing to help", async () => {

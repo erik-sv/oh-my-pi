@@ -7,7 +7,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
+import { type AsyncJob, type AsyncJobManager, type AsyncJobType, getAsyncJobDurationMs } from "../../async";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
@@ -148,9 +148,11 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 interface TrackedJobLike {
 	id: string;
 	type: AsyncJobType;
-	status: string;
+	status: AsyncJob["status"];
 	label: string;
-	startTime: number;
+	registeredAt: number;
+	startedAt?: number;
+	settledAt?: number;
 	latestDetails?: Record<string, unknown>;
 	resultText?: string;
 	errorText?: string;
@@ -189,7 +191,7 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 			type: latest.type,
 			status: latest.status as JobSnapshot["status"],
 			label: latest.label,
-			durationMs: Math.max(0, now - latest.startTime),
+			durationMs: getAsyncJobDurationMs(latest, now),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(!resultConsumed && latest.resultText ? { resultText: latest.resultText } : {}),
 			...(!resultConsumed && latest.errorText ? { errorText: latest.errorText } : {}),
