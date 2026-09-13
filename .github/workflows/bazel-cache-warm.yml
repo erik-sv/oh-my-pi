@@ -87,8 +87,10 @@ jobs:
               cache-scope: ${{ matrix.scope }}
 
    # Produces the shared bun store entry PR jobs restore. bun-install's save
-   # half only runs on non-PR events, and main CI jobs run on omp-kata (PVC
-   # store, no GitHub cache), so this is the sole hosted-runner producer.
+   # half only runs on non-PR events, so this job guarantees the entry exists
+   # even when main CI is routed to a self-hosted pool (OMP_CI_RUNNER), whose
+   # mounted PVC store bypasses the GitHub cache entirely. When main CI runs
+   # hosted it produces the same entry; a duplicate save is a no-op.
    warm_bun:
       name: Seed bun store cache
       runs-on: ubuntu-22.04

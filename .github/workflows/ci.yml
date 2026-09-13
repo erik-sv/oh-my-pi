@@ -81,6 +81,14 @@ env:
 permissions:
    contents: read
 
+# Runner routing. Non-PR jobs resolve `vars.OMP_CI_RUNNER`, a single runner
+# label (scalar `runs-on`; a runner group would need the object form), and fall
+# back to `ubuntu-22.04` when it is unset — so a repository with no self-hosted
+# capacity runs the full validation matrix instead of queueing forever against
+# a label nobody serves. PR jobs are pinned hosted and never read the variable:
+# fork PR code MUST NOT reach self-hosted runners and their mounted caches and
+# credentials. Only pushes and dispatches, which need write access, route to
+# the override.
 jobs:
    # scripts/release.ts pushes the version-bump commit and its `v*` tag
    # atomically (`git push --atomic origin refs/heads/main:refs/heads/main
@@ -94,9 +102,10 @@ jobs:
    # ref (or from a tagged main HEAD) is also treated as a release.
    release_metadata:
       name: Resolve release metadata
-      # Hosted, not omp-kata: this ~20 s git-tag probe gates the whole release
-      # chain, and queueing it behind the 4-runner kata pool adds dead minutes
-      # to the darwin critical path.
+      # Pinned hosted, and deliberately not routed through OMP_CI_RUNNER: this
+      # ~20 s git-tag probe gates the whole release chain, and queueing it
+      # behind a small self-hosted pool adds dead minutes to the darwin
+      # critical path.
       runs-on: ubuntu-22.04
       outputs:
          is-release: ${{ steps.detect.outputs.is-release }}
@@ -145,7 +154,7 @@ jobs:
 
    check:
       name: Lint, type check & web build
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
@@ -153,11 +162,11 @@ jobs:
            run: |
               cargo install --locked --version 0.20.2 cargo-deny
               # `--offline` needs every workspace crate already in the registry
-              # cache. PR runs use a fresh GitHub-hosted runner (see runs-on
-              # above), where the only prior cargo work is the cargo-deny
+              # cache. A fresh GitHub-hosted runner — every PR, and every
+              # non-PR run unless OMP_CI_RUNNER points at a pool with a warm
+              # Cargo cache — has no prior cargo work beyond the cargo-deny
               # install, so nothing populates the index for our own graph and
-              # resolution fails. Non-PR events land on omp-kata, whose Cargo
-              # cache is warm, which is why main stayed green. Fetch first.
+              # resolution fails. Fetch first; it is a no-op when warm.
               cargo fetch --locked
               cargo deny --locked --offline check licenses sources
          - name: Type check workspace
@@ -168,14 +177,17 @@ jobs:
    # Rust validation (tests, clippy, rustfmt) runs on non-PR events only.
    # Native-changing PRs are rare enough that they do not warrant PR-side
    # Rust validation or a PR-side addon build (see native_addons): Rust is
-   # validated post-merge on main (kata remote cache, warm) and again at
-   # release. A skipped required check still satisfies branch protection.
+   # validated post-merge on main and again at release. A skipped required
+   # check still satisfies branch protection.
    rust_validate:
       name: Validate Rust workspace (bazel)
       if: github.event_name != 'pull_request'
-      runs-on: omp-kata
+      runs-on: ${{ vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       steps:
          - uses: actions/checkout@v4
+         # Hosted runners hold the whole Bazel output base plus the disk cache
+         # on one small volume; no-op on a self-hosted pool with room to spare.
+         - uses: ./.github/actions/free-disk-space
          - uses: ./.github/actions/bun-install
          - id: cache
            uses: ./.github/actions/bazel-cache
@@ -208,6 +220,21 @@ jobs:
                 | xargs bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=clippy-ported --
          - name: Rustfmt
            run: bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=rustfmt //crates/...
+         # The remote-cache (self-hosted) path writes through to the cluster and
+         # reports save-needed=false, so this only fires for the hosted
+         # --disk_cache backend — and only when the restore was not an exact
+         # hit. Paths must mirror the restore list in the bazel-cache action.
+         # Saved even when validation failed: the archive is the toolchain
+         # fetches plus every action that did succeed, and throwing it away
+         # would make the retry of a cold hosted run start from zero again.
+         - name: Save bazel disk cache
+           if: ${{ !cancelled() && steps.cache.outputs.save-needed == 'true' }}
+           uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: |
+                 ~/.cache/omp-bazel-disk
+                 ~/.cache/omp-bazel-repo
+              key: ${{ steps.cache.outputs.cache-key }}
 
    # Provides the native addons every downstream TS job installs. PRs never
    # build: they fetch the latest release's Linux x64 pair from the
@@ -215,11 +242,12 @@ jobs:
    # skips its version sentinel for workspace loads, so release addons load
    # fine under a newer checkout; a PR whose TS tests depend on changed
    # native behavior fails visibly and the native side lands via main.
-   # Main (kata, cluster remote cache) builds all Linux-hosted targets with
-   # bazel. Job name says "bazel" for continuity with required checks.
+   # Main builds all Linux-hosted targets with bazel (cluster remote cache on a
+   # self-hosted pool, actions/cache --disk_cache when hosted). Job name says
+   # "bazel" for continuity with required checks.
    native_addons:
       name: Build native addons (bazel)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       steps:
          - uses: actions/checkout@v4
 
@@ -274,6 +302,11 @@ jobs:
               fi
 
          # ---- main path: bazel build of all Linux-hosted targets ----
+         # Six cross-target output trees, the LLVM/xwin/zig/rust toolchains and
+         # a --disk_cache copy of every output do not fit in a stock hosted
+         # volume; no-op on a self-hosted pool with room to spare.
+         - uses: ./.github/actions/free-disk-space
+           if: github.event_name != 'pull_request'
          - id: cache
            if: github.event_name != 'pull_request'
            uses: ./.github/actions/bazel-cache
@@ -286,13 +319,15 @@ jobs:
               if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
               # The addon cdylib links each peak at several GiB of rustc RSS;
               # the aggregate //:natives-linux-all build runs all six
-              # concurrently, which OOMs the kata pod and takes the bazel
-              # server with it (exit 37 "Server terminated abruptly", runs
-              # 30556752623 / 30557524371). Build one addon per invocation —
-              # analysis and cached actions are shared through the persistent
-              # server, so only the heavy links serialize — then assemble the
-              # aggregate as a no-op (also catches targets added to the
-              # filegroup but missing from this list).
+              # concurrently, which OOMs the runner and takes the bazel server
+              # with it (exit 37 "Server terminated abruptly", runs
+              # 30556752623 / 30557524371) — a 16 GiB hosted runner has even
+              # less headroom than the kata pod that first hit it. Build one
+              # addon per invocation — analysis and cached actions are shared
+              # through the persistent server, so only the heavy links
+              # serialize — then assemble the aggregate as a no-op (also
+              # catches targets added to the filegroup but missing from this
+              # list).
               : > "$RUNNER_TEMP/bazel-build.log"
               for target in \
                 natives-linux-arm64 \
@@ -324,10 +359,22 @@ jobs:
               path: bazel-bin/natives-*/*.node
               if-no-files-found: error
               retention-days: 1
+         # Hosted --disk_cache only: the remote-cache (self-hosted) path writes
+         # through to the cluster and reports save-needed=false. Runs after the
+         # upload so the addons downstream jobs need are published first.
+         # Paths must mirror the restore list in the bazel-cache action.
+         - name: Save bazel disk cache
+           if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.cache.outputs.save-needed == 'true' }}
+           uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+           with:
+              path: |
+                 ~/.cache/omp-bazel-disk
+                 ~/.cache/omp-bazel-repo
+              key: ${{ steps.cache.outputs.cache-key }}
 
    test_workspace:
       name: Test TS workspace fast
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 20
@@ -350,7 +397,7 @@ jobs:
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 20
@@ -368,7 +415,7 @@ jobs:
 
    test_ts_native:
       name: Test TS native/integration packages
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -386,7 +433,7 @@ jobs:
 
    test_coding_agent_ui:
       name: Test coding-agent UI/TUI (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -404,7 +451,7 @@ jobs:
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -424,7 +471,7 @@ jobs:
 
    test_coding_agent_native:
       name: Test coding-agent native/unit (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 25
@@ -442,7 +489,7 @@ jobs:
 
    test_smoke:
       name: Test CLI smoke (TS)
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       timeout-minutes: 15
@@ -458,7 +505,7 @@ jobs:
 
    install_methods:
       name: Install method smoke tests
-      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
+      runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       needs: [native_addons]
       if: ${{ !cancelled() && needs.native_addons.result == 'success' }}
       steps:
