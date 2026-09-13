@@ -158,15 +158,16 @@ jobs:
       steps:
          - uses: actions/checkout@v4
          - uses: ./.github/actions/bun-install
-         - name: Verify Rust license compliance (cargo-deny 0.20.2)
+         - uses: ./.github/actions/cargo-deny
+         - name: Verify Rust license compliance
            run: |
-              cargo install --locked --version 0.20.2 cargo-deny
               # `--offline` needs every workspace crate already in the registry
-              # cache. A fresh GitHub-hosted runner — every PR, and every
-              # non-PR run unless OMP_CI_RUNNER points at a pool with a warm
-              # Cargo cache — has no prior cargo work beyond the cargo-deny
-              # install, so nothing populates the index for our own graph and
-              # resolution fails. Fetch first; it is a no-op when warm.
+              # cache. A fresh GitHub-hosted runner has no registry state of
+              # its own (every PR, and every non-PR run unless OMP_CI_RUNNER
+              # points at a pool with a warm Cargo cache), and the step above
+              # builds nothing on a cargo-deny cache hit, so nothing populates
+              # the index for our own graph and resolution fails. Fetch first;
+              # it is a no-op when warm.
               cargo fetch --locked
               cargo deny --locked --offline check licenses sources
          - name: Type check workspace
@@ -174,11 +175,12 @@ jobs:
          - name: Build collab web
            run: bun run collab:web:build
 
-   # Rust validation (tests, clippy, rustfmt) runs on non-PR events only.
-   # Native-changing PRs are rare enough that they do not warrant PR-side
-   # Rust validation or a PR-side addon build (see native_addons): Rust is
-   # validated post-merge on main and again at release. A skipped required
-   # check still satisfies branch protection.
+   # Rust validation (tests, clippy, rustfmt) runs on non-PR events only. A PR
+   # does compile the crates, because native_addons builds its host addons from
+   # source, but the test/clippy/rustfmt suites stay post-merge on main and at
+   # release; a trusted dispatch runs the full suite pre-merge when a native
+   # change warrants it. A skipped required check still satisfies branch
+   # protection.
    rust_validate:
       name: Validate Rust workspace (bazel)
       if: github.event_name != 'pull_request'
@@ -189,10 +191,16 @@ jobs:
          # on one small volume; no-op on a self-hosted pool with room to spare.
          - uses: ./.github/actions/free-disk-space
          - uses: ./.github/actions/bun-install
+         # Own scope, deliberately not `linux`: actions/cache keys are
+         # immutable, and this job's host-target archive finishes long before
+         # native_addons' six cross-target build. Sharing the key let the
+         # cheaper archive claim it, made the native save a no-op, and an exact
+         # hit on the next run then suppressed any refresh — so the expensive
+         # addon outputs could never enter the cache.
          - id: cache
            uses: ./.github/actions/bazel-cache
            with:
-              scope: linux
+              scope: linux-validate
          - name: Rust tests
            # The ulimit guard runs in the step that launches the bazel server
            # (limits are per-process and the server persists across steps).
@@ -236,84 +244,48 @@ jobs:
                  ~/.cache/omp-bazel-repo
               key: ${{ steps.cache.outputs.cache-key }}
 
-   # Provides the native addons every downstream TS job installs. PRs never
-   # build: they fetch the latest release's Linux x64 pair from the
-   # @oh-my-pi/pi-natives-linux-x64 npm leaf instead. The workspace loader
-   # skips its version sentinel for workspace loads, so release addons load
-   # fine under a newer checkout; a PR whose TS tests depend on changed
-   # native behavior fails visibly and the native side lands via main.
-   # Main builds all Linux-hosted targets with bazel (cluster remote cache on a
-   # self-hosted pool, actions/cache --disk_cache when hosted). Job name says
-   # "bazel" for continuity with required checks.
+   # Provides the native addons every downstream TS job installs, always built
+   # from the sources under test. PRs build the two Linux x64 host addons the
+   # TS suites load; trusted runs build every shipped Linux/win32 target plus
+   # the aggregate.
+   #
+   # PRs used to install the latest release's addons from the
+   # @oh-my-pi/pi-natives-linux-x64 npm leaf. That fails the moment workspace
+   # code consumes a NAPI export no release carries yet (the broker's
+   # unconditional `Process.identity` call): the PR that adds the export fails,
+   # and so does every later PR, until someone publishes a release. Publishing
+   # is not an acceptable prerequisite for merging, and building from source
+   # also means a PR that changes native behavior is tested against that
+   # change instead of against last month's binary.
+   #
+   # Cache access stays asymmetric: PRs restore the `linux` scope (GitHub
+   # shares default-branch caches read-only) and never save, so PR code cannot
+   # poison what trusted runs produce.
    native_addons:
       name: Build native addons (bazel)
       runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || vars.OMP_CI_RUNNER || 'ubuntu-22.04' }}
       steps:
          - uses: actions/checkout@v4
 
-         # ---- PR path: latest release addons from npm ----
-         - name: Fetch release native addons (npm)
-           if: github.event_name == 'pull_request'
-           shell: bash
-           run: |
-              set -euo pipefail
-              tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
-              echo "Fetching $tarball"
-              curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
-              mkdir -p bazel-bin/natives-linux-x64-baseline bazel-bin/natives-linux-x64-modern
-              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" bazel-bin/natives-linux-x64-baseline/
-              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" bazel-bin/natives-linux-x64-modern/
-         # A corrupt download must fail here, not as a confusing dlopen error
-         # in every downstream test shard.
-         - name: Smoke release addons
-           if: github.event_name == 'pull_request'
-           shell: bash
-           run: |
-              set -euo pipefail
-              # NOTE: `bun -e 'require("./x.node")'` swallows dlopen failures
-              # (exit 0 on a bogus addon); a script file enforces them in
-              # both bun and node. Verified against a corrupt .node fixture.
-              cat > "$RUNNER_TEMP/smoke-addons.js" <<'EOF'
-              for (const f of process.argv.slice(2)) {
-               const m = require(f);
-               if (!m || Object.keys(m).length === 0) {
-               	console.error(`addon failed to load: ${f}`);
-               	process.exit(1);
-               }
-              }
-              EOF
-              loader=node
-              if command -v bun >/dev/null 2>&1; then loader=bun; fi
-              "$loader" "$RUNNER_TEMP/smoke-addons.js" \
-                "$PWD/bazel-bin/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node" \
-                "$PWD/bazel-bin/natives-linux-x64-modern/pi_natives.linux-x64-modern.node"
-         # Make the policy visible on the rare native-touching PR instead of
-         # leaving a reviewer to wonder which addons the tests exercised.
-         # Best-effort: a diff-API failure must not fail the job over a notice.
-         - name: Note native changes tested against release addons
-           if: github.event_name == 'pull_request'
-           shell: bash
-           env:
-              GH_TOKEN: ${{ github.token }}
-           run: |
-              if gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null \
-                 | grep -qE '^(crates/|bazel/|Cargo\.(toml|lock)|MODULE\.bazel(\.lock)?|BUILD\.bazel|\.bazelrc|\.bazelignore|\.bazelversion|rust-toolchain\.toml|rustfmt\.toml)'; then
-                echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
-              fi
-
-         # ---- main path: bazel build of all Linux-hosted targets ----
-         # Six cross-target output trees, the LLVM/xwin/zig/rust toolchains and
-         # a --disk_cache copy of every output do not fit in a stock hosted
-         # volume; no-op on a self-hosted pool with room to spare.
+         # Bazel's output base, repository cache and disk cache share one small
+         # hosted volume, and the trusted six-target build needs the most room.
+         # Hosted-only and threshold-gated, so a self-hosted pool is a no-op.
          - uses: ./.github/actions/free-disk-space
-           if: github.event_name != 'pull_request'
+         # Restored on every event, saved only by trusted runs (see the save
+         # step below). Sole producer of the `linux` scope: the six-target addon
+         # archive is the expensive one to rebuild, so no other job may claim
+         # its immutable key (rust_validate uses `linux-validate`).
          - id: cache
-           if: github.event_name != 'pull_request'
            uses: ./.github/actions/bazel-cache
            with:
               scope: linux
          - name: Build native addons once
-           if: github.event_name != 'pull_request'
+           env:
+              # Event-controlled target list, not a changed-path heuristic: a
+              # PR that merges before the next release must keep working, so
+              # the host addons are always built from the PR's own sources.
+              NATIVE_TARGETS: ${{ github.event_name == 'pull_request' && 'natives-linux-x64-baseline natives-linux-x64-modern' || 'natives-linux-arm64 natives-linux-musl-arm64 natives-linux-musl-x64-baseline natives-linux-x64-baseline natives-linux-x64-modern natives-win32-x64-baseline' }}
+              BUILD_AGGREGATE: ${{ github.event_name != 'pull_request' }}
            run: |
               set -eo pipefail
               if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
@@ -323,27 +295,25 @@ jobs:
               # with it (exit 37 "Server terminated abruptly", runs
               # 30556752623 / 30557524371) — a 16 GiB hosted runner has even
               # less headroom than the kata pod that first hit it. Build one
-              # addon per invocation — analysis and cached actions are shared
+              # addon per invocation: analysis and cached actions are shared
               # through the persistent server, so only the heavy links
-              # serialize — then assemble the aggregate as a no-op (also
-              # catches targets added to the filegroup but missing from this
-              # list).
+              # serialize.
               : > "$RUNNER_TEMP/bazel-build.log"
-              for target in \
-                natives-linux-arm64 \
-                natives-linux-musl-arm64 \
-                natives-linux-musl-x64-baseline \
-                natives-linux-x64-baseline \
-                natives-linux-x64-modern \
-                natives-win32-x64-baseline; do
+              read -r -a targets <<< "$NATIVE_TARGETS"
+              for target in "${targets[@]}"; do
                 bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "//:$target" 2>&1 | tee -a "$RUNNER_TEMP/bazel-build.log"
               done
-              bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build //:natives-linux-all 2>&1 | tee -a "$RUNNER_TEMP/bazel-build.log"
+              # Aggregate assembly is a no-op that also catches a filegroup
+              # member missing from NATIVE_TARGETS. Trusted runs only: a PR
+              # builds a deliberate subset, so the filegroup would rebuild the
+              # rest.
+              if [ "$BUILD_AGGREGATE" = "true" ]; then
+                bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build //:natives-linux-all 2>&1 | tee -a "$RUNNER_TEMP/bazel-build.log"
+              fi
          # Cache-hit visibility: a supposedly warm build that executes
          # thousands of actions is the failure mode that made CI slow — make
          # it visible in the run summary instead of discovering it weeks in.
          - name: Report bazel cache stats
-           if: github.event_name != 'pull_request'
            shell: bash
            run: |
               # Bazel runs with --color=yes (config=ci); strip ANSI before
@@ -360,7 +330,8 @@ jobs:
               if-no-files-found: error
               retention-days: 1
          # Hosted --disk_cache only: the remote-cache (self-hosted) path writes
-         # through to the cluster and reports save-needed=false. Runs after the
+         # through to the cluster and reports save-needed=false. Trusted events
+         # only, so PR code never writes the shared archive. Runs after the
          # upload so the addons downstream jobs need are published first.
          # Paths must mirror the restore list in the bazel-cache action.
          - name: Save bazel disk cache

@@ -219,10 +219,14 @@ template:
 Field by field:
 
 - **`githubConfigUrl`** - the repo (or org) the scale set serves. Jobs reach it
-  with `runs-on: omp-kata`.
+  through the `OMP_CI_RUNNER` repository variable, which carries the label.
 - **`githubConfigSecret: arc-github`** - the auth secret from [step 1](#1-github-app-and-the-arc-github-secret).
-- **`runnerScaleSetName: omp-kata`** - the runner label. This is the string that
-  goes in a workflow's `runs-on:`.
+- **`runnerScaleSetName: omp-kata`** - the runner label. Publish it to the repo
+  as `gh variable set OMP_CI_RUNNER --body omp-kata`: non-PR `runs-on:`
+  expressions in `ci.yml` resolve that variable and fall back to `ubuntu-22.04`
+  when it is unset, so a repo with no scale set still runs the full matrix. The
+  variable holds one label; a runner *group* would need the object form of
+  `runs-on`.
 - **`minRunners: 0` / `maxRunners: 8`** - **scale-to-zero**. With no queued jobs
   there are zero runner microVMs. Runner pods are **burstable**: a small
   request (3 vCPU / 10 GiB) bin-packs eight runners onto the reference host,
@@ -385,7 +389,7 @@ One endpoint, one auth model — **reads are unauthenticated, writes require the
 | Client | Endpoint | Writes |
 | --- | --- | --- |
 | omp-kata runner pods (trusted `push`/main + release) | `grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092` | yes - `ci` credentials injected via the `bazel-remote-ci` secret |
-| GitHub-hosted runners (PRs, macOS, release) | — never touch this infrastructure; they persist a local `--disk_cache`/`--repository_cache` via `actions/cache` (`.github/actions/bazel-cache`) | n/a |
+| GitHub-hosted runners (PRs, macOS, release, and every non-PR job while `OMP_CI_RUNNER` is unset) | — never touch this infrastructure; they persist a local `--disk_cache`/`--repository_cache` via `actions/cache` (`.github/actions/bazel-cache`) | n/a |
 
 - **TLS.** The server certificate is signed by a self-signed CA committed at
   [`infra/bazel-remote/ca.crt`](../bazel-remote/ca.crt); every client passes
@@ -422,14 +426,20 @@ bazel build \
 On omp-kata the credentials come from the injected pod env
 (`bazel-remote-ci` secret) and `.github/actions/bazel-cache` composes the rc
 fragment. GitHub-hosted jobs get the disk-cache branch of the same action —
-no remote endpoint, no credentials, no infrastructure knowledge. The bridge
-between the two worlds is the **disk-cache export**: main-push rust jobs
-write a bazel disk cache alongside the remote cache and save it to the
-GitHub Actions cache (once per lockfile change, `linux` scope). GitHub only
-shares caches from the default branch across pull requests, so this export
-is what keeps PR builds warm; kata jobs otherwise skip artifact downloads
-entirely (`--remote_download_toplevel`), and the xwin MSVC splat persists on
-the runner-cache PVC (`OMP_XWIN_CACHE_DIR`).
+no remote endpoint, no credentials, no infrastructure knowledge. Which branch a
+non-PR job takes follows its `runs-on`: while `OMP_CI_RUNNER` is unset those
+jobs are GitHub-hosted, so the `actions/cache`-backed `--disk_cache` plus
+`--repository_cache` is their only cache and each job saves its archive
+whenever the restore was not an exact hit. Keys carry a config hash (toolchain
+and build settings, including `Cargo.toml`/`Cargo.lock`) and a `crates/**`
+source hash. Cache keys are immutable, so the two Linux scopes have one
+producer each: `native_addons` owns `linux` (the six cross-target addon
+archive) and `rust_validate` owns `linux-validate`. The `release-darwin-*`
+scopes are produced by `bazel-cache-warm` and by the release darwin legs, which
+build the same target for the same scope. A kata job exports nothing of its
+own: its rc carries no `--disk_cache`, it writes through to bazel-remote, it
+skips artifact downloads entirely (`--remote_download_toplevel`), and it keeps
+the xwin MSVC splat on the runner-cache PVC (`OMP_XWIN_CACHE_DIR`).
 
 **(b) Cargo registry cache** - the scale-set pod template mounts only the
 immutable download cache and sparse index at
@@ -456,12 +466,12 @@ The bazel-remote store is content-addressed and **writes require the `ci`
 credentials**, so the poisoning surface is exactly the set of jobs holding those
 credentials. The primary defense is to keep untrusted code away from them:
 
-- `ci.yml` routes every pull-request job to GitHub-hosted runners
-  (`runs-on` resolves to `omp-kata` only for `push`/main, manual dispatch, and
-  release). That expression lives in the base workflow, which GitHub uses
-  verbatim for `pull_request` events, so a fork cannot override it. PR jobs
-  never talk to the cluster at all — they build against a local
-  `actions/cache`-backed disk cache — and fork code never sees
+- `ci.yml` pins every pull-request job to `ubuntu-22.04` and never reads
+  `OMP_CI_RUNNER` on that event, so only `push`, manual dispatch, and release
+  runs can reach the scale set at all. That expression lives in the base
+  workflow, which GitHub uses verbatim for `pull_request` events, so a fork
+  cannot override it. PR jobs never talk to the cluster — they build against a
+  local `actions/cache`-backed disk cache — and fork code never sees
   `bazel-remote-ci` (the cache has no publicly reachable endpoint to attack).
 - As defense in depth, set the repo's **Settings -> Actions -> Fork pull request
   workflows** policy to *Require approval for all outside collaborators* (or all
