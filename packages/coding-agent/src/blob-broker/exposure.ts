@@ -234,6 +234,7 @@ async function spawnUrlTunnel(
 	argv: string[],
 	extract: (line: string) => string | null,
 	readyPattern?: RegExp,
+	onSpawn?: (proc: Bun.Subprocess) => void,
 ): Promise<{ proc: Bun.Subprocess; baseUrl: string }> {
 	const logPath = path.join(os.tmpdir(), `omp-blob-tunnel-${Date.now().toString(36)}-${process.pid}.log`);
 	const fd = fs.openSync(logPath, "w");
@@ -243,6 +244,7 @@ async function spawnUrlTunnel(
 	} finally {
 		fs.closeSync(fd);
 	}
+	onSpawn?.(proc);
 
 	const deadline = Date.now() + READY_TIMEOUT_MS;
 	let scanned = 0;
@@ -301,6 +303,7 @@ function processExposure(kind: ExposureKind, baseUrl: string, proc: Bun.Subproce
  */
 function restartingPinggyExposure(baseUrl: string, argv: string[], initialProc: Bun.Subprocess): ActiveExposure {
 	let proc = initialProc;
+	let pendingRestart: Bun.Subprocess | undefined;
 	let stopping = false;
 	proc.unref();
 	const exited = (async () => {
@@ -308,7 +311,11 @@ function restartingPinggyExposure(baseUrl: string, argv: string[], initialProc: 
 			await proc.exited;
 			if (stopping) return;
 			try {
-				const restarted = await spawnUrlTunnel(argv, parsePinggyUrl);
+				const restarted = await spawnUrlTunnel(argv, parsePinggyUrl, undefined, spawned => {
+					pendingRestart = spawned;
+					if (stopping) killTunnelProcess(spawned);
+				});
+				pendingRestart = undefined;
 				if (stopping) {
 					killTunnelProcess(restarted.proc);
 					await restarted.proc.exited;
@@ -317,6 +324,8 @@ function restartingPinggyExposure(baseUrl: string, argv: string[], initialProc: 
 				proc = restarted.proc;
 				proc.unref();
 			} catch {
+				pendingRestart = undefined;
+				if (stopping) return;
 				logger.warn("blob-broker: authenticated Pinggy tunnel failed to reconnect");
 				return;
 			}
@@ -328,7 +337,7 @@ function restartingPinggyExposure(baseUrl: string, argv: string[], initialProc: 
 		exited,
 		stop: () => {
 			stopping = true;
-			killTunnelProcess(proc);
+			killTunnelProcess(pendingRestart ?? proc);
 		},
 	};
 }
