@@ -111,16 +111,17 @@ beforeAll(() => {
 			`printf 'run\\n' >> "$OMP_FAKE_TUNNEL_RUNS"\n` +
 			`trap 'printf "SIGINT\\n" >> "$OMP_FAKE_TUNNEL_SIGNALS"; exit 0' INT\n` +
 			`trap 'printf "SIGTERM\\n" >> "$OMP_FAKE_TUNNEL_SIGNALS"; exit 0' TERM\n` +
+			`if [ -z "$OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT" ] || [ ! -e "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
+			`  if [ -n "$OMP_FAKE_TUNNEL_OUTPUT" ]; then printf '%s\\n' "$OMP_FAKE_TUNNEL_OUTPUT"; fi\n` +
+			`fi\n` +
 			`if [ -n "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
 			`  if [ ! -e "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
-			`    if [ -n "$OMP_FAKE_TUNNEL_OUTPUT" ]; then printf '%s\\n' "$OMP_FAKE_TUNNEL_OUTPUT"; fi\n` +
 			`    printf 'first\\n' > "$OMP_FAKE_TUNNEL_RESTART_MARKER"\n` +
 			`    exit 23\n` +
 			`  fi\n` +
 			`  printf 'restarted\\n' >> "$OMP_FAKE_TUNNEL_RESTART_MARKER"\n` +
 			`  if [ -n "$OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT" ]; then while :; do /bin/sleep 1; done; fi\n` +
 			`fi\n` +
-			`if [ -n "$OMP_FAKE_TUNNEL_OUTPUT" ]; then printf '%s\\n' "$OMP_FAKE_TUNNEL_OUTPUT"; fi\n` +
 			`if [ -n "$OMP_FAKE_TUNNEL_EXIT_CODE" ]; then exit "$OMP_FAKE_TUNNEL_EXIT_CODE"; fi\n` +
 			`while :; do /bin/sleep 1; done\n`,
 	);
@@ -238,10 +239,9 @@ describe("startExposure tunnel adapters", () => {
 		expect(fs.readFileSync(invocation.runsFile, "utf8")).toBe("run\n");
 	});
 
-	it("owns an authenticated Pinggy reconnect before it reports the stable URL", async () => {
+	it("uses a configured stable Pinggy base with authenticated SSH", async () => {
 		const invocation = prepareFake("Tunnel established at https://different-random.a.pinggy.link", {
 			restartOnce: true,
-			restartWithoutOutput: true,
 		});
 		const active = await startExposure(
 			exposure("pinggy", {
@@ -256,6 +256,25 @@ describe("startExposure tunnel adapters", () => {
 		await waitForRestart(invocation.restartMarker!);
 		expect(fs.readFileSync(invocation.runsFile, "utf8")).toBe("run\nrun\n");
 		expect(active.baseUrl).toBe("https://stable.example.test");
+		await stopAndObserve(active, invocation);
+	});
+
+	it("stops an authenticated Pinggy reconnect while it is waiting to report its URL", async () => {
+		const invocation = prepareFake("Tunnel established at https://different-random.a.pinggy.link", {
+			restartOnce: true,
+			restartWithoutOutput: true,
+		});
+		const active = await startExposure(
+			exposure("pinggy", {
+				publicBaseUrl: "https://stable.example.test/",
+				credentials: { token: "fake-pinggy-token" },
+			}),
+			PORT,
+		);
+		activeExposures.push(active);
+		expect(active.baseUrl).toBe("https://stable.example.test");
+		await waitForRestart(invocation.restartMarker!);
+		expect(fs.readFileSync(invocation.runsFile, "utf8")).toBe("run\nrun\n");
 		await stopAndObserve(active, invocation);
 	});
 
