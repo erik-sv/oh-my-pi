@@ -2189,7 +2189,9 @@ export class WorkerCore {
 		if (this.#dialogHandler && page && !page.isClosed()) page.off("dialog", this.#dialogHandler);
 		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
-		this.#transport.send({ type: "closed" });
+		const closed = { type: "closed" } as const;
+		if (this.#transport.sendAndFlush) await this.#transport.sendAndFlush(closed);
+		else this.#transport.send(closed);
 		this.#transport.close();
 	}
 

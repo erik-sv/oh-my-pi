@@ -1,6 +1,8 @@
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 
 export type Transferable = Bun.Transferable;
+/** Hidden CLI selector used by every tab subprocess distribution. */
+export const TAB_PROCESS_WORKER_ARG = "__omp_worker_tab_process";
 
 export interface ObservationEntry {
 	id: number;
@@ -113,6 +115,13 @@ export interface RunErrorPayload {
 export type WorkerOutbound =
 	| {
 			/**
+			 * The process entry installed its inbound listener. Parent messages
+			 * sent before this acknowledgement are queued by the worker handle.
+			 */
+			type: "process-ready";
+	  }
+	| {
+			/**
 			 * Puppeteer loaded, browser connected. Sent before page acquisition so the supervisor's cold-start budget
 			 * bounds only the realm setup (cold import + connect); page creation and the first navigation run under the
 			 * ready wait.
@@ -138,6 +147,8 @@ export type WorkerOutbound =
 
 export interface Transport {
 	send(msg: WorkerOutbound | WorkerInbound, transferList?: Transferable[]): void;
+	/** Resolve once the outbound IPC frame has crossed the transport boundary. */
+	sendAndFlush?(msg: WorkerOutbound | WorkerInbound): Promise<void>;
 	onMessage(handler: (msg: WorkerOutbound | WorkerInbound) => void): () => void;
 	close(): void;
 }
