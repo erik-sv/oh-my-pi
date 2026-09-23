@@ -2,7 +2,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 
 export type Transferable = Bun.Transferable;
 /** Hidden CLI selector used by every tab subprocess distribution. */
-export const TAB_PROCESS_WORKER_ARG = "__omp_worker_tab_process";
+export { TAB_PROCESS_WORKER_ARG } from "../../cli/worker-selectors";
 
 export interface ObservationEntry {
 	id: number;
@@ -53,6 +53,16 @@ export type WorkerInitPayload =
 			emulateViewport?: boolean;
 			viewport?: { width: number; height: number; deviceScaleFactor?: number };
 			dialogs?: "accept" | "dismiss";
+			/** Hostname patterns allowed for every page request. */
+			allowedDomains?: string[];
+			/** Document-start JavaScript sources registered before navigation. */
+			initScripts?: string[];
+			/** Absolute directory enabled for completed downloads. */
+			downloadsPath?: string;
+			/** Explicit tab user agent applied during worker initialization. */
+			userAgent?: string;
+			/** Ignore invalid HTTPS certificates for this page. */
+			ignoreHttpsErrors?: boolean;
 			url?: string;
 			waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 			timeoutMs: number;
@@ -63,6 +73,16 @@ export type WorkerInitPayload =
 			safeDir: string;
 			targetId: string;
 			dialogs?: "accept" | "dismiss";
+			/** Hostname patterns allowed for every page request. */
+			allowedDomains?: string[];
+			/** Document-start JavaScript sources registered before navigation. */
+			initScripts?: string[];
+			/** Absolute directory enabled for completed downloads. */
+			downloadsPath?: string;
+			/** Explicit tab user agent applied during worker initialization. */
+			userAgent?: string;
+			/** Ignore invalid HTTPS certificates for this page. */
+			ignoreHttpsErrors?: boolean;
 			url?: string;
 			waitUntil?: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 			timeoutMs: number;
@@ -72,6 +92,8 @@ export type WorkerInitPayload =
 			 * previously force-killed the tab). Never set for first-time Electron attach.
 			 */
 			recover?: boolean;
+			/** Restore focus emulation when recycling an OMP-owned tab, never a borrowed user tab. */
+			emulateFocus?: boolean;
 			/**
 			 * Whether the worker may raise this tab before capturing a screenshot. Unset
 			 * behaves as `true`; the supervisor clears it for browsers we did not launch.

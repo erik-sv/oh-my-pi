@@ -6,9 +6,7 @@ import {
 	getEnvApiKey,
 	getProviderDetails,
 	type ProviderDetails,
-	resolveUsedFraction,
 	type DisabledCredentialSummary,
-	type UsageLimit,
 	type UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { Loader, Markdown, Spacer, Text, visibleWidth } from "@oh-my-pi/pi-tui";
@@ -30,17 +28,19 @@ import {
 	summarizeMentalModel,
 } from "../../hindsight";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memory-backend";
-import { BashExecutionComponent, bashPtyViewport } from "../../modes/components/bash-execution";
-import { BorderedLoader } from "../../modes/components/bordered-loader";
-import { DynamicBorder } from "../../modes/components/dynamic-border";
-import { EvalExecutionComponent } from "../../modes/components/eval-execution";
-import { MoveOverlay, type MoveOverlayResult } from "../../modes/components/move-overlay";
-import { TranscriptBlock } from "../../modes/components/transcript-container";
-import { getMarkdownTheme, getSymbolTheme, theme } from "../../modes/theme/theme";
+import { BashExecutionComponent, bashPtyViewport } from "@oh-my-pi/pi-tui/chat/bash-execution";
+import { BorderedLoader } from "@oh-my-pi/pi-tui/overlays/bordered-loader";
+import { DynamicBorder } from "@oh-my-pi/pi-tui/chrome/dynamic-border";
+import { EvalExecutionComponent } from "@oh-my-pi/pi-tui/chat/eval-execution";
+import { MoveOverlay, type MoveOverlayResult } from "@oh-my-pi/pi-tui/overlays/move-overlay";
+import { moveDirectorySource } from "../move-directory-source";
+import { TranscriptBlock } from "@oh-my-pi/pi-tui/chrome/transcript-container";
+import { getMarkdownTheme, getSymbolTheme, theme, type Theme } from "@oh-my-pi/pi-tui/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import { computeContextBreakdown, renderContextUsage } from "../../modes/utils/context-usage";
-import { buildHotkeysMarkdown } from "../../modes/utils/hotkeys-markdown";
-import { buildToolsMarkdown } from "../../modes/utils/tools-markdown";
+import { renderContextUsage } from "@oh-my-pi/pi-tui/status-line/context-usage";
+import { computeSessionContextBreakdown } from "../../session/context-usage-runtime";
+import { buildHotkeysMarkdown } from "@oh-my-pi/pi-tui/hotkeys-markdown";
+import { buildToolsMarkdown } from "@oh-my-pi/pi-tui/prompt/tools-markdown";
 import type { AsyncJobSnapshotItem } from "../../session/agent-session";
 import type { AuthStorage, OAuthAccountIdentity } from "../../session/auth-storage";
 import type { CompactMode } from "../../session/compact-modes";
@@ -53,11 +53,12 @@ import {
 	type SessionWorktree,
 } from "../../session/session-worktree";
 import { formatShakeSummary, type ShakeMode, type ShakeResult } from "../../session/shake-types";
-import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
 import { formatUsageBreakdown, type UsageStyler } from "../../cli/usage-cli";
+import { limitMatchesActiveAccount } from "../../slash-commands/helpers/active-oauth-account";
+import { formatCompactQuota } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { outputMeta } from "../../tools/output-meta";
 import { resolveToCwd, stripOuterDoubleQuotes } from "../../tools/path-utils";
-import { replaceTabs } from "../../tools/render-utils";
+import { replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import {
 	getChangelogPath,
 	parseChangelog,
@@ -67,6 +68,7 @@ import {
 import { copyToClipboard } from "../../utils/clipboard";
 import { openPath } from "../../utils/open";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import { collapseSharedUsageReports } from "@oh-my-pi/pi-tui/overlays/usage-display";
 import { collectStoredUsageAccounts } from "../../usage-accounts";
 
 function formatCreditValue(value: number): string {
@@ -504,11 +506,12 @@ export class CommandController {
 					info += `${theme.fg("dim", "Model:")} ${a.model.provider}/${a.model.id}\n`;
 				}
 				if (a.model && usageReports) {
+					const identity = resolveActiveAdvisorAccount(a.model.provider, a.sessionId);
 					const quota = formatCompactQuota(
 						a.model.provider,
-						usageReports,
+						collapseSharedUsageReports(usageReports),
 						nowMs,
-						resolveActiveAdvisorAccount(a.model.provider, a.sessionId),
+						(report, limit) => !identity || limitMatchesActiveAccount(report, limit, identity),
 					);
 					if (quota) info += `${theme.fg("dim", quota)}\n`;
 				}
@@ -546,11 +549,12 @@ export class CommandController {
 			info += `${theme.fg("dim", "Model:")} ${model.provider}/${model.id}\n`;
 		}
 		if (model && usageReports) {
+			const identity = resolveActiveAdvisorAccount(model.provider, stats.advisors[0]?.sessionId);
 			const quota = formatCompactQuota(
 				model.provider,
-				usageReports,
+				collapseSharedUsageReports(usageReports),
 				nowMs,
-				resolveActiveAdvisorAccount(model.provider, stats.advisors[0]?.sessionId),
+				(report, limit) => !identity || limitMatchesActiveAccount(report, limit, identity),
 			);
 			if (quota) {
 				info += `\n${theme.bold("Quota")}\n`;
@@ -702,7 +706,7 @@ export class CommandController {
 	}
 
 	handleContextCommand(): void {
-		const breakdown = computeContextBreakdown(this.ctx.session, { snapcompactSavings: true });
+		const breakdown = computeSessionContextBreakdown(this.ctx.session, { snapcompactSavings: true });
 		if (breakdown.contextWindow <= 0) {
 			this.ctx.showWarning("Context usage is unavailable: no model is selected for this session.");
 			return;
@@ -1132,12 +1136,12 @@ export class CommandController {
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
 	}
 
-	async handleDropCommand(): Promise<void> {
+	async handleDeleteCommand(): Promise<void> {
 		if (!this.ctx.sessionManager.getSessionFile()) {
-			this.ctx.showError("Nothing to drop (in-memory session)");
+			this.ctx.showError("Nothing to delete (in-memory session)");
 			return;
 		}
-		await this.#runNewSessionFlow({ drop: true }, "Session dropped");
+		await this.#runNewSessionFlow({ drop: true }, "Session deleted");
 	}
 
 	async handleForkCommand(): Promise<void> {
@@ -1188,7 +1192,8 @@ export class CommandController {
 		// No argument in TUI mode: open the path autocomplete overlay.
 		if (!input) {
 			const result = await this.ctx.showHookCustom<MoveOverlayResult | undefined>(
-				(_tui, _theme, _keybindings, done) => new MoveOverlay(this.ctx.sessionManager.getCwd(), done),
+				(_tui, _theme, _keybindings, done) =>
+					new MoveOverlay(this.ctx.sessionManager.getCwd(), done, moveDirectorySource),
 				{ overlay: true },
 			);
 			if (!result) return; // cancelled
@@ -1224,19 +1229,24 @@ export class CommandController {
 				this.ctx.showError(`Cannot create "${path.basename(resolvedPath)}": parent directory does not exist`);
 				return;
 			}
-			const confirmed = await this.ctx.showHookConfirm(
-				"Create directory?",
-				`"${path.basename(resolvedPath)}" does not exist. Create it?`,
-			);
-			if (!confirmed) return;
-			try {
-				await fs.mkdir(resolvedPath, { recursive: true });
-			} catch (err) {
-				this.ctx.showError(`Failed to create directory: ${err instanceof Error ? err.message : String(err)}`);
-				return;
-			}
 		}
-		if (await this.#relocateSession(resolvedPath)) {
+		const moved = await this.#withSessionMove(async () => {
+			if (!isDirectory) {
+				const confirmed = await this.ctx.showHookConfirm(
+					"Create directory?",
+					`"${path.basename(resolvedPath)}" does not exist. Create it?`,
+				);
+				if (!confirmed) return false;
+				try {
+					await fs.mkdir(resolvedPath, { recursive: true });
+				} catch (err) {
+					this.ctx.showError(`Failed to create directory: ${err instanceof Error ? err.message : String(err)}`);
+					return false;
+				}
+			}
+			return this.#relocateSession(resolvedPath);
+		});
+		if (moved) {
 			this.ctx.present([
 				new Spacer(1),
 				new Text(`${theme.fg("accent", `${theme.status.success} Moved to ${resolvedPath}`)}`, 1, 1),
@@ -1254,32 +1264,36 @@ export class CommandController {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before creating a worktree.");
 			return;
 		}
-		const branchName = branch?.trim() || defaultSessionWorktreeBranch();
-		const cwd = this.ctx.sessionManager.getCwd();
-		this.ctx.statusContainer.disposeChildren();
-		const loader = new Loader(
-			this.ctx.ui,
-			spinner => theme.fg("accent", spinner),
-			text => theme.fg("muted", text),
-			`Creating worktree on ${branchName}…`,
-			getSymbolTheme().spinnerFrames,
-		);
-		this.ctx.statusContainer.addChild(loader);
-		this.ctx.ui.requestRender();
-		let worktree: SessionWorktree;
-		try {
-			worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName);
-		} catch (err) {
-			this.ctx.showError(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
-			return;
-		} finally {
-			loader.stop();
+		await this.#withSessionMove(async () => {
+			const branchName = branch?.trim() || defaultSessionWorktreeBranch();
+			const cwd = this.ctx.sessionManager.getCwd();
 			this.ctx.statusContainer.disposeChildren();
-		}
-		if (worktree.cloneError) {
-			logger.warn("worktree clone fell back to plain checkout", { path: worktree.path, error: worktree.cloneError });
-		}
-		if (await this.#relocateSession(worktree.path)) {
+			const loader = new Loader(
+				this.ctx.ui,
+				spinner => theme.fg("accent", spinner),
+				text => theme.fg("muted", text),
+				`Creating worktree on ${branchName}…`,
+				getSymbolTheme().spinnerFrames,
+			);
+			this.ctx.statusContainer.addChild(loader);
+			this.ctx.ui.requestRender();
+			let worktree: SessionWorktree;
+			try {
+				worktree = await createSessionWorktree(cwd, this.ctx.settings, branchName);
+			} catch (err) {
+				this.ctx.showError(`Worktree creation failed: ${err instanceof Error ? err.message : String(err)}`);
+				return false;
+			} finally {
+				loader.stop();
+				this.ctx.statusContainer.disposeChildren();
+			}
+			if (worktree.cloneError) {
+				logger.warn("worktree clone fell back to plain checkout", {
+					path: worktree.path,
+					error: worktree.cloneError,
+				});
+			}
+			if (!(await this.#relocateSession(worktree.path))) return false;
 			const cleanup = await cleanSourceCheckoutIfConfigured(cwd, this.ctx.settings);
 			if (cleanup.errorMessage !== undefined) {
 				this.ctx.showWarning(`Worktree created, but cleaning source checkout failed: ${cleanup.errorMessage}`);
@@ -1292,20 +1306,25 @@ export class CommandController {
 					1,
 				),
 			]);
-		}
+			return true;
+		});
 	}
 
-	/**
-	 * Move the session and process cwd to an existing directory, rolling back
-	 * on failure. Returns true when the session now lives at `resolvedPath`.
-	 */
-	async #relocateSession(resolvedPath: string): Promise<boolean> {
+	/** Save source settings before acquiring the gate for a complete relocation operation. */
+	async #withSessionMove(operation: () => Promise<boolean>): Promise<boolean> {
 		try {
 			await this.ctx.settings.flush();
 		} catch (err) {
 			this.ctx.showError(`Failed to save pending settings: ${err instanceof Error ? err.message : String(err)}`);
 			return false;
 		}
+
+		return this.ctx.withBtwSessionMove(operation);
+	}
+
+	/** Relocate only while #withSessionMove holds the BTW gate; false means no successful move. */
+	async #relocateSession(resolvedPath: string): Promise<boolean> {
+		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return false;
 
 		const previousState = this.ctx.sessionManager.captureState();
 		try {
@@ -1333,15 +1352,30 @@ export class CommandController {
 	}
 
 	async handleRenameCommand(title: string): Promise<void> {
+		const session = this.ctx.session;
+		const sessionManager = this.ctx.sessionManager;
+		const sessionId = sessionManager.getSessionId();
+		const signal = session.titleGenerationSignal;
+		let titleRevision = sessionManager.titleRevision;
+		const isCurrent = () =>
+			this.ctx.session === session &&
+			this.ctx.sessionManager === sessionManager &&
+			!signal.aborted &&
+			sessionManager.getSessionId() === sessionId &&
+			sessionManager.titleRevision === titleRevision;
 		try {
-			const stored = await this.ctx.sessionManager.setSessionName(title, "user");
+			const persistence = sessionManager.setSessionName(title, "user");
+			titleRevision = sessionManager.titleRevision;
+			const stored = await persistence;
+			if (!isCurrent()) return;
 			if (!stored) {
 				this.ctx.showError("Session name cannot be empty.");
 				return;
 			}
-			const name = this.ctx.sessionManager.getSessionName()!;
+			const name = sessionManager.getSessionName()!;
 			this.ctx.showStatus(`Session renamed to "${name}".`);
 		} catch (err) {
+			if (!isCurrent()) return;
 			this.ctx.showError(`Rename failed: ${err instanceof Error ? err.message : String(err)}`);
 		}
 	}
@@ -1354,6 +1388,20 @@ export class CommandController {
 			return;
 		}
 
+		if (shouldPersistCwd) {
+			await this.#withSessionMove(() => this.#executeBashCommand(command, excludeFromContext, isDeferred, true));
+		} else {
+			await this.#executeBashCommand(command, excludeFromContext, isDeferred, false);
+		}
+	}
+
+	/** Returns whether shell execution committed a cwd relocation, not whether the shell command succeeded. */
+	async #executeBashCommand(
+		command: string,
+		excludeFromContext: boolean,
+		isDeferred: boolean,
+		shouldPersistCwd: boolean,
+	): Promise<boolean> {
 		this.ctx.bashComponent = new BashExecutionComponent(command, this.ctx.ui, excludeFromContext);
 
 		if (isDeferred) {
@@ -1388,12 +1436,13 @@ export class CommandController {
 				this.ctx.bashComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
 					truncation: meta?.truncation,
+					artifactError: meta?.artifactError,
 					images: result.images,
 					showImages: this.ctx.settings.get("terminal.showImages"),
 				});
 			}
 			try {
-				if (shouldPersistCwd) await this.#applyBashResultCwd(result);
+				if (shouldPersistCwd) return await this.#applyBashResultCwd(result);
 			} catch (error) {
 				this.ctx.showError(
 					`Bash command completed, but OMP failed to update its working directory: ${
@@ -1406,37 +1455,19 @@ export class CommandController {
 				this.ctx.bashComponent.setComplete(undefined, false);
 			}
 			this.ctx.showError(`Bash command failed: ${error instanceof Error ? error.message : "Unknown error"}`);
+		} finally {
+			this.ctx.bashComponent = undefined;
+			this.ctx.ui.requestRender();
 		}
-
-		this.ctx.bashComponent = undefined;
-		this.ctx.ui.requestRender();
+		return false;
 	}
 
-	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
-		const previousState = this.ctx.sessionManager.captureState();
-		await this.ctx.sessionManager.moveTo(resolvedPath);
-		let applied = false;
-		try {
-			applied = await this.ctx.applyCwdChange(resolvedPath);
-		} catch (error) {
-			await this.#restoreAfterMoveFailure(previousState, error);
-			return;
-		}
-		if (!applied) {
-			await this.#restoreAfterMoveFailure(previousState);
-			return;
-		}
-
-		this.ctx.updateEditorBorderColor();
-		await this.ctx.reloadTodos();
-	}
-
-	async #applyBashResultCwd(result: BashResult): Promise<void> {
-		if (result.cancelled || result.exitCode !== 0 || !result.workingDir) return;
-		if (!path.isAbsolute(result.workingDir)) return;
+	async #applyBashResultCwd(result: BashResult): Promise<boolean> {
+		if (result.cancelled || result.exitCode !== 0 || !result.workingDir) return false;
+		if (!path.isAbsolute(result.workingDir)) return false;
 
 		const resolvedPath = path.resolve(result.workingDir);
-		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return;
+		if (resolvedPath === path.resolve(this.ctx.sessionManager.getCwd())) return false;
 
 		let isDirectory = false;
 		try {
@@ -1444,9 +1475,9 @@ export class CommandController {
 		} catch {
 			isDirectory = false;
 		}
-		if (!isDirectory) return;
+		if (!isDirectory) return false;
 
-		await this.#moveInteractiveCwd(resolvedPath);
+		return this.#relocateSession(resolvedPath);
 	}
 
 	async handlePythonCommand(code: string, excludeFromContext = false): Promise<void> {
@@ -1477,6 +1508,7 @@ export class CommandController {
 				this.ctx.pythonComponent.setComplete(result.exitCode, result.cancelled, {
 					output: result.output,
 					truncation: meta?.truncation,
+					artifactError: meta?.artifactError,
 				});
 			}
 		} catch (error) {
@@ -1509,9 +1541,16 @@ export class CommandController {
 		// `customInstructions` channel of the `session_before_compact` extension
 		// hook — extensions treat that field as user focus and would otherwise
 		// bias the summary toward the plan boilerplate (issue #4359). Ride it
-		// through as a CompactOptions field instead.
+		// through as a CompactOptions field instead. That caller also dispatches
+		// the execution turn itself, so the compaction must not resume the
+		// plan-approval turn it aborted.
 		if (internalGuidance) {
-			return this.executeCompaction({ internalGuidance, ...(mode ? { mode } : {}) }, false, beforeFlush, mode);
+			return this.executeCompaction(
+				{ internalGuidance, suppressContinuation: true, ...(mode ? { mode } : {}) },
+				false,
+				beforeFlush,
+				mode,
+			);
 		}
 		return this.executeCompaction(customInstructions, false, beforeFlush, mode);
 	}
@@ -1625,6 +1664,10 @@ export class CommandController {
 			this.ctx.showWarning("Wait for the current response to finish or abort it before handing off.");
 			return;
 		}
+		if (this.ctx.session.isCompacting) {
+			this.ctx.showWarning("Wait for context compaction to finish or cancel it before handing off.");
+			return;
+		}
 
 		const entries = this.ctx.sessionManager.getEntries();
 		const messageCount = entries.filter(e => e.type === "message").length;
@@ -1692,10 +1735,33 @@ export class CommandController {
 				this.ctx.showError(`Handoff failed: ${message}`);
 			}
 		} finally {
-			handoffLoader.stop();
-			this.ctx.statusContainer.disposeChildren();
+			this.#finishHandoffUi(handoffLoader);
 		}
 		this.ctx.ui.requestRender(true, { clearScrollback: true });
+	}
+
+	#finishHandoffUi(handoffLoader: Loader): void {
+		handoffLoader.stop();
+		// A retry/compaction event may replace the handoff overlay while transcript
+		// replay yields. Preserve it only while it still owns the status row; a
+		// reference to a loader disposed earlier must not retain the handoff overlay.
+		const maintenanceLoader = this.ctx.autoCompactionLoader ?? this.ctx.retryLoader;
+		if (maintenanceLoader && this.ctx.statusContainer.children.includes(maintenanceLoader)) return;
+		this.ctx.statusContainer.disposeChildren();
+		// `disposeChildren()` disposed any working loader mounted by a delayed
+		// `agent_start` during transcript replay, which stops its animation timer.
+		// Drop the now-frozen reference so the reconciler below never reattaches it
+		// (`ensureLoadingAnimation()` only re-adds an existing instance, never
+		// restarts it).
+		if (this.ctx.loadingAnimation) {
+			this.ctx.loadingAnimation.stop();
+			this.ctx.loadingAnimation = undefined;
+		}
+		if (this.ctx.session.isStreaming) {
+			// A new turn won the race with handoff cleanup; mount a fresh, running
+			// loader for it now that the stale reference is cleared.
+			this.ctx.ensureLoadingAnimation();
+		}
 	}
 }
 
@@ -1741,85 +1807,13 @@ function resolveProviderAuthMode(authStorage: AuthStorage, provider: string): st
 	return "unknown";
 }
 
-export function renderProviderSection(details: ProviderDetails, uiTheme: Pick<typeof theme, "fg">): string {
+export function renderProviderSection(details: ProviderDetails, uiTheme: Pick<Theme, "fg">): string {
 	const lines: string[] = [];
 	lines.push(`${uiTheme.fg("dim", "Name:")} ${details.provider}`);
 	for (const field of details.fields) {
 		lines.push(`${uiTheme.fg("dim", `${field.label}:`)} ${field.value}`);
 	}
 	return `${lines.join("\n")}\n`;
-}
-
-function resolveResetRange(limits: UsageLimit[], nowMs: number): string | null {
-	const windows = limits
-		.map(limit => limit.window)
-		.filter(
-			(window): window is NonNullable<UsageLimit["window"]> =>
-				window?.resetsAt !== undefined && Number.isFinite(window.resetsAt) && window.resetsAt > nowMs,
-		);
-	if (windows.length === 0) return null;
-	// Use the shared verb when every contributing window agrees (e.g. all "tick");
-	// mixed or absent labels fall back to the generic "resets".
-	const labels = new Set(windows.map(window => window.resetLabel ?? "resets"));
-	const verb = labels.size === 1 ? [...labels][0]! : "resets";
-	const offsets = windows.map(window => window.resetsAt! - nowMs);
-	const minReset = Math.min(...offsets);
-	const maxReset = Math.max(...offsets);
-	if (maxReset - minReset > 60_000) {
-		return `${verb} in ${formatDuration(minReset)}–${formatDuration(maxReset)}`;
-	}
-	return `${verb} in ${formatDuration(minReset)}`;
-}
-/**
- * Compact one-line quota summary for a single advisor's provider.
- * Returns `null` when the provider has no usage data.
- * When `activeAccount` is provided, only limits matching that credential
- * are shown (mirrors `renderUsageReports`'s account-stickiness filtering).
- * Example output: `Quota: 7d window · 67% used · resets in 3.2d`
- */
-export function formatCompactQuota(
-	provider: string,
-	reports: UsageReport[],
-	nowMs: number,
-	activeAccount?: OAuthAccountIdentity,
-): string | null {
-	const providerReports = reports.filter(r => r.provider === provider);
-	if (providerReports.length === 0) return null;
-	// Group limits by window id so we show BOTH the 5-hour and 7-day windows
-	// (or any other distinct windows the provider exposes). Within each window,
-	// pick the highest used fraction across accounts — that's the most pressing.
-	const byWindow = new Map<string, { limit: UsageLimit; fraction: number }>();
-	for (const report of providerReports) {
-		for (const limit of report.limits) {
-			// Skip limits that belong to a different credential than the one
-			// the advisor is actually using, so we don't alarm the user with
-			// an exhausted account that isn't theirs.
-			if (activeAccount && !limitMatchesActiveAccount(report, limit, activeAccount)) continue;
-			const fraction = resolveUsedFraction(limit);
-			if (fraction === undefined) continue;
-			const key = limit.window?.id ?? limit.scope.windowId ?? "—";
-			const existing = byWindow.get(key);
-			if (!existing || fraction > existing.fraction) byWindow.set(key, { limit, fraction });
-		}
-	}
-	if (byWindow.size === 0) return null;
-	// Sort windows by urgency (highest fraction first) so the most pressing
-	// quota is always the first thing the user sees.
-	const entries = [...byWindow.values()].sort((a, b) => b.fraction - a.fraction);
-	const lines: string[] = [];
-	for (const { limit, fraction } of entries) {
-		const pct = Math.round(fraction * 100);
-		const windowLabel = limit.window?.label ?? limit.scope.windowId ?? "—";
-		// Include the limit label (account/tier) when it carries identity beyond
-		// the window name, so the user can tell which credential's quota is shown.
-		const identity = limit.label.trim();
-		const header = identity && identity !== windowLabel ? `${windowLabel} (${identity})` : windowLabel;
-		const parts = [`${header}: ${pct}% used`];
-		const reset = resolveResetRange([limit], nowMs);
-		if (reset) parts.push(reset);
-		lines.push(parts.join(" · "));
-	}
-	return `Quota: ${lines.join(" │ ")}`;
 }
 
 /**
@@ -1831,7 +1825,7 @@ export function formatCompactQuota(
  */
 export function renderUsageReports(
 	reports: UsageReport[],
-	uiTheme: typeof theme,
+	uiTheme: Theme,
 	nowMs: number,
 	_availableWidth: number,
 	resolveActiveAccount?: (provider: string) => OAuthAccountIdentity | undefined,

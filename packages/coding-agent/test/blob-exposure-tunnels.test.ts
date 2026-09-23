@@ -36,25 +36,50 @@ function exposure(kind: ExposureConfig["kind"], overrides: Partial<ExposureConfi
 	} as ExposureConfig;
 }
 
+function shellLiteral(value: string): string {
+	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
 function prepareFake(
 	output: string,
 	options: { exitCode?: number; restartOnce?: boolean; restartWithoutOutput?: boolean } = {},
 ): FakeInvocation {
 	const suffix = String(invocationSequence++);
-	const argsFile = path.join(fakeBinDir, `args-${suffix}.json`);
-	const runsFile = path.join(fakeBinDir, `runs-${suffix}.txt`);
-	const signalsFile = path.join(fakeBinDir, `signals-${suffix}.txt`);
-	process.env.OMP_FAKE_TUNNEL_ARGS = argsFile;
-	process.env.OMP_FAKE_TUNNEL_RUNS = runsFile;
-	process.env.OMP_FAKE_TUNNEL_SIGNALS = signalsFile;
-	process.env.OMP_FAKE_TUNNEL_OUTPUT = output;
-	if (options.exitCode === undefined) delete process.env.OMP_FAKE_TUNNEL_EXIT_CODE;
-	else process.env.OMP_FAKE_TUNNEL_EXIT_CODE = String(options.exitCode);
-	const restartMarker = options.restartOnce ? path.join(fakeBinDir, `restart-${suffix}.txt`) : undefined;
-	if (restartMarker === undefined) delete process.env.OMP_FAKE_TUNNEL_RESTART_MARKER;
-	else process.env.OMP_FAKE_TUNNEL_RESTART_MARKER = restartMarker;
-	if (options.restartWithoutOutput) process.env.OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT = "1";
-	else delete process.env.OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT;
+	const invocationDir = path.join(fakeBinDir, suffix);
+	fs.mkdirSync(invocationDir);
+	const argsFile = path.join(invocationDir, "args.txt");
+	const runsFile = path.join(invocationDir, "runs.txt");
+	const signalsFile = path.join(invocationDir, "signals.txt");
+	const restartMarker = options.restartOnce ? path.join(invocationDir, "restart.txt") : undefined;
+	const target = path.join(invocationDir, "fake-tunnel");
+	fs.writeFileSync(
+		target,
+		`#!/bin/sh\n` +
+			`: > ${shellLiteral(argsFile)}\n` +
+			`for arg do printf '%s\\n' "$arg" >> ${shellLiteral(argsFile)}; done\n` +
+			`printf 'run\\n' >> ${shellLiteral(runsFile)}\n` +
+			`trap 'printf "SIGINT\\n" >> ${shellLiteral(signalsFile)}; exit 0' INT\n` +
+			`trap 'printf "SIGTERM\\n" >> ${shellLiteral(signalsFile)}; exit 0' TERM\n` +
+			// `restartWithoutOutput` keeps the reconnect silent: the restarted run
+			// never reports a URL, so a stop lands while the exposure is still
+			// waiting for one.
+			(restartMarker && options.restartWithoutOutput
+				? `if [ ! -e ${shellLiteral(restartMarker)} ]; then printf '%s\\n' ${shellLiteral(output)}; fi\n`
+				: `printf '%s\\n' ${shellLiteral(output)}\n`) +
+			(restartMarker
+				? `if [ ! -e ${shellLiteral(restartMarker)} ]; then\n` +
+					`  printf 'first\\n' > ${shellLiteral(restartMarker)}\n` +
+					`  exit 23\n` +
+					`fi\n` +
+					`printf 'restarted\\n' >> ${shellLiteral(restartMarker)}\n`
+				: "") +
+			(options.exitCode === undefined ? `while :; do /bin/sleep 1; done\n` : `exit ${options.exitCode}\n`),
+	);
+	fs.chmodSync(target, 0o755);
+	for (const name of ["ssh", "devtunnel", "zrok", "bore", "cloudflared"]) {
+		fs.symlinkSync(target, path.join(invocationDir, name));
+	}
+	process.env.PATH = invocationDir;
 	return { argsFile, runsFile, signalsFile, restartMarker };
 }
 
@@ -102,34 +127,6 @@ async function stopAndObserve(exposure: ActiveExposure, invocation: FakeInvocati
 
 beforeAll(() => {
 	fakeBinDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-blob-tunnels-"));
-	const target = path.join(fakeBinDir, "fake-tunnel");
-	fs.writeFileSync(
-		target,
-		`#!/bin/sh\n` +
-			`: > "$OMP_FAKE_TUNNEL_ARGS"\n` +
-			`for arg do printf '%s\\n' "$arg" >> "$OMP_FAKE_TUNNEL_ARGS"; done\n` +
-			`printf 'run\\n' >> "$OMP_FAKE_TUNNEL_RUNS"\n` +
-			`trap 'printf "SIGINT\\n" >> "$OMP_FAKE_TUNNEL_SIGNALS"; exit 0' INT\n` +
-			`trap 'printf "SIGTERM\\n" >> "$OMP_FAKE_TUNNEL_SIGNALS"; exit 0' TERM\n` +
-			`if [ -z "$OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT" ] || [ ! -e "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
-			`  if [ -n "$OMP_FAKE_TUNNEL_OUTPUT" ]; then printf '%s\\n' "$OMP_FAKE_TUNNEL_OUTPUT"; fi\n` +
-			`fi\n` +
-			`if [ -n "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
-			`  if [ ! -e "$OMP_FAKE_TUNNEL_RESTART_MARKER" ]; then\n` +
-			`    printf 'first\\n' > "$OMP_FAKE_TUNNEL_RESTART_MARKER"\n` +
-			`    exit 23\n` +
-			`  fi\n` +
-			`  printf 'restarted\\n' >> "$OMP_FAKE_TUNNEL_RESTART_MARKER"\n` +
-			`  if [ -n "$OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT" ]; then while :; do /bin/sleep 1; done; fi\n` +
-			`fi\n` +
-			`if [ -n "$OMP_FAKE_TUNNEL_EXIT_CODE" ]; then exit "$OMP_FAKE_TUNNEL_EXIT_CODE"; fi\n` +
-			`while :; do /bin/sleep 1; done\n`,
-	);
-	fs.chmodSync(target, 0o755);
-	for (const name of ["ssh", "devtunnel", "zrok", "bore", "cloudflared"]) {
-		fs.symlinkSync(target, path.join(fakeBinDir, name));
-	}
-	process.env.PATH = fakeBinDir;
 });
 
 afterAll(async () => {
@@ -137,13 +134,7 @@ afterAll(async () => {
 	await Promise.all(activeExposures.map(active => active.exited));
 	if (originalPath === undefined) delete process.env.PATH;
 	else process.env.PATH = originalPath;
-	delete process.env.OMP_FAKE_TUNNEL_ARGS;
-	delete process.env.OMP_FAKE_TUNNEL_RUNS;
-	delete process.env.OMP_FAKE_TUNNEL_SIGNALS;
-	delete process.env.OMP_FAKE_TUNNEL_OUTPUT;
-	delete process.env.OMP_FAKE_TUNNEL_EXIT_CODE;
-	delete process.env.OMP_FAKE_TUNNEL_RESTART_MARKER;
-	delete process.env.OMP_FAKE_TUNNEL_RESTART_WITHOUT_OUTPUT;
+
 	fs.rmSync(fakeBinDir, { recursive: true, force: true });
 });
 

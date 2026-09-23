@@ -24,6 +24,7 @@
  */
 
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { type } from "@oh-my-pi/omptype";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import {
@@ -443,6 +444,9 @@ describe("browser tab-supervisor: worker generations", () => {
 			getSessionFile: () => null,
 			getSessionId: () => "session-containment",
 			getToolByName: () => ({
+				name: "read",
+				description: "Waits for the browser worker to cancel its host tool call.",
+				parameters: type({}),
 				execute: async (_id: string, _args: unknown, signal?: AbortSignal) => {
 					signal?.addEventListener("abort", () => toolCancelled.resolve(String(signal.reason)), { once: true });
 					toolStarted.resolve();

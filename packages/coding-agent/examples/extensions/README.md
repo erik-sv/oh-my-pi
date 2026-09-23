@@ -43,7 +43,7 @@ cp permission-gate.ts ~/.omp/agent/extensions/
 | `qna.ts`         | Extracts questions from last response into editor via `ctx.ui.setEditorText()` |
 | `status-line.ts` | Shows turn progress in footer via `ctx.ui.setStatus()` with themed colors      |
 | `thinking-note.ts` | Adds display-only supplemental UI below assistant thinking blocks              |
-| `snake.ts`       | Snake game with custom UI, keyboard handling, and session persistence          |
+| `snake.ts`         | Snake game with custom UI, keyboard handling, and session persistence          |
 
 ### Git Integration
 
@@ -110,6 +110,7 @@ export default function (pi: ExtensionAPI) {
 	});
 }
 ```
+
 ## Key Patterns
 
 **Use `z.enum` for discriminated string tool args:**

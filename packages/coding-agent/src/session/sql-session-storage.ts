@@ -7,6 +7,7 @@ import {
 	type SessionStorageBackend,
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
+import { SessionWriteConflictError } from "./session-storage";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -17,23 +18,24 @@ import type { SessionTitleUpdate } from "./session-title-slot";
 export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
 
 /**
- * Minimal subset of the `Bun.SQL` instance surface used by
- * {@link SqlSessionStorage}. Bun's SQL client exposes a tagged-template API too,
+ * SQL executor shared by the pooled client and its transaction-scoped handle.
+ * Bun's SQL client exposes a tagged-template API too,
  * but this implementation intentionally uses `unsafe(query, values)` because
  * the table identifier is validated and then inlined while values remain bound
  * parameters.
  */
-interface SqlSessionStorageTransactionClient {
-	unsafe(query: string, values?: unknown[]): Promise<unknown[]>;
+export interface SqlSessionStorageTransaction {
+	unsafe(query: string, values?: unknown[]): Promise<SqlSessionStorageResult>;
 }
 
 interface SqlSessionStorageReservedClient extends SqlSessionStorageClient {
 	release(): void;
 }
 
-export interface SqlSessionStorageClient extends SqlSessionStorageTransactionClient {
+/** Bun.SQL-compatible client whose transactions make session mutations atomic. */
+export interface SqlSessionStorageClient extends SqlSessionStorageTransaction {
 	/** Run the callback on one connection inside a database transaction. */
-	begin<T>(callback: (transaction: SqlSessionStorageTransactionClient) => Promise<T>): Promise<T>;
+	begin<T>(callback: (transaction: SqlSessionStorageTransaction) => Promise<T>): Promise<T>;
 	/**
 	 * `Bun.SQL` exposes the parsed connection options here. We only consult
 	 * `adapter` to pick the dialect; the field is typed as
@@ -44,6 +46,11 @@ export interface SqlSessionStorageClient extends SqlSessionStorageTransactionCli
 	end?(): Promise<void>;
 	/** Reserve one physical connection for connection-scoped MySQL advisory locks. */
 	reserve?(): Promise<SqlSessionStorageReservedClient>;
+}
+
+/** Array result returned by `Bun.SQL`, including MySQL mutation metadata. */
+export interface SqlSessionStorageResult extends Array<unknown> {
+	affectedRows?: number;
 }
 
 export interface SqlSessionStorageOptions {
@@ -87,6 +94,13 @@ interface DialectQueries {
 	loadIndex: string;
 	readChunks: string;
 	readFirstChunks: string;
+	/**
+	 * Per-chunk UTF-8 byte lengths for one path. Row count distinguishes a
+	 * missing path (no rows) from a zero-byte body (one empty chunk), and the
+	 * dialects that support row locks take them so a rewrite precondition
+	 * cannot be raced by a concurrent append.
+	 */
+	chunkSizes: string;
 	maxSeq: string;
 }
 
@@ -118,6 +132,10 @@ interface LegacyRow {
 
 interface SeqRow {
 	seq: number | bigint | string | null;
+}
+
+interface ChunkSizeRow {
+	byte_len: number | bigint | string | null;
 }
 
 const DEFAULT_TABLE = "omp_session_chunks";
@@ -219,6 +237,7 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 				`FROM ${table} GROUP BY path`,
 			readChunks: `SELECT content FROM ${table} WHERE path = ? ORDER BY seq`,
 			readFirstChunks: `SELECT seq, content, title, title_source, title_updated_at FROM ${table} WHERE path = ? ORDER BY seq LIMIT 2`,
+			chunkSizes: `SELECT ${byteLengthExpr} AS byte_len FROM ${table} WHERE path = ? FOR UPDATE`,
 			maxSeq: `SELECT MAX(seq) AS seq FROM ${table} WHERE path = ?`,
 		};
 	}
@@ -255,6 +274,9 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			`FROM ${table} GROUP BY path`,
 		readChunks: `SELECT content FROM ${table} WHERE path = ${placeholder(1)} ORDER BY seq`,
 		readFirstChunks: `SELECT seq, content, title, title_source, title_updated_at FROM ${table} WHERE path = ${placeholder(1)} ORDER BY seq LIMIT 2`,
+		chunkSizes:
+			`SELECT ${byteLengthExpr} AS byte_len FROM ${table} WHERE path = ${placeholder(1)}` +
+			(adapter === "postgres" ? " FOR UPDATE" : ""),
 		maxSeq: `SELECT MAX(seq) AS seq FROM ${table} WHERE path = ${placeholder(1)}`,
 	};
 }
@@ -485,8 +507,22 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return [bytePrefix(chunks, prefixBytes), byteSuffix(chunks, suffixBytes)];
 	}
 
-	async writeFull(path: string, content: string, mtimeMs: number, title?: SessionTitleUpdate): Promise<void> {
+	async writeFull(
+		path: string,
+		content: string,
+		mtimeMs: number,
+		title?: SessionTitleUpdate,
+		expectedSize?: number | null,
+	): Promise<void> {
 		await this.#withPathLocks([path], async transaction => {
+			// A chunked body has no single row whose size a `WHERE` clause could
+			// guard, so the precondition is re-read inside the same per-path
+			// lock/transaction that performs the rewrite: no append can land
+			// between the check and the delete+insert.
+			if (expectedSize !== undefined) {
+				const actualSize = await this.#byteLength(transaction, path);
+				if (actualSize !== expectedSize) throw new SessionWriteConflictError(path, expectedSize, actualSize);
+			}
 			await transaction.unsafe(this.#q.delete, [path]);
 			await this.#insertChunks(transaction, path, splitChunks(content), mtimeMs, 0, title);
 		});
@@ -530,6 +566,13 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async move(src: string, dst: string, mtimeMs: number): Promise<void> {
+		// A self-rename must not take the delete-then-rename path: the delete
+		// would drop the very chunks the rename is supposed to carry over.
+		if (src === dst) {
+			const rows = (await this.#client.unsafe(this.#q.readFirstChunks, [src])) as ChunkRow[];
+			if (rows.length === 0) throw enoent(src);
+			return;
+		}
 		await this.#withPathLocks([src, dst], async transaction => {
 			const source = (await transaction.unsafe(this.#q.readFirstChunks, [src])) as ChunkRow[];
 			if (source.length === 0) throw enoent(src);
@@ -538,9 +581,21 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		});
 	}
 
+	/**
+	 * Current durable UTF-8 byte length for `path`, or `null` when the path has
+	 * no rows. Summed over chunk rows because the body is stored per line.
+	 */
+	async #byteLength(client: SqlSessionStorageTransaction, path: string): Promise<number | null> {
+		const rows = (await client.unsafe(this.#q.chunkSizes, [path])) as ChunkSizeRow[];
+		if (rows.length === 0) return null;
+		let total = 0;
+		for (const row of rows) total += toNumber(row.byte_len);
+		return total;
+	}
+
 	async #withPathLocks<T>(
 		paths: readonly string[],
-		callback: (transaction: SqlSessionStorageTransactionClient) => Promise<T>,
+		callback: (transaction: SqlSessionStorageTransaction) => Promise<T>,
 	): Promise<T> {
 		if (this.#adapter !== "postgres") return this.#client.begin(callback);
 
@@ -652,7 +707,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		await client.unsafe(`DROP TABLE IF EXISTS ${backup}`);
 	}
 
-	async #tableColumns(client: SqlSessionStorageTransactionClient, table: string): Promise<Set<string>> {
+	async #tableColumns(client: SqlSessionStorageTransaction, table: string): Promise<Set<string>> {
 		let rows: Array<{ name?: string; column_name?: string }>;
 		if (this.#adapter === "sqlite") {
 			rows = (await client.unsafe(`PRAGMA table_info(${table})`)) as typeof rows;
@@ -671,7 +726,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 	}
 
 	async #readLegacyRows(
-		client: SqlSessionStorageTransactionClient,
+		client: SqlSessionStorageTransaction,
 		table: string,
 		columns: ReadonlySet<string>,
 		lock: boolean,
@@ -683,11 +738,7 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		)) as LegacyRow[];
 	}
 
-	async #insertLegacyRow(
-		client: SqlSessionStorageTransactionClient,
-		row: LegacyRow,
-		table = this.#table,
-	): Promise<void> {
+	async #insertLegacyRow(client: SqlSessionStorageTransaction, row: LegacyRow, table = this.#table): Promise<void> {
 		const title = row.title_updated_at
 			? {
 					title: row.title ?? undefined,
@@ -702,14 +753,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		return rows.map(row => row.content);
 	}
 
-	async #nextSeq(client: SqlSessionStorageTransactionClient, path: string): Promise<number> {
+	async #nextSeq(client: SqlSessionStorageTransaction, path: string): Promise<number> {
 		const rows = (await client.unsafe(this.#q.maxSeq, [path])) as SeqRow[];
 		const max = rows[0]?.seq;
 		return max === null || max === undefined ? 0 : toNumber(max) + 1;
 	}
 
 	async #insertChunks(
-		client: SqlSessionStorageTransactionClient,
+		client: SqlSessionStorageTransaction,
 		path: string,
 		chunks: readonly string[],
 		mtimeMs: number,

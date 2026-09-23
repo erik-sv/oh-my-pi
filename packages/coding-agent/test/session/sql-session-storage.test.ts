@@ -391,6 +391,61 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	it("rolls back destination deletion when the source move fails", async () => {
+		const { client, storage } = await createSqlite();
+		const source = "/sessions/p/source.jsonl";
+		const destination = "/sessions/p/destination.jsonl";
+		try {
+			await storage.writeText(source, "source\n");
+			await storage.writeText(destination, "destination\n");
+			await client.unsafe(
+				`CREATE TRIGGER reject_session_move BEFORE UPDATE OF path ON omp_session_chunks ` +
+					`WHEN OLD.path = '${source}' BEGIN SELECT RAISE(ABORT, 'move rejected'); END`,
+			);
+			await expect(storage.rename(source, destination)).rejects.toThrow("move rejected");
+			expect(await storage.readText(source)).toBe("source\n");
+			expect(await storage.readText(destination)).toBe("destination\n");
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("preserves a same-path rename but rejects an externally deleted source", async () => {
+		const { client, storage } = await createSqlite();
+		const sessionPath = "/sessions/p/same.jsonl";
+		try {
+			await storage.writeText(sessionPath, "keep\n");
+			await storage.rename(sessionPath, sessionPath);
+			expect(await storage.readText(sessionPath)).toBe("keep\n");
+			await client.unsafe("DELETE FROM omp_session_chunks WHERE path = ?", [sessionPath]);
+			await expect(storage.rename(sessionPath, sessionPath)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("accepts an identical rewrite and rejects stale chunk-byte preconditions", async () => {
+		const { client, storage } = await createSqlite();
+		const sessionPath = "/sessions/p/rewrite.jsonl";
+		const body = "first\nsecond\n";
+		try {
+			await storage.writeText(sessionPath, body);
+			const expectedSize = Buffer.byteLength(body);
+			storage.writeTextSync(sessionPath, body, { expectedSize });
+			await storage.drain();
+			expect(await storage.readText(sessionPath)).toBe(body);
+
+			const peer = await SqlSessionStorage.create({ client, createTable: false });
+			const writer = peer.openWriter(sessionPath);
+			await writer.append("peer\n");
+			await writer.close();
+			await expect(storage.writeTextAtomic(sessionPath, "replacement\n", { expectedSize })).rejects.toThrow();
+			expect(await storage.readText(sessionPath)).toBe(`${body}peer\n`);
+		} finally {
+			await client.end();
+		}
+	});
+
 	it("does not delete the destination when the indexed source disappeared out of band", async () => {
 		const { client, storage } = await createSqlite();
 		const source = "/sessions/p/stale-source.jsonl";

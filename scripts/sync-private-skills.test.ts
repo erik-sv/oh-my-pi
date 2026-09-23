@@ -61,12 +61,12 @@ function createPrivateRemote(root: string, name: string) {
 		[
 			"#!/bin/sh",
 			"set -eu",
-			': "${SYNC_STUB_LOG:?SYNC_STUB_LOG is required}"',
+			`: "\${SYNC_STUB_LOG:?SYNC_STUB_LOG is required}"`,
 			'printf \'%s\\n\' "$@" > "$SYNC_STUB_LOG"',
-			'if [ -n "${SYNC_STUB_ERROR_TEXT:-}" ]; then',
+			`if [ -n "\${SYNC_STUB_ERROR_TEXT:-}" ]; then`,
 			"  printf '%s\\n' \"$SYNC_STUB_ERROR_TEXT\" >&2",
 			"fi",
-			'exit "${SYNC_STUB_EXIT:-0}"',
+			`exit "\${SYNC_STUB_EXIT:-0}"`,
 			"",
 		].join("\n"),
 	);

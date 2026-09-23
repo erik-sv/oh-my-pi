@@ -6,15 +6,11 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/hub";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
-import {
-	DAEMON_IDLE_GRACE_ENV,
-	DAEMON_PROJECT_DIR_ENV,
-	DAEMON_RUNTIME_DIR_ENV,
-	type DaemonSnapshot,
-} from "../../src/launch/protocol";
+import { DAEMON_IDLE_GRACE_ENV, DAEMON_PROJECT_DIR_ENV, DAEMON_RUNTIME_DIR_ENV } from "../../src/launch/protocol";
 
 function restoreEnv(name: string, value: string | undefined): void {
 	if (value === undefined) delete process.env[name];
