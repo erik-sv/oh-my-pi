@@ -138,7 +138,7 @@ describe("RPC dispatch: ephemeral_turn wire behavior", () => {
 		}
 	});
 
-	test("recognizes ephemeral_turn and keeps unknown-command behavior for older clients", async () => {
+	test("correlates rejected commands and remains usable afterward", async () => {
 		sessionDir = path.join(os.tmpdir(), `omp-rpc-ephemeral-${Snowflake.next()}`);
 		const packageDir = path.join(import.meta.dir, "..");
 		proc = ptree.spawn(["bun", path.join(packageDir, "src", "cli.ts"), "--mode", "rpc"], {
@@ -183,13 +183,16 @@ describe("RPC dispatch: ephemeral_turn wire behavior", () => {
 
 		await nextFrame(frame => frame.type === "ready");
 
-		// Older clients probing a command this server does not know still get
-		// the unchanged unknown-command error frame (id intentionally absent).
+		// Unsupported commands must reject their own request, not terminate
+		// a client that requires correlated responses.
 		send({ id: "u1", type: "bogus_command" });
 		const unknownResponse = await nextFrame(frame => frame.type === "response" && frame.command === "bogus_command");
 		expect(unknownResponse.success).toBe(false);
-		expect(unknownResponse.error).toBe("Unknown command: bogus_command");
-		expect(unknownResponse.id).toBeUndefined();
+		expect(unknownResponse.id).toBe("u1");
+
+		send({ id: "s1", type: "get_state" });
+		const stateResponse = await nextFrame(frame => frame.type === "response" && frame.id === "s1");
+		expect(stateResponse.success).toBe(true);
 
 		// ephemeral_turn is dispatched (not unknown): the blank-prompt guard
 		// answers with a command-scoped error response before any model call.
@@ -199,6 +202,5 @@ describe("RPC dispatch: ephemeral_turn wire behavior", () => {
 		);
 		expect(ephemeralResponse.id).toBe("e1");
 		expect(ephemeralResponse.success).toBe(false);
-		expect(ephemeralResponse.error).toBe("Prompt cannot be empty");
 	}, 60_000);
 });

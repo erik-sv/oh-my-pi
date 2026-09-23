@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Unsupported RPC commands now preserve the request ID in error replies, so strict clients reject the request without terminating the session.
 - Disabled subscriptions remain visible when another organization or member still has an active credential.
 - Browser timeouts and tab shutdown no longer post cancellation to a terminated or replacement worker, crash the parent, or evict a tab reopened during cleanup.
 - Browser worker failures now release worker/page resources and log bounded run, worker-generation, and timeout context without recording evaluated code.
