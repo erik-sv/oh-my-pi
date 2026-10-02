@@ -16,6 +16,12 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 
 const timestamp = new Date(0).toISOString();
 const header = { type: "session", version: 3, id: "session", timestamp, cwd: "/tmp" };
+// Resolution validates persisted image bytes, so image fixtures carry a real PNG header.
+const MINIMAL_PNG = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	"base64",
+);
+const pngBytes = (tag: string): Buffer => Buffer.concat([MINIMAL_PNG, Buffer.from(tag)]);
 
 function imageEntry(id: string, parentId: string | null, data: string): SessionMessageEntry {
 	return {
@@ -31,8 +37,8 @@ describe("read-only session blob hydration", () => {
 	it("reads only retained branch images after a clear boundary and preserves URL and missing-blob fallbacks", async () => {
 		using dir = TempDir.createSync("@read-only-hydration-");
 		const store = new BlobStore(path.join(dir.path(), "blobs"));
-		const discarded = await store.put(Buffer.from("discarded"));
-		const retained = await store.put(Buffer.from("retained"));
+		const discarded = await store.put(pngBytes("discarded"));
+		const retained = await store.put(pngBytes("retained"));
 		const dataUrl = "data:image/png;base64,aW1hZ2U=";
 		const url = await store.put(Buffer.from(dataUrl));
 		const missing = `blob:sha256:${"0".repeat(64)}`;
@@ -64,10 +70,13 @@ describe("read-only session blob hydration", () => {
 			expect(reads.toSorted()).toEqual([retained.hash, url.hash, "0".repeat(64)].toSorted());
 			expect(messages).toHaveLength(2);
 			expect(messages[0]).toMatchObject({
-				content: [{ type: "image", data: Buffer.from("retained").toString("base64") }],
+				content: [{ type: "image", data: pngBytes("retained").toString("base64") }],
 				providerPayload: { items: [{ content: [{ image_url: dataUrl }] }] },
 			});
-			expect(messages[1]).toMatchObject({ content: [{ type: "image", data: missing }] });
+			// A missing blob degrades to text rather than replaying a storage reference or an empty image.
+			expect(messages[1]).toMatchObject({
+				content: [{ type: "text", text: "[image omitted: persisted image is unavailable]" }],
+			});
 		} finally {
 			readSpy.mockRestore();
 		}
@@ -188,7 +197,7 @@ describe("read-only session blob hydration", () => {
 	it("bounds simultaneous blob reads inside one large message", async () => {
 		using dir = TempDir.createSync("@message-hydration-limit-");
 		const store = new BlobStore(path.join(dir.path(), "blobs"));
-		const blob = await store.put(Buffer.from("image"));
+		const blob = await store.put(pngBytes("image"));
 		const images = Array.from({ length: 48 }, () => ({
 			type: "image" as const,
 			data: blob.ref,
@@ -217,7 +226,7 @@ describe("read-only session blob hydration", () => {
 		try {
 			await resolveBlobRefsInEntries([entry], store);
 			expect(peak).toBeLessThanOrEqual(8);
-			expect(images.map(image => image.data)).toEqual(Array(48).fill(Buffer.from("image").toString("base64")));
+			expect(images.map(image => image.data)).toEqual(Array(48).fill(pngBytes("image").toString("base64")));
 		} finally {
 			readSpy.mockRestore();
 		}

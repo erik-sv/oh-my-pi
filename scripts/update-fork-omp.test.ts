@@ -27,7 +27,7 @@ function makeFixture(fingerprint = "native-source-tree:") {
 	fs.writeFileSync(path.join(checkout, "packages", "natives", "package.json"), '{"version":"16.5.0"}\n');
 	fs.writeFileSync(path.join(checkout, "packages", "coding-agent", "package.json"), '{"version":"16.5.0"}\n');
 	const addon = path.join(nativeDir, `pi_natives.${process.platform}-${process.arch}.node`);
-	fs.writeFileSync(addon, "binary payload __piNativesV16_5_0 without the new runtime export");
+	fs.writeFileSync(addon, "binary payload PI_NATIVES_VERSION_STAMP:16.5.0\0 without the new runtime export");
 	const buildLog = path.join(dir, "build.log");
 	fs.writeFileSync(
 		path.join(nativeDir, `.source-fingerprint-${process.platform}-${process.arch}.node`),
@@ -52,7 +52,8 @@ function makeFixture(fingerprint = "native-source-tree:") {
 			'if [ "$1" = "-e" ]; then',
 			'  case "$2" in',
 			'    *process.platform*) printf "%s" "$TEST_HOST_TAG"; exit 0 ;;',
-			'    *) [ "$PI_REQUIRED_NATIVE_EXPORTS" = "__piNativesV16_5_0,snapcompactSupportedChars" ] || exit 91',
+			'    *) [ "$PI_REQUIRED_NATIVE_EXPORTS" = "__piNativesBuildVersion,snapcompactSupportedChars" ] || exit 91',
+			'       [ "$PI_NATIVE_VERSION" = "16.5.0" ] || exit 92',
 			'       [ "$TEST_EXPORTS_OK" = "1" ] || [ -f "$TEST_BUILD_LOG" ]; exit $? ;;',
 			"  esac",
 			"fi",
@@ -144,7 +145,7 @@ function createBareFork(root: string, name: string, release: string): { bare: st
 	fs.writeFileSync(path.join(work, "packages", "natives", "package.json"), '{"version":"1.2.3"}\n');
 	fs.writeFileSync(
 		path.join(work, "packages", "natives", "native", "pi_natives.test-platform-test-arch.node"),
-		"__piNativesV1_2_3\n",
+		"PI_NATIVES_VERSION_STAMP:1.2.3\0\n",
 	);
 	fs.writeFileSync(path.join(work, "packages", "coding-agent", "package.json"), '{"version":"1.2.3"}\n');
 

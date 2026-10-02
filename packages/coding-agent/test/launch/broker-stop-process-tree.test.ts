@@ -6,7 +6,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
-import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/hub";
+import type { DaemonSnapshot } from "@oh-my-pi/pi-tui/tools/daemon";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
 import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";

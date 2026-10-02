@@ -10,9 +10,14 @@ import * as snapcompact from "@oh-my-pi/snapcompact";
 
 const FRAME_COUNT = 10;
 const FRAME_RAW_BYTES = 300_000;
+// Resolution validates persisted image bytes, so frames carry a real PNG header.
+const MINIMAL_PNG = Buffer.from(
+	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+	"base64",
+);
 
 function frameData(index: number): string {
-	return Buffer.alloc(FRAME_RAW_BYTES, index + 1).toString("base64");
+	return Buffer.concat([MINIMAL_PNG, Buffer.alloc(FRAME_RAW_BYTES, index + 1)]).toString("base64");
 }
 
 function makeAssistantMessage(text: string) {

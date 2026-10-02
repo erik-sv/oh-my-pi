@@ -24,6 +24,26 @@ function fakeUsage(input: number, output: number): Usage {
 	};
 }
 
+function assistantMessage(text: string) {
+	return {
+		role: "assistant" as const,
+		provider: "anthropic",
+		model: "claude-3-7-sonnet",
+		content: [{ type: "text" as const, text }],
+		usage: fakeUsage(1, 1),
+		api: "anthropic-messages" as const,
+		stopReason: "stop" as const,
+		timestamp: Date.now(),
+	};
+}
+
+async function sqlBody(client: SQL, sessionFile: string): Promise<string> {
+	const rows = (await client.unsafe(`SELECT content FROM omp_session_chunks WHERE path = ? ORDER BY seq`, [
+		sessionFile,
+	])) as Array<{ content: string }>;
+	return rows.map(row => row.content).join("");
+}
+
 describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 	it("persists appended assistant messages into SQL and reloads via open()", async () => {
 		const client = new SQL("sqlite::memory:");
@@ -141,6 +161,71 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 
 		await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
 		expect(await secondStorage.readText(sessionFile)).toContain("durable SQL peer turn");
+		await client.end();
+	});
+
+	it("seal()+close() lands a dispose-time exit record that self-raced the deferred SQL publish", async () => {
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		const manager = SessionManager.create("/cwd", "/sessions/dispose", storage);
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		// Dispose shape: final turn persist, then exit record + flushSync with no
+		// await between them, so the second sync rewrite conflicts with the
+		// first one's still-unconfirmed SQL publish.
+		manager.appendMessage(assistantMessage("FINAL SQL MESSAGE"));
+		let exitRecordError: unknown;
+		try {
+			manager.appendCustomEntry("session_exit", { reason: "dispose" });
+			manager.flushSync();
+		} catch (err) {
+			exitRecordError = err;
+		}
+		expect(exitRecordError).toBeInstanceOf(SessionWriteConflictError);
+
+		manager.seal();
+		await manager.close();
+
+		const body = await sqlBody(client, sessionFile);
+		expect(body).toContain("FINAL SQL MESSAGE");
+		expect(body).toContain("session_exit");
+		expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(body, "utf8"));
+
+		const reloadedStorage = await SqlSessionStorage.create({ client });
+		const reopened = await SessionManager.open(sessionFile, "/sessions/dispose", reloadedStorage);
+		expect(reopened.getEntries().some(entry => entry.type === "custom" && entry.customType === "session_exit")).toBe(
+			true,
+		);
+		await reopened.close();
+		await client.end();
+	});
+
+	it("close() terminal retry never overwrites a peer's durable SQL turn after a conflict", async () => {
+		const client = new SQL("sqlite::memory:");
+		const firstStorage = await SqlSessionStorage.create({ client });
+		const first = SessionManager.create("/cwd", "/sessions/peer", firstStorage);
+		first.appendMessage(assistantMessage("original local turn"));
+		await first.flush();
+		await firstStorage.drain();
+		const sessionFile = first.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		const secondStorage = await SqlSessionStorage.create({ client });
+		const second = await SessionManager.open(sessionFile, "/sessions/peer", secondStorage);
+		second.appendMessage({ role: "user", content: "durable SQL peer turn", timestamp: Date.now() });
+		await second.close();
+		const peerBody = await sqlBody(client, sessionFile);
+
+		await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
+		// close() retries the terminal rewrite for deferred-publish backends; the
+		// SQL size precondition must reject it rather than replace the peer's body.
+		first.seal();
+		await expect(first.close()).rejects.toThrow();
+
+		expect(await sqlBody(client, sessionFile)).toBe(peerBody);
+		expect(peerBody).toContain("durable SQL peer turn");
+		expect(peerBody).toContain("original local turn");
 		await client.end();
 	});
 });

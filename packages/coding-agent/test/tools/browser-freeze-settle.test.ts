@@ -17,6 +17,7 @@
  */
 
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CmuxKind } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/rpc";
 import { CmuxSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/socket-client";
 import { acquireBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
@@ -52,7 +53,7 @@ function makeSession(cwd: string): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
-		settings: { get: () => undefined },
+		settings: Settings.isolated(),
 		getSessionFile: () => null,
 	} as unknown as ToolSession;
 }
@@ -583,16 +584,22 @@ describe("browser settle — lifecycle freeze via CDP", () => {
 			const name = "settle-terminated-worker";
 			const messages: string[] = [];
 			const worker = {
-				mode: "worker",
-				send(message: { type: string }): void {
+				mode: "process" as const,
+				id: 1,
+				alive: true,
+				// The process handle reports delivery; the supervisor treats `false`
+				// as "this generation is gone" and abandons the run.
+				send(message: { type: string }): boolean {
 					messages.push(message.type);
 					if (message.type === "abort") {
 						throw new DOMException("Worker has been terminated", "InvalidStateError");
 					}
+					return true;
 				},
 				onMessage: (): (() => void) => () => {},
 				onError: (): (() => void) => () => {},
 				terminate: async (): Promise<void> => undefined,
+				close: async (): Promise<boolean> => true,
 			};
 			const { tab } = makeStubTab({ name, worker, activateForScreenshot: false });
 			getTabsMapForTest().set(name, tab);

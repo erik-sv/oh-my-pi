@@ -8,6 +8,7 @@ import {
 	type SessionStorageIndexEntry,
 } from "./indexed-session-storage";
 import { SessionWriteConflictError } from "./session-storage";
+import { enoent } from "./session-storage-errors";
 import type { SessionTitleUpdate } from "./session-title-slot";
 
 /**
@@ -152,15 +153,6 @@ function mysqlMigrationTableName(table: string, suffix: string): string {
 	const name = `${table.slice(0, prefixLength)}_${fingerprint}${suffix}`;
 	if (!IDENT_RE.test(name)) throw new Error(`SqlSessionStorage: invalid internal migration table name ${name}`);
 	return name;
-}
-
-function enoent(p: string): NodeJS.ErrnoException {
-	const err = new Error(`ENOENT: no such file, '${p}'`) as NodeJS.ErrnoException;
-	err.code = "ENOENT";
-	err.errno = -2;
-	err.path = p;
-	err.syscall = "open";
-	return err;
 }
 
 /**

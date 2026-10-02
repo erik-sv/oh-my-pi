@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 // Browser global read inside page.evaluate callbacks; absent from bun-types.
 declare const devicePixelRatio: number;
 
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -239,7 +240,7 @@ describe("OMP-owned browser evaluation", () => {
 			const session = {
 				cwd: process.cwd(),
 				hasUI: false,
-				settings: { get: () => undefined },
+				settings: Settings.isolated(),
 				getSessionFile: () => null,
 			} as unknown as ToolSession;
 			try {
@@ -332,7 +333,7 @@ describe("OMP-owned browser input", () => {
 			const session = {
 				cwd: process.cwd(),
 				hasUI: false,
-				settings: { get: () => undefined },
+				settings: Settings.isolated(),
 				getSessionFile: () => null,
 			} as unknown as ToolSession;
 			try {

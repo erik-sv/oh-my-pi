@@ -27,6 +27,9 @@ function makeAssistantMessage(text: string) {
 
 function makeSession(overrides: {
 	isStreaming?: boolean;
+	hasAdmittedSubmission?: boolean;
+	queuedMessageCount?: number;
+	hasPendingAsyncWork?: boolean;
 	isCompacting?: boolean;
 	replyText?: string;
 	onRun?: (args: { promptText: string }) => void;
@@ -34,6 +37,9 @@ function makeSession(overrides: {
 }): RpcEphemeralTurnSession & { runCalls: number } {
 	const session = {
 		isStreaming: overrides.isStreaming ?? false,
+		hasAdmittedSubmission: overrides.hasAdmittedSubmission ?? false,
+		queuedMessageCount: overrides.queuedMessageCount ?? 0,
+		hasPendingAsyncWork: () => overrides.hasPendingAsyncWork ?? false,
 		isCompacting: overrides.isCompacting ?? false,
 		runCalls: 0,
 		async runEphemeralTurn(args: {
@@ -75,11 +81,16 @@ describe("handleRpcEphemeralTurn", () => {
 		expect(session.runCalls).toBe(1);
 	});
 
-	test("rejects while a response is streaming without invoking the primitive", async () => {
-		const session = makeSession({ isStreaming: true });
+	test.each([
+		["a response is streaming", { isStreaming: true }],
+		["a submission is admitted but not yet streaming", { hasAdmittedSubmission: true }],
+		["messages are queued", { queuedMessageCount: 1 }],
+		["background work can still wake the session", { hasPendingAsyncWork: true }],
+	])("rejects while %s without invoking the primitive", async (_label, state) => {
+		const session = makeSession(state);
 
 		await expect(handleRpcEphemeralTurn(session, { type: "ephemeral_turn", prompt: "recap please" })).rejects.toThrow(
-			"Cannot run ephemeral turn while a response is in progress",
+			"Cannot run ephemeral turn while the session has active or pending work",
 		);
 		expect(session.runCalls).toBe(0);
 	});

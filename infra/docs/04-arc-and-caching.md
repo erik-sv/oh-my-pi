@@ -259,9 +259,12 @@ Field by field:
   to create the PVC subdirectories as root before the runner starts. This avoids
   relying on kubelet's subPath auto-create permissions and does not pull another
   image.
-- **`volumeMounts`** - mounts the shared PVC only at `~/.bun/install/cache` and
-  `~/.cargo/registry`. `node_modules`, Cargo `target/`, and Cargo git checkouts
-  stay inside the throwaway VM filesystem.
+- **`volumeMounts`** - mounts the shared PVC only at `~/.bun/install/cache`,
+  `~/.cargo/registry`, and `/opt/bazel-repo-cache` (Bazel's repository cache,
+  plus the `xwin/` sysroot cache and CI's `ci-natives/` linux-x64 addon stash,
+  which `native_addons` writes content-addressed and prunes after two days).
+  `node_modules`, Cargo `target/`, and Cargo git checkouts stay inside the
+  throwaway VM filesystem.
 - **`volumes[].persistentVolumeClaim.claimName: runner-cache`** - binds those
   mounts to the `arc-runners/runner-cache` PVC. `ReadWriteOnce` is enough on this
   single-node k3s host; use a RWX-capable storage class before spreading runners
@@ -429,12 +432,12 @@ fragment. GitHub-hosted jobs get the disk-cache branch of the same action —
 no remote endpoint, no credentials, no infrastructure knowledge. Which branch a
 non-PR job takes follows its `runs-on`: while `OMP_CI_RUNNER` is unset those
 jobs are GitHub-hosted, so the `actions/cache`-backed `--disk_cache` plus
-`--repository_cache` is their only cache and each job saves its archive
-whenever the restore was not an exact hit. Keys carry a config hash (toolchain
-and build settings, including `Cargo.toml`/`Cargo.lock`) and a `crates/**`
-source hash. Cache keys are immutable, so the two Linux scopes have one
-producer each: `native_addons` owns `linux` (the six cross-target addon
-archive) and `rust_validate` owns `linux-validate`. The `release-darwin-*`
+`--repository_cache` is their only cache and each job saves its archive on
+main whenever the restore was not an exact hit. Keys carry a config hash
+(toolchain and build settings, including `Cargo.toml`/`Cargo.lock`) and a
+`crates/**` source hash. Cache keys are immutable, so each Linux scope has one
+producer: `native_addons` owns `linux-x64`, `native_addons_cross` owns `linux`
+(the cross-target addon archive) and `rust_validate` owns `linux-validate`. The `release-darwin-*`
 scopes are produced by `bazel-cache-warm` and by the release darwin legs, which
 build the same target for the same scope. A kata job exports nothing of its
 own: its rc carries no `--disk_cache`, it writes through to bazel-remote, it

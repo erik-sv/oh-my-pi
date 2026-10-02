@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { acquireTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { spawnTabWorker } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker-host";
@@ -11,7 +12,7 @@ function makeSession(): ToolSession {
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
-		settings: { get: () => undefined },
+		settings: Settings.isolated(),
 		getSessionFile: () => null,
 		getSessionId: () => "browser-process-isolation",
 	} as unknown as ToolSession;

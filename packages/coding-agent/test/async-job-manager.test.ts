@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { AsyncJobError, AsyncJobManager, getAsyncJobDurationMs } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/tools/hub/jobs";
+import { snapshotJobs } from "@oh-my-pi/pi-coding-agent/async/job-control";
+import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
@@ -393,6 +393,7 @@ describe("AsyncJobManager", () => {
 		let now = 1_000;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const session = { asyncJobManager: manager } as unknown as ToolSession;
 		const completedGate = Promise.withResolvers<void>();
 		const failedGate = Promise.withResolvers<void>();
 		const completedId = manager.register("task", "complete", async () => {
@@ -405,8 +406,8 @@ describe("AsyncJobManager", () => {
 		});
 
 		now = 1_600;
-		expect(getAsyncJobDurationMs(manager.getJob(completedId)!, now)).toBe(600);
-		expect(getAsyncJobDurationMs(manager.getJob(failedId)!, now)).toBe(600);
+		const live = [manager.getJob(completedId)!, manager.getJob(failedId)!];
+		expect(snapshotJobs(session, live).map(job => job.durationMs)).toEqual([600, 600]);
 
 		now = 1_700;
 		completedGate.resolve();
@@ -416,7 +417,7 @@ describe("AsyncJobManager", () => {
 		const failed = manager.getJob(failedId)!;
 		expect(completed.status).toBe("completed");
 		expect(failed.status).toBe("failed");
-		const session = { asyncJobManager: manager } as unknown as ToolSession;
+		expect([completed.endTime, failed.endTime]).toEqual([1_700, 1_700]);
 		expect(snapshotJobs(session, [completed, failed]).map(job => job.durationMs)).toEqual([700, 700]);
 		now = 9_000;
 		expect(snapshotJobs(session, [completed, failed]).map(job => job.durationMs)).toEqual([700, 700]);
@@ -426,14 +427,29 @@ describe("AsyncJobManager", () => {
 		let now = 10_000;
 		vi.spyOn(Date, "now").mockImplementation(() => now);
 		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
-		const queuedGate = Promise.withResolvers<void>();
+		const session = { asyncJobManager: manager } as unknown as ToolSession;
+		const neverStartedGate = Promise.withResolvers<void>();
+		const startGate = Promise.withResolvers<void>();
+		const startedGate = Promise.withResolvers<void>();
+		const neverStartedId = manager.register(
+			"task",
+			"never started",
+			async ({ markRunning }) => {
+				await neverStartedGate.promise;
+				markRunning();
+				return "cancelled before start";
+			},
+			{ queued: true },
+		);
 		const queuedId = manager.register(
 			"task",
 			"queued",
-			async ({ markRunning }) => {
-				await queuedGate.promise;
+			async ({ markRunning, signal }) => {
+				await startGate.promise;
 				markRunning();
-				return "cancelled before start";
+				startedGate.resolve();
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				return "cancelled";
 			},
 			{ queued: true },
 		);
@@ -442,21 +458,27 @@ describe("AsyncJobManager", () => {
 			return "cancelled";
 		});
 
+		// Leaving the queue restarts the clock: the 400ms parked is not run time.
 		now = 10_400;
-		expect(getAsyncJobDurationMs(manager.getJob(queuedId)!, now)).toBe(0);
-		expect(getAsyncJobDurationMs(manager.getJob(runningId)!, now)).toBe(400);
+		startGate.resolve();
+		await startedGate.promise;
+		expect(manager.getJob(queuedId)!.startTime).toBe(10_400);
+		expect(manager.getJob(runningId)!.startTime).toBe(10_000);
+
+		now = 10_900;
+		expect(manager.cancel(neverStartedId)).toBe(true);
 		expect(manager.cancel(queuedId)).toBe(true);
 		expect(manager.cancel(runningId)).toBe(true);
-		queuedGate.resolve();
+		now = 11_500;
+		neverStartedGate.resolve();
 		await manager.waitForAll();
 
-		const queued = manager.getJob(queuedId)!;
-		const running = manager.getJob(runningId)!;
-		expect(queued.startedAt).toBeUndefined();
-		const session = { asyncJobManager: manager } as unknown as ToolSession;
-		expect(snapshotJobs(session, [queued, running]).map(job => job.durationMs)).toEqual([0, 400]);
+		const jobs = [manager.getJob(neverStartedId)!, manager.getJob(queuedId)!, manager.getJob(runningId)!];
+		expect(jobs.map(job => job.status)).toEqual(["cancelled", "cancelled", "cancelled"]);
+		// A cancelled job's end is frozen at cancel time, not when its body exits.
+		expect(snapshotJobs(session, jobs).map(job => job.durationMs)).toEqual([0, 500, 900]);
 		now = 50_000;
-		expect(snapshotJobs(session, [queued, running]).map(job => job.durationMs)).toEqual([0, 400]);
+		expect(snapshotJobs(session, jobs).map(job => job.durationMs)).toEqual([0, 500, 900]);
 	});
 
 	test("bounds owner-job reap while preserving late settlement", async () => {
@@ -593,6 +615,84 @@ describe("AsyncJobManager", () => {
 		expect(manager.getJob(jobId)?.status).toBe("completed");
 		await waitForJobEviction(manager, jobId);
 		expect(manager.getJob(jobId)).toBeUndefined();
+	});
+
+	test("never recycles auto ids after settled jobs are evicted", async () => {
+		const manager = new AsyncJobManager({ retentionMs: 0, onJobComplete: async () => {} });
+		const first = manager.register("bash", "first", async () => "one");
+		const second = manager.register("bash", "second", async () => "two");
+		await manager.waitForAll();
+		expect(manager.getJob(first)).toBeUndefined();
+		expect(manager.getJob(second)).toBeUndefined();
+
+		const third = manager.register("bash", "third", async () => "three");
+		expect([first, second, third]).toEqual(["bg_1", "bg_2", "bg_3"]);
+		await manager.dispose();
+	});
+
+	test("keeps a foreground-backed job out of listings and delivery unless promoted", async () => {
+		const completions: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				completions.push(jobId);
+			},
+		});
+
+		// Released before its body settles (the foreground waiter wins the race).
+		const pending = Promise.withResolvers<string>();
+		const racing = manager.register("bash", "racing foreground", () => pending.promise, { foreground: true });
+		expect(manager.getAllJobs()).toEqual([]);
+		expect(manager.getRunningJobs()).toEqual([]);
+		manager.releaseForegroundJob(racing);
+		pending.resolve("done");
+		await manager.waitForAll();
+		expect(manager.getJob(racing)).toBeUndefined();
+
+		// Settled before promotion: stays hidden until promoted, then delivers once.
+		const promoted = manager.register("bash", "promoted", async () => "slow", { foreground: true });
+		expect(promoted).toBe(racing);
+		await manager.waitForAll();
+		expect(manager.getRecentJobs()).toEqual([]);
+		expect(manager.backgroundJob(promoted)).toBeTrue();
+		expect(manager.getAllJobs().map(job => job.id)).toEqual([promoted]);
+		await manager.drainDeliveries({ timeoutMs: 2_000 });
+		expect(completions).toEqual([promoted]);
+		await manager.dispose();
+	});
+
+	test("keeps a cancelled foreground job until its body exits, with duration frozen at cancel", async () => {
+		let now = 20_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const manager = new AsyncJobManager({ onJobComplete: async () => {} });
+		const exit = Promise.withResolvers<void>();
+		const jobId = manager.register(
+			"bash",
+			"slow teardown",
+			async ({ signal }) => {
+				await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
+				await exit.promise;
+				return "stopped";
+			},
+			{ foreground: true },
+		);
+
+		now = 20_300;
+		expect(manager.cancel(jobId)).toBe(true);
+		manager.releaseForegroundJob(jobId);
+		now = 90_000;
+		// Cancellation is terminal for metrics, but the body still runs: the row
+		// and its id stay reserved so a new job cannot collide with it.
+		const cancelled = manager.getJob(jobId);
+		expect(cancelled?.status).toBe("cancelled");
+		expect(cancelled!.endTime! - cancelled!.startTime).toBe(300);
+		const next = manager.register("bash", "next", async () => "ok");
+		expect(next).not.toBe(jobId);
+
+		exit.resolve();
+		await manager.waitForAll();
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(cancelled?.endTime).toBe(20_300);
+		await manager.dispose();
 	});
 
 	test("evicts a consumed settled row on the short grace instead of full retention", async () => {
@@ -972,6 +1072,24 @@ describe("AsyncJobManager", () => {
 		expect(defaultDeliveries).toEqual(["unowned-1"]);
 	});
 
+	test("delivers a completion that settled while a wait watched it but returned something else", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({});
+		manager.registerDeliverySink("Main", (_jobId, text) => {
+			delivered.push(text);
+		});
+		const id = manager.register("task", "EchoPeer", async () => "received=kestrel42", { ownerId: "Main" });
+		manager.watchJobs([id]);
+		await manager.getJob(id)?.promise;
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(delivered).toEqual([]);
+
+		// The wait returned a peer message instead of this job's result.
+		manager.unwatchJobs([id]);
+		await manager.drainDeliveries({ timeoutMs: 500 });
+		expect(delivered).toEqual(["received=kestrel42"]);
+	});
+
 	test("dead-letters an owned delivery when its owner has no live sink", async () => {
 		const defaultDeliveries: string[] = [];
 		const manager = new AsyncJobManager({
@@ -1019,52 +1137,5 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
-	});
-});
-
-describe("AsyncJobManager adaptive wait ladder", () => {
-	const newManager = () => new AsyncJobManager({ onJobComplete: async () => {} });
-
-	test("back-to-back waits climb the ladder and saturate at the top rung", () => {
-		const m = newManager();
-		const owner = "Main";
-		const t = 1_000;
-		const waits: number[] = [];
-		for (let i = 0; i < 6; i++) {
-			// Same timestamp every time → zero gap → always escalates.
-			waits.push(m.nextPollWaitMs(owner, t));
-			m.recordPollWaitEnd(owner, t);
-		}
-		expect(waits).toEqual([5_000, 10_000, 30_000, 60_000, 300_000, 300_000]);
-	});
-
-	test("a quiet gap of a minute resets back to the floor", () => {
-		const m = newManager();
-		const owner = "Main";
-
-		expect(m.nextPollWaitMs(owner, 0)).toBe(5_000);
-		m.recordPollWaitEnd(owner, 0);
-
-		// Just under the reset window → keeps climbing.
-		expect(m.nextPollWaitMs(owner, 59_999)).toBe(10_000);
-		m.recordPollWaitEnd(owner, 60_000);
-
-		// A full minute without waiting resets the climb to the floor.
-		expect(m.nextPollWaitMs(owner, 120_000)).toBe(5_000);
-	});
-
-	test("escalation is tracked independently per owner", () => {
-		const m = newManager();
-		const t = 1_000;
-
-		m.nextPollWaitMs("A", t);
-		m.recordPollWaitEnd("A", t);
-		m.nextPollWaitMs("A", t);
-		m.recordPollWaitEnd("A", t);
-
-		// A fresh owner starts at the floor regardless of A's escalation.
-		expect(m.nextPollWaitMs("B", t)).toBe(5_000);
-		// A keeps climbing from where it left off.
-		expect(m.nextPollWaitMs("A", t)).toBe(30_000);
 	});
 });
