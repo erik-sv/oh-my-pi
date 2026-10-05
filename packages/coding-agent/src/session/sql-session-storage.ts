@@ -22,7 +22,7 @@ export type SqlSessionStorageAdapter = "postgres" | "mysql" | "sqlite";
  * the table identifier is validated and then inlined while values remain bound
  * parameters.
  */
-interface SqlSessionStorageTransactionClient {
+export interface SqlSessionStorageTransactionClient {
 	unsafe(query: string, values?: unknown[]): Promise<unknown[]>;
 }
 

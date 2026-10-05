@@ -10,6 +10,7 @@ import type { Effort, ImageContent, Model, ToolExample } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { RestrictedTurnRecord } from "../../session/restricted-turn-storage";
 import type { FileEntry } from "../../session/session-entries";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
 import type {
@@ -19,6 +20,7 @@ import type {
 	SubagentProgressPayload,
 } from "../../task";
 import type { TodoPhase } from "../../tools/todo";
+import type { RestrictedProfileReceipt } from "./restricted-rpc-profile";
 import type { RpcMessagesPage } from "./rpc-messages";
 
 // ============================================================================
@@ -31,6 +33,8 @@ export type RpcCommand =
 
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
+	| { id?: string; type: "accept_turn"; clientTurnId: string; prompt: string; expectedPromptDigest: string }
+	| { id?: string; type: "activate_turn"; clientTurnId: string; acceptedTurnId: string }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
 	| { id?: string; type: "abort" }
@@ -119,6 +123,10 @@ export interface RpcSessionState {
 	dumpTools?: Array<{ name: string; description: string; parameters: unknown; examples?: readonly ToolExample[] }>;
 	/** Current context window usage. */
 	contextUsage?: ContextUsage;
+	/** Present only for agentdesk_restricted_rpc_v1. */
+	restrictedProfileReceipt?: RestrictedProfileReceipt;
+	/** Durable one-turn state, when acceptance has occurred. */
+	restrictedTurn?: RestrictedTurnRecord;
 }
 
 export interface RpcAvailableSlashCommand {
@@ -205,6 +213,8 @@ export type RpcResponse =
 
 	// Prompting (async - events follow)
 	| { id?: string; type: "response"; command: "prompt"; success: true; data?: { agentInvoked: boolean } }
+	| { id?: string; type: "response"; command: "accept_turn"; success: true; data: RestrictedTurnRecord }
+	| { id?: string; type: "response"; command: "activate_turn"; success: true; data: RestrictedTurnRecord }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
@@ -340,6 +350,11 @@ export type RpcResponse =
 
 	// Error response (any command can fail); `code` is an optional machine-readable reason.
 	| { id?: string; type: "response"; command: string; success: false; error: string; code?: string };
+
+export interface RpcRestrictedTerminalReceiptFrame {
+	type: "restricted_terminal_receipt";
+	receipt: RestrictedTurnRecord;
+}
 
 // ============================================================================
 // Subagent Events (stdout)

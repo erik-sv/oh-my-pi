@@ -12,6 +12,7 @@ import { isRecord, ptree, readJsonl } from "@oh-my-pi/pi-utils";
 import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
+import type { RestrictedTurnRecord } from "../../session/restricted-turn-storage";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
 import {
 	RPC_MESSAGES_PAGE_BUSY_ERROR,
@@ -32,6 +33,7 @@ import type {
 	RpcHostToolResult,
 	RpcHostToolUpdate,
 	RpcResponse,
+	RpcRestrictedTerminalReceiptFrame,
 	RpcSessionState,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
@@ -58,6 +60,8 @@ export interface RpcClientOptions {
 	provider?: string;
 	/** Model ID to use */
 	model?: string;
+	/** Versioned restricted RPC host profile. */
+	restrictedRpcHostProfile?: "agentdesk_restricted_rpc_v1";
 	/** Session directory for the agent */
 	sessionDir?: string;
 	/** Additional CLI arguments */
@@ -74,6 +78,7 @@ export type RpcEventListener = (event: AgentEvent) => void;
 export type RpcSessionEventListener = (event: AgentSessionEvent) => void;
 export type RpcSubagentLifecycleListener = (payload: RpcSubagentLifecycleFrame["payload"]) => void;
 export type RpcSubagentProgressListener = (payload: RpcSubagentProgressFrame["payload"]) => void;
+export type RpcRestrictedTerminalReceiptListener = (receipt: RestrictedTurnRecord) => void;
 export type RpcSubagentEventListener = (payload: RpcSubagentEventFrame["payload"]) => void;
 export type RpcAvailableCommandsUpdateListener = (commands: RpcAvailableSlashCommand[]) => void;
 
@@ -190,6 +195,10 @@ function isRpcAvailableCommandsUpdateFrame(value: unknown): value is RpcAvailabl
 	return value.type === "available_commands_update" && Array.isArray(value.commands);
 }
 
+function isRpcRestrictedTerminalReceiptFrame(value: unknown): value is RpcRestrictedTerminalReceiptFrame {
+	return isRecord(value) && value.type === "restricted_terminal_receipt" && isRecord(value.receipt);
+}
+
 function isRpcHostToolCallRequest(value: unknown): value is RpcHostToolCallRequest {
 	if (!isRecord(value)) return false;
 	return (
@@ -253,6 +262,7 @@ export class RpcClient {
 	#subagentProgressListeners = new Set<RpcSubagentProgressListener>();
 	#subagentEventListeners = new Set<RpcSubagentEventListener>();
 	#availableCommandsUpdateListeners = new Set<RpcAvailableCommandsUpdateListener>();
+	#restrictedTerminalReceiptListeners = new Set<RpcRestrictedTerminalReceiptListener>();
 	#pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
 	#customTools: RpcClientCustomTool[] = [];
@@ -293,6 +303,9 @@ export class RpcClient {
 		}
 		if (this.options.model) {
 			args.push("--model", this.options.model);
+		}
+		if (this.options.restrictedRpcHostProfile) {
+			args.push("--rpc-host-profile", this.options.restrictedRpcHostProfile, "--session-storage", "sql");
 		}
 		if (this.options.sessionDir) {
 			args.push("--session-dir", this.options.sessionDir);
@@ -506,6 +519,12 @@ export class RpcClient {
 		};
 	}
 
+	/** Subscribe to terminal receipts committed after transcript flush. */
+	onRestrictedTerminalReceipt(listener: RpcRestrictedTerminalReceiptListener): () => void {
+		this.#restrictedTerminalReceiptListeners.add(listener);
+		return () => this.#restrictedTerminalReceiptListeners.delete(listener);
+	}
+
 	/**
 	 * Subscribe to subagent lifecycle frames after setSubagentSubscription("progress" | "events").
 	 */
@@ -562,6 +581,22 @@ export class RpcClient {
 	 */
 	async prompt(message: string, images?: ImageContent[]): Promise<void> {
 		await this.#send({ type: "prompt", message, images });
+	}
+
+	/** Durably accept one restricted turn without invoking the agent. */
+	async acceptTurn(input: {
+		clientTurnId: string;
+		prompt: string;
+		expectedPromptDigest: string;
+	}): Promise<RestrictedTurnRecord> {
+		const response = await this.#send({ type: "accept_turn", ...input });
+		return this.#getData(response);
+	}
+
+	/** Activate one previously accepted restricted turn. */
+	async activateTurn(clientTurnId: string, acceptedTurnId: string): Promise<RestrictedTurnRecord> {
+		const response = await this.#send({ type: "activate_turn", clientTurnId, acceptedTurnId });
+		return this.#getData(response);
 	}
 
 	/**
@@ -1078,6 +1113,11 @@ export class RpcClient {
 			for (const listener of this.#availableCommandsUpdateListeners) {
 				listener(data.commands);
 			}
+			return;
+		}
+
+		if (isRpcRestrictedTerminalReceiptFrame(data)) {
+			for (const listener of this.#restrictedTerminalReceiptListeners) listener(data.receipt);
 			return;
 		}
 

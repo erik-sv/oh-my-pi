@@ -2127,6 +2127,38 @@ export class SessionManager {
 	}
 
 	/**
+	 * Build the exact user entry accepted by the restricted RPC transaction
+	 * without mutating memory or scheduling backing storage.
+	 */
+	prepareRestrictedUserEntry(prompt: string): SessionMessageEntry {
+		const timestamp = Date.now();
+		return {
+			type: "message",
+			...this.#freshEntryFields(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text: prompt }],
+				attribution: "user",
+				timestamp,
+			},
+		};
+	}
+
+	/**
+	 * Adopt an entry only after RestrictedTurnStorage committed the same JSONL
+	 * bytes with the acceptance row. This deliberately performs no file append.
+	 */
+	adoptRestrictedDurableEntry(entry: SessionMessageEntry): void {
+		if (this.#released) throw new Error("Cannot adopt a restricted entry after terminal release");
+		if (entry.parentId !== this.#index.leafId()) {
+			throw new Error("Restricted accepted entry no longer matches the active session leaf");
+		}
+		this.#entries.push(entry);
+		this.#index.insert(entry);
+		this.#notifyEntryAppended(entry);
+	}
+
+	/**
 	 * Snapshot the session for collab replication: the live header plus a deep
 	 * copy of every entry (the host mutates entries in place on rewrite paths, so
 	 * guests must not share references).

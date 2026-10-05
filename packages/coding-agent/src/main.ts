@@ -64,6 +64,7 @@ import { discoverStartupLspServers } from "./lsp/servers";
 import type { MCPManager } from "./mcp";
 import { InteractiveMode } from "./modes/interactive-mode";
 import type { PrintModeOptions } from "./modes/print-mode";
+import { type RestrictedProfileRuntime, restrictedDiscoveryOptions } from "./modes/rpc/restricted-rpc-profile";
 import { claimRpcInput } from "./modes/rpc/rpc-input";
 import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import type * as SetupWizardModule from "./modes/setup-wizard";
@@ -97,6 +98,7 @@ import {
 	persistForeignSession,
 } from "./session/foreign-session-import";
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
+import { RestrictedTurnStorage } from "./session/restricted-turn-storage";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { SessionManager } from "./session/session-manager";
 import { setDefaultSessionStorage } from "./session/session-storage";
@@ -118,6 +120,7 @@ type RunRpcMode = (
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
+	restricted?: { runtime: RestrictedProfileRuntime; turnStorage: RestrictedTurnStorage },
 ) => Promise<never>;
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
@@ -910,6 +913,55 @@ export function parseSqlSessionDbOptions(optionsJson: string): {
 	return { connectionOptions: { ...connectionOptions, max: SQL_SESSION_POOL_MAX }, createTable };
 }
 
+export function parseSqlSessionCreateTableEnv(value: string | undefined): boolean | undefined {
+	if (value === undefined) return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "true") return true;
+	if (normalized === "false") return false;
+	throw new Error("OMP_SESSION_DB_CREATE_TABLE must be exactly true or false.");
+}
+
+interface SqlStorageSetup {
+	storage: SqlSessionStorage;
+	restrictedTurnStorage?: RestrictedTurnStorage;
+	databaseReceipt?: RestrictedProfileRuntime["databaseReceipt"];
+}
+
+/** Fail closed before restricted startup can reach discovery or session restore. */
+export function validateRestrictedRpcCli(parsed: Args): void {
+	if (!parsed.rpcHostProfile) return;
+	if (parsed.mode !== "rpc") throw new Error("agentdesk_restricted_rpc_v1 requires --mode rpc.");
+	if (parsed.sessionStorage !== "sql") {
+		throw new Error("agentdesk_restricted_rpc_v1 requires --session-storage sql.");
+	}
+	if (!parsed.model) throw new Error("agentdesk_restricted_rpc_v1 requires one pinned --model.");
+	const forbidden = [
+		parsed.continue,
+		parsed.resume,
+		parsed.fork,
+		parsed.fromClaude,
+		parsed.fromCodex,
+		parsed.noSession,
+		parsed.systemPrompt,
+		parsed.appendSystemPrompt,
+		parsed.config?.length,
+		parsed.addDir?.length,
+		parsed.tools?.length,
+		parsed.extensions?.length,
+		parsed.hooks?.length,
+		parsed.trustedExtensions?.length,
+		parsed.pluginDirs?.length,
+		parsed.fileArgs.length,
+		parsed.messages.length,
+		parsed.apiKey,
+	];
+	if (forbidden.some(Boolean)) {
+		throw new Error(
+			"agentdesk_restricted_rpc_v1 forbids restore/import, prompt/config/tool/extension inputs, positional messages, and argv credentials.",
+		);
+	}
+}
+
 /**
  * When `--session-storage sql` is requested, build a SQL-backed
  * {@link SqlSessionStorage} from the connection in OMP_SESSION_DB_URL (a
@@ -924,8 +976,8 @@ export function parseSqlSessionDbOptions(optionsJson: string): {
  * silently falling back to files (which would split a deployment's transcripts
  * across two backends).
  */
-async function setupSessionStorageBackend(parsed: Args): Promise<void> {
-	if (parsed.sessionStorage !== "sql") return;
+async function setupSessionStorageBackend(parsed: Args): Promise<SqlStorageSetup | undefined> {
+	if (parsed.sessionStorage !== "sql") return undefined;
 
 	const url = $env.OMP_SESSION_DB_URL?.trim();
 	const optionsJson = $env.OMP_SESSION_DB_OPTIONS?.trim();
@@ -933,19 +985,35 @@ async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 		throw new Error("--session-storage sql requires OMP_SESSION_DB_URL or OMP_SESSION_DB_OPTIONS to be set.");
 	}
 
+	const envCreateTable = parseSqlSessionCreateTableEnv(Bun.env.OMP_SESSION_DB_CREATE_TABLE);
 	let client: SQL;
-	let createTable = true;
+	let createTable = envCreateTable ?? true;
 	if (url) {
 		client = new SQL(url, { max: SQL_SESSION_POOL_MAX });
 	} else {
 		const parsedOptions = parseSqlSessionDbOptions(optionsJson as string);
 		client = new SQL(parsedOptions.connectionOptions);
-		createTable = parsedOptions.createTable;
+		createTable = envCreateTable ?? parsedOptions.createTable;
+	}
+	if (parsed.rpcHostProfile && Bun.env.OMP_SESSION_DB_CREATE_TABLE !== "false") {
+		throw new Error(
+			"agentdesk_restricted_rpc_v1 requires OMP_SESSION_DB_CREATE_TABLE=false; absence and true are refused.",
+		);
 	}
 
+	let restrictedTurnStorage: RestrictedTurnStorage | undefined;
+	let databaseReceipt: RestrictedProfileRuntime["databaseReceipt"] | undefined;
+	if (parsed.rpcHostProfile) {
+		restrictedTurnStorage = new RestrictedTurnStorage(client);
+		databaseReceipt = await restrictedTurnStorage.validateContract();
+	}
 	const storage = await SqlSessionStorage.create({ client, createTable });
+	if (parsed.rpcHostProfile && storage.adapter !== "postgres") {
+		throw new Error("agentdesk_restricted_rpc_v1 requires PostgreSQL session storage.");
+	}
 	setDefaultSessionStorage(storage);
 	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
+	return { storage, restrictedTurnStorage, databaseReceipt };
 }
 
 /** Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager. */
@@ -1095,16 +1163,21 @@ export async function buildSessionOptions(
 	modelRegistry: ModelRegistry,
 	activeSettings: Settings,
 ): Promise<CreateAgentSessionOptions> {
+	const restrictedProfile = parsed.rpcHostProfile;
 	const options: CreateAgentSessionOptions = {
 		cwd: parsed.cwd ?? getProjectDir(),
 		autoApprove: parsed.autoApprove ?? false,
+		...(restrictedProfile ? { restrictedRpcHostProfile: restrictedProfile } : {}),
 	};
+	if (restrictedProfile) {
+		Object.assign(options, restrictedDiscoveryOptions());
+	}
 	const restoringSession = Boolean(parsed.continue || parsed.resume || isForeignSessionImport(parsed));
 	if (parsed.serviceTier !== undefined) {
 		options.openAIServiceTier = serviceTierSettingToTier(parsed.serviceTier) ?? null;
 	}
-	const cliDirs = parsed.addDir ?? [];
-	const settingsDirs = activeSettings.get("workspace.additionalDirectories");
+	const cliDirs = restrictedProfile ? [] : (parsed.addDir ?? []);
+	const settingsDirs = restrictedProfile ? [] : activeSettings.get("workspace.additionalDirectories");
 	if (cliDirs.length > 0 || settingsDirs.length > 0) {
 		options.additionalDirectories = [...new Set([...cliDirs, ...settingsDirs])];
 	}
@@ -1112,15 +1185,19 @@ export async function buildSessionOptions(
 		options.deadline = Date.now() + parsed.maxTime * 1000;
 	}
 
-	// Auto-discover SYSTEM.md if no CLI system prompt provided
-	const systemPromptSource = parsed.systemPrompt ?? discoverSystemPromptFile();
-	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
-	const titleSystemPromptSource = discoverTitleSystemPromptFile();
-	const [resolvedSystemPrompt, resolvedAppendPrompt, titleSystemPrompt] = await Promise.all([
-		resolvePromptInput(systemPromptSource, "system prompt"),
-		resolvePromptInput(appendPromptSource, "append system prompt"),
-		resolvePromptInput(titleSystemPromptSource, "title system prompt"),
-	]);
+	// Restricted startup must not probe project/global prompt files.
+	const systemPromptSource = restrictedProfile ? undefined : (parsed.systemPrompt ?? discoverSystemPromptFile());
+	const appendPromptSource = restrictedProfile
+		? undefined
+		: (parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile());
+	const titleSystemPromptSource = restrictedProfile ? undefined : discoverTitleSystemPromptFile();
+	const [resolvedSystemPrompt, resolvedAppendPrompt, titleSystemPrompt] = restrictedProfile
+		? [undefined, undefined, undefined]
+		: await Promise.all([
+				resolvePromptInput(systemPromptSource, "system prompt"),
+				resolvePromptInput(appendPromptSource, "append system prompt"),
+				resolvePromptInput(titleSystemPromptSource, "title system prompt"),
+			]);
 
 	if (sessionManager) {
 		options.sessionManager = sessionManager;
@@ -1410,6 +1487,7 @@ export async function runRootCommand(
 
 		const parsedArgs = parsed;
 		await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+		validateRestrictedRpcCli(parsedArgs);
 
 		const notifs: (InteractiveModeNotify | null)[] = [];
 
@@ -1443,13 +1521,14 @@ export async function runRootCommand(
 
 		// Install the session storage backend before any SessionManager is created,
 		// so all factories and resume pickers share one durable backend.
-		await logger.time("setupSessionStorageBackend", setupSessionStorageBackend, parsedArgs);
+		const sqlStorageSetup = await logger.time("setupSessionStorageBackend", setupSessionStorageBackend, parsedArgs);
 
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
 		const home = os.homedir();
-		const pluginPreloadPromise =
-			parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+		const pluginPreloadPromise = parsedArgs.rpcHostProfile
+			? Promise.resolve()
+			: parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
 				? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
 				: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
 		// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
@@ -1458,7 +1537,7 @@ export async function runRootCommand(
 
 		// Trusted files load as exact module paths, never as package roots whose
 		// sibling hooks/tools/commands/MCP content could be discovered implicitly.
-		if (!parsedArgs.trustedExtensions?.length) {
+		if (!parsedArgs.rpcHostProfile && !parsedArgs.trustedExtensions?.length) {
 			// Register CLI-provided extension package paths (`--extension`, `--hook`) so
 			// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
 			// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
@@ -1492,9 +1571,11 @@ export async function runRootCommand(
 		// startup error below, while its cache/config I/O overlaps settings I/O.
 		const authStoragePromise = logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
 		authStoragePromise.catch(() => {});
-		const settingsPromise = deps.settings
-			? Promise.resolve(deps.settings)
-			: logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config });
+		const settingsPromise = parsedArgs.rpcHostProfile
+			? Promise.resolve(Settings.isolated())
+			: deps.settings
+				? Promise.resolve(deps.settings)
+				: logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config });
 		settingsPromise.catch(() => {});
 		let authStorage: AuthStorage;
 		try {
@@ -1507,6 +1588,7 @@ export async function runRootCommand(
 		}
 
 		const settingsInstance = await settingsPromise;
+		if (parsedArgs.rpcHostProfile) settingsInstance.override("autoResume", false);
 		if (parsedArgs.approvalMode) {
 			// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
 			// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -1526,7 +1608,11 @@ export async function runRootCommand(
 		// extended-context window caps, so it must receive the finalized settings.
 		const modelRegistry = logger.time(
 			"modelRegistry:init",
-			() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
+			() =>
+				new ModelRegistry(authStorage, undefined, {
+					settings: settingsInstance,
+					ignoreLocalModelConfig: Boolean(parsedArgs.rpcHostProfile),
+				}),
 		);
 		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_PTY = "1";
@@ -1792,15 +1878,17 @@ export async function runRootCommand(
 		}
 
 		await pluginPreloadPromise;
-		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+		if (!parsedArgs.rpcHostProfile && deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
 			await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
 		}
 
-		scheduleMarketplaceAutoUpdate({
-			autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
-			resolveActiveProjectRegistryPath,
-			clearPluginRootsCache: clearPluginRootsAndCaches,
-		});
+		if (!parsedArgs.rpcHostProfile) {
+			scheduleMarketplaceAutoUpdate({
+				autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
+				resolveActiveProjectRegistryPath,
+				clearPluginRootsCache: clearPluginRootsAndCaches,
+			});
+		}
 
 		const sessionOptions = await logger.time(
 			"buildSessionOptions",
@@ -1820,9 +1908,11 @@ export async function runRootCommand(
 		// env, then switch on the agent loop's telemetry hooks so traces, run-level
 		// metrics, and structured logs have source events to export. Content capture
 		// remains governed by OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
-		await logger.time("initTelemetryExport", initTelemetryExport);
-		if (isTelemetryExportEnabled()) {
-			sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
+		if (!parsedArgs.rpcHostProfile) {
+			await logger.time("initTelemetryExport", initTelemetryExport);
+			if (isTelemetryExportEnabled()) {
+				sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
+			}
 		}
 
 		// Handle CLI --api-key as runtime override (not persisted)
@@ -1844,7 +1934,7 @@ export async function runRootCommand(
 			// Kick off background model discovery only after createAgentSession finishes its parallel
 			// discovery arms; running these concurrently contends for the event loop and stretches
 			// every parallel arm by ~30ms.
-			modelRegistry.refreshInBackground();
+			if (!parsedArgs.rpcHostProfile) modelRegistry.refreshInBackground();
 			return result;
 		};
 
@@ -1952,6 +2042,7 @@ export async function runRootCommand(
 				lspServers,
 				mcpManager,
 				startBackgroundModelDiscovery,
+				restrictedProfileRuntime,
 			} = await createSession({
 				...sessionOptions,
 				eventBus,
@@ -1972,17 +2063,19 @@ export async function runRootCommand(
 			// its persisted JSONL (see persisted-revive.ts). Scoped to the non-ACP
 			// bootstrap: ACP keeps several concurrent top-level sessions and a single
 			// process-global factory must not be clobbered by the most recent one.
-			AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
-				createPersistedSubagentReviverFactory({
-					session,
-					authStorage,
-					modelRegistry,
-					settings: settingsInstance,
-					enableLsp: sessionOptions.enableLsp ?? true,
-					eventBus,
-				}),
-				Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
-			);
+			if (!parsedArgs.rpcHostProfile) {
+				AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
+					createPersistedSubagentReviverFactory({
+						session,
+						authStorage,
+						modelRegistry,
+						settings: settingsInstance,
+						enableLsp: sessionOptions.enableLsp ?? true,
+						eventBus,
+					}),
+					Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
+				);
+			}
 			if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
 				authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
 			}
@@ -2025,10 +2118,23 @@ export async function runRootCommand(
 			}
 
 			if (mode === "rpc" || mode === "rpc-ui") {
-				// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
 				const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
+				let restricted: { runtime: RestrictedProfileRuntime; turnStorage: RestrictedTurnStorage } | undefined;
+				if (parsedArgs.rpcHostProfile) {
+					if (
+						!restrictedProfileRuntime ||
+						!sqlStorageSetup?.restrictedTurnStorage ||
+						!sqlStorageSetup.databaseReceipt
+					) {
+						throw new Error("Restricted RPC startup evidence is incomplete");
+					}
+					restricted = {
+						runtime: { ...restrictedProfileRuntime, databaseReceipt: sqlStorageSetup.databaseReceipt },
+						turnStorage: sqlStorageSetup.restrictedTurnStorage,
+					};
+				}
 				stopStartupWatchdog();
-				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
+				await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput, restricted);
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
 				const startupChangelog = await startupChangelogPromise;

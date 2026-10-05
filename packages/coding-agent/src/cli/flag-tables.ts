@@ -125,6 +125,14 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 			result.mode = value;
 		}
 	},
+	"--rpc-host-profile": (result, value) => {
+		if (value !== "agentdesk_restricted_rpc_v1") {
+			throw new CliUsageError(
+				`Invalid --rpc-host-profile value: ${JSON.stringify(value)}. Expected "agentdesk_restricted_rpc_v1".`,
+			);
+		}
+		result.rpcHostProfile = value;
+	},
 	"--fork": (result, value) => {
 		result.fork = value;
 	},

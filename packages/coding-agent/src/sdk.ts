@@ -42,6 +42,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import {
+	type DiscoveredAdvisors,
 	discoverAdvisorConfigs,
 	discoverWatchdogFiles,
 	formatActiveRepoWatchdogPrompt,
@@ -134,6 +135,13 @@ import { MCP_CONNECTION_STATUS_EVENT_CHANNEL, type McpConnectionStatusEvent } fr
 import { createSessionMemoryRuntimeContext, resolveMemoryBackend } from "./memory-backend";
 import { MEMORY_BACKEND_TOOL_NAMES } from "./memory-backend/tool-names";
 import type { MnemopiSessionState } from "./mnemopi/state";
+import {
+	AGENTDESK_RESTRICTED_RPC_PROFILE,
+	applyRestrictedRpcHostProfile,
+	assertRestrictedPromptSegments,
+	type RestrictedProfileRuntime,
+	type RestrictedRpcHostProfile,
+} from "./modes/rpc/restricted-rpc-profile";
 import mcpXdevGuidanceTemplate from "./prompts/system/mcp-xdev-guidance.md" with { type: "text" };
 import lateDiagnosticTemplate from "./prompts/tools/lsp-late-diagnostic.md" with { type: "text" };
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
@@ -369,6 +377,8 @@ export interface CreateAgentSessionOptions {
 	agentDir?: string;
 	/** Spawns to allow. Default: "*" */
 	spawns?: string;
+	/** Versioned fail-closed RPC host profile. Omit for ordinary SDK behavior. */
+	restrictedRpcHostProfile?: RestrictedRpcHostProfile;
 
 	/** Auth storage for credentials. Default: discoverAuthStorage(agentDir) */
 	authStorage?: AuthStorage;
@@ -629,6 +639,8 @@ export interface CreateAgentSessionResult {
 	startBackgroundModelDiscovery?: () => Promise<void>;
 	/** Shared event bus for tool/extension communication */
 	eventBus: EventBus;
+	/** Fixed-option evidence produced before restricted session discovery. */
+	restrictedProfileRuntime?: Omit<RestrictedProfileRuntime, "databaseReceipt">;
 }
 
 export type DialectFormat = "auto" | "native" | Dialect;
@@ -1249,10 +1261,23 @@ export function createAutoLearnCaptureRunner(
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const rootMode = options.disableExtensionDiscovery ? "explicit-only" : "merge";
-	return await withOmpExtensionRootScope(options.additionalExtensionPaths ?? [], rootMode, () =>
-		createAgentSessionScoped(options),
+	if (
+		options.restrictedRpcHostProfile !== undefined &&
+		options.restrictedRpcHostProfile !== AGENTDESK_RESTRICTED_RPC_PROFILE
+	) {
+		throw new Error(`Unknown restricted RPC host profile: ${String(options.restrictedRpcHostProfile)}`);
+	}
+	const restricted =
+		options.restrictedRpcHostProfile === AGENTDESK_RESTRICTED_RPC_PROFILE
+			? applyRestrictedRpcHostProfile(options)
+			: undefined;
+	const effectiveOptions = restricted?.options ?? options;
+	const rootMode = effectiveOptions.disableExtensionDiscovery ? "explicit-only" : "merge";
+	const result = await withOmpExtensionRootScope(effectiveOptions.additionalExtensionPaths ?? [], rootMode, () =>
+		createAgentSessionScoped(effectiveOptions),
 	);
+	if (restricted) result.restrictedProfileRuntime = restricted.runtime;
+	return result;
 }
 
 async function createAgentSessionScoped(options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> {
@@ -1271,6 +1296,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
+	const restrictedProfile = options.restrictedRpcHostProfile === AGENTDESK_RESTRICTED_RPC_PROFILE;
 	const modelRegistry =
 		options.modelRegistry ??
 		new ModelRegistry(
@@ -1279,6 +1305,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			{
 				settings,
 				cacheDbPath: getModelDbPath(agentDir),
+				ignoreLocalModelConfig: restrictedProfile,
 			},
 		);
 	// Track whether we internally created the authStorage so we can close it
@@ -1305,7 +1332,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 	});
 	await modelRegistry.hydrateCredentialScopedModelCaches();
-	if (!options.modelRegistry) {
+	if (!options.modelRegistry && !restrictedProfile) {
 		modelRegistry.refreshInBackground();
 	}
 	// Kick off workspace tree discovery early. The native workspace scan returns
@@ -1336,11 +1363,17 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			return null;
 		}
 	};
-	const activeRepoContextPromise = logger.time("resolveActiveRepoContext", resolveRepoContext, cwd);
+	const activeRepoContextPromise = restrictedProfile
+		? Promise.resolve(null)
+		: logger.time("resolveActiveRepoContext", resolveRepoContext, cwd);
 	activeRepoContextPromise.catch(() => {});
-	const watchdogFilesPromise = logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
+	const watchdogFilesPromise = restrictedProfile
+		? Promise.resolve([])
+		: logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
 	watchdogFilesPromise.catch(() => {});
-	const advisorConfigsPromise = logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
+	const advisorConfigsPromise = restrictedProfile
+		? Promise.resolve<DiscoveredAdvisors>({ advisors: [], sharedInstructions: undefined })
+		: logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
 	advisorConfigsPromise.catch(() => {});
 	const promptTemplatesPromise = options.promptTemplates
 		? Promise.resolve(options.promptTemplates)
@@ -1374,6 +1407,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		logger.time("sessionManager", () =>
 			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
 		);
+	if (restrictedProfile && sessionManager.getBranch().some(entry => entry.type === "message")) {
+		throw new Error("Restricted RPC sessions must start with an empty message transcript");
+	}
 	const configuredDirs = options.additionalDirectories
 		? options.additionalDirectories
 		: settings.get("workspace.additionalDirectories");
@@ -4029,6 +4065,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		} catch (error) {
 			logger.warn("Code Mode initialization at session startup failed", { error: String(error) });
 		}
+		if (restrictedProfile) assertRestrictedPromptSegments(session.systemPrompt);
 
 		return {
 			session,

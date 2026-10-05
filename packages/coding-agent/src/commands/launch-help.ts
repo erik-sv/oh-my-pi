@@ -43,6 +43,10 @@ export const launchHelp = {
 			description: "Output mode: text (default), json, rpc, or rpc-ui",
 			options: ["text", "json", "rpc", "acp", "rpc-ui"],
 		}),
+		"rpc-host-profile": Flags.string({
+			description: "Versioned RPC host restriction profile",
+			options: ["agentdesk_restricted_rpc_v1"],
+		}),
 		config: Flags.string({
 			description: "Load an extra config.yml-style overlay for this run (repeatable)",
 			multiple: true,

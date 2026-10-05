@@ -56,6 +56,7 @@ export interface Args {
 	help?: boolean;
 	version?: boolean;
 	mode?: Mode;
+	rpcHostProfile?: "agentdesk_restricted_rpc_v1";
 	noSession?: boolean;
 	sessionDir?: string;
 	/**

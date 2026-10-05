@@ -11,6 +11,7 @@
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
 import { once } from "node:events";
+import type { AgentEvent } from "@oh-my-pi/pi-agent-core";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { $env, isRecord, Snowflake } from "@oh-my-pi/pi-utils";
@@ -28,6 +29,12 @@ import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import type {
+	RestrictedTerminalStatus,
+	RestrictedTurnRecord,
+	RestrictedTurnStorage,
+} from "../../session/restricted-turn-storage";
+import type { SessionMessageEntry } from "../../session/session-entries";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "../../slash-commands/available-commands";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
@@ -36,6 +43,12 @@ import { calculateTokensPerSecond } from "../../utils/token-rate";
 import { initializeExtensions } from "../runtime-init";
 import { isRpcHostToolResult, isRpcHostToolUpdate, RpcHostToolBridge } from "./host-tools";
 import { isRpcHostUriResult, RpcHostUriBridge } from "./host-uris";
+import {
+	buildRestrictedProfileReceipt,
+	canonicalRestrictedJson,
+	type RestrictedProfileRuntime,
+	restrictedSha256,
+} from "./restricted-rpc-profile";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameEncoder } from "./rpc-frame";
 import { claimRpcInput, readRpcInputFrames } from "./rpc-input";
 import { pageRpcMessages, RPC_MESSAGES_PAGE_BUSY_ERROR, RpcMessagesPageError } from "./rpc-messages";
@@ -494,16 +507,31 @@ export async function handleRpcSessionChange(
 	throw new Error("Unsupported RPC session change command");
 }
 
-function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[]): RpcHostToolDefinition[] {
+function normalizeHostToolDefinitions(tools: RpcHostToolDefinition[], strict = false): RpcHostToolDefinition[] {
+	if (!Array.isArray(tools)) throw new Error("Host tools must be an array");
+	const seen = new Set<string>();
+	const allowedKeys: Record<string, true> = {
+		name: true,
+		label: true,
+		description: true,
+		parameters: true,
+		hidden: true,
+		loadMode: true,
+	};
 	return tools.map((tool, index) => {
+		if (!tool || typeof tool !== "object" || Array.isArray(tool)) {
+			throw new Error(`Host tool at index ${index} must be an object`);
+		}
+		const unknownKeys = strict ? Object.keys(tool).filter(key => !allowedKeys[key]) : [];
+		if (unknownKeys.length > 0) {
+			throw new Error(`Host tool at index ${index} has unknown keys: ${unknownKeys.join(", ")}`);
+		}
 		const name = typeof tool.name === "string" ? tool.name.trim() : "";
-		if (!name) {
-			throw new Error(`Host tool at index ${index} must provide a non-empty name`);
-		}
+		if (!name) throw new Error(`Host tool at index ${index} must provide a non-empty name`);
+		if (strict && seen.has(name)) throw new Error(`Duplicate host tool name: ${name}`);
+		seen.add(name);
 		const description = typeof tool.description === "string" ? tool.description.trim() : "";
-		if (!description) {
-			throw new Error(`Host tool "${name}" must provide a non-empty description`);
-		}
+		if (!description) throw new Error(`Host tool "${name}" must provide a non-empty description`);
 		if (!tool.parameters || typeof tool.parameters !== "object" || Array.isArray(tool.parameters)) {
 			throw new Error(`Host tool "${name}" must provide a JSON Schema object`);
 		}
@@ -681,7 +709,6 @@ export function requestRpcDialog<T>(
 			resolve(defaultValue);
 		}, opts.timeout);
 	}
-
 	pendingRequests.set(id, {
 		resolve: response => {
 			cleanup();
@@ -692,6 +719,12 @@ export function requestRpcDialog<T>(
 	output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 	return promise;
 }
+
+export interface RestrictedRpcModeOptions {
+	runtime: RestrictedProfileRuntime;
+	turnStorage: RestrictedTurnStorage;
+}
+
 /**
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
@@ -701,6 +734,7 @@ export async function runRpcMode(
 	setToolUIContext?: (uiContext: ExtensionUIContext, hasUI: boolean) => void,
 	eventBus?: EventBus,
 	input: ReadableStream<Uint8Array> = claimRpcInput(),
+	restricted?: RestrictedRpcModeOptions,
 ): Promise<never> {
 	// Signal to RPC clients that the server is ready to accept commands
 	// Suppress terminal notifications: they write \x07 (BEL) or OSC sequences directly to
@@ -750,6 +784,12 @@ export async function runRpcMode(
 		}
 		return { id, type: "response", command, success: true, data } as RpcResponse;
 	};
+	let acceptedEntry: SessionMessageEntry | undefined;
+	let restrictedTurn: RestrictedTurnRecord | undefined;
+	let highWaterMark = 0;
+	const orderedToolCalls: string[] = [];
+	const terminalTasks = new Set<Promise<void>>();
+	let terminalStarted = false;
 
 	const error = (id: string | undefined, command: string, message: string, code?: string): RpcResponse => {
 		return { id, type: "response", command, success: false, error: message, ...(code ? { code } : {}) };
@@ -956,27 +996,79 @@ export async function runRpcMode(
 	const rpcUiContext = new RpcExtensionUIContext(pendingExtensionRequests, output);
 	setToolUIContext?.(rpcUiContext, true);
 
-	// Set up extensions with RPC-based UI context
-	await initializeExtensions(session, {
-		mode: "rpc",
-		reportSendError: (action, err) => {
-			output(error(undefined, action, err.message));
-		},
-		reportRuntimeError: err => {
-			output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
-		},
-		onShutdown: () => {
-			shutdownState.requested = true;
-		},
-		trackAgentInvokingMessage: task => {
-			extensionUserMessageTracker.trackAgentMessageTask(task);
-		},
-		uiContext: rpcUiContext,
-	});
+	if (!restricted) {
+		await initializeExtensions(session, {
+			mode: "rpc",
+			reportSendError: (action, err) => {
+				output(error(undefined, action, err.message));
+			},
+			reportRuntimeError: err => {
+				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
+			},
+			onShutdown: () => {
+				shutdownState.requested = true;
+			},
+			trackAgentInvokingMessage: task => {
+				extensionUserMessageTracker.trackAgentMessageTask(task);
+			},
+			uiContext: rpcUiContext,
+		});
+	}
 
-	// Output all agent events as JSON
+	const terminalStatus = (event: Extract<AgentEvent, { type: "agent_end" }>): RestrictedTerminalStatus => {
+		for (let index = event.messages.length - 1; index >= 0; index--) {
+			const message = event.messages[index];
+			if (message?.role !== "assistant") continue;
+			if (message.stopReason === "aborted") return "cancelled";
+			if (message.stopReason === "error") return "failed";
+			return "completed";
+		}
+		return "failed";
+	};
+	const persistTerminal = (status: RestrictedTerminalStatus, terminalMaterial: unknown): Promise<void> => {
+		if (!restricted || !restrictedTurn || terminalStarted) return Promise.resolve();
+		terminalStarted = true;
+		const task = (async () => {
+			await session.flushRestrictedTerminalTranscript();
+			const branch = session.sessionManager.getBranch();
+			const terminalEntry = branch.at(-1) ?? null;
+			const receipt = await restricted.turnStorage.persistTerminal({
+				clientTurnId: restrictedTurn.clientTurnId,
+				acceptedTurnId: restrictedTurn.acceptedTurnId,
+				status,
+				terminalEntryEventDigest: restrictedSha256(
+					canonicalRestrictedJson({ entry: terminalEntry, event: terminalMaterial }),
+				),
+				orderedToolCallDigest: restrictedSha256(canonicalRestrictedJson(orderedToolCalls)),
+				highWaterMark,
+			});
+			restrictedTurn = receipt;
+			output({ type: "restricted_terminal_receipt", receipt });
+		})();
+		terminalTasks.add(task);
+		void task
+			.finally(() => terminalTasks.delete(task))
+			.catch(promptError => {
+				output(
+					error(
+						undefined,
+						"terminal_receipt",
+						promptError instanceof Error ? promptError.message : String(promptError),
+					),
+				);
+			});
+		return task;
+	};
+
 	session.subscribe(event => {
+		if (restrictedTurn?.state === "active") {
+			highWaterMark++;
+			if (event.type === "tool_execution_end") {
+				orderedToolCalls.push(canonicalRestrictedJson(event));
+			}
+		}
 		output(event);
+		if (event.type === "agent_end") void persistTerminal(terminalStatus(event), event);
 	});
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
@@ -990,16 +1082,31 @@ export async function runRpcMode(
 		await emitAvailableCommandsUpdate();
 	};
 	const emitAvailableCommandsUpdate = async () => {
-		output({ type: "available_commands_update", commands: await getAvailableCommands() });
+		if (!restricted) output({ type: "available_commands_update", commands: await getAvailableCommands() });
 	};
-	session.subscribeCommandMetadataChanged(() => {
-		void emitAvailableCommandsUpdate();
-	});
-	await emitAvailableCommandsUpdate();
+	if (!restricted) {
+		session.subscribeCommandMetadataChanged(() => {
+			void emitAvailableCommandsUpdate();
+		});
+		await emitAvailableCommandsUpdate();
+	}
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (restricted) {
+			const allowed: Record<string, true> = {
+				negotiate_protocol: true,
+				get_state: true,
+				set_host_tools: true,
+				accept_turn: true,
+				activate_turn: true,
+				abort: true,
+			};
+			if (!allowed[command.type]) {
+				return error(id, command.type, `Command ${command.type} is disabled by agentdesk_restricted_rpc_v1`);
+			}
+		}
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -1011,6 +1118,89 @@ export async function runRpcMode(
 			// =================================================================
 			// Prompting
 			// =================================================================
+
+			case "accept_turn": {
+				if (!restricted) return error(id, "accept_turn", "accept_turn requires a restricted RPC host profile");
+				const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+				if (!uuid.test(command.clientTurnId)) {
+					return error(id, "accept_turn", "clientTurnId must be a canonical lowercase UUID");
+				}
+				if (!/^[0-9a-f]{64}$/.test(command.expectedPromptDigest)) {
+					return error(id, "accept_turn", "expectedPromptDigest must be a lowercase SHA-256 digest");
+				}
+				if (
+					typeof command.prompt !== "string" ||
+					new TextDecoder("utf-8", { fatal: true }).decode(new TextEncoder().encode(command.prompt)) !==
+						command.prompt
+				) {
+					return error(id, "accept_turn", "prompt must be exact well-formed UTF-8 text");
+				}
+				const promptDigest = restrictedSha256(new TextEncoder().encode(command.prompt));
+				if (promptDigest !== command.expectedPromptDigest) {
+					return error(id, "accept_turn", "Prompt digest mismatch", "prompt_digest_mismatch");
+				}
+				await session.sessionManager.ensureOnDisk();
+				await session.sessionManager.flush();
+				const sessionPath = session.sessionFile;
+				if (!sessionPath) return error(id, "accept_turn", "Restricted session has no durable SQL path");
+				const entry = session.sessionManager.prepareRestrictedUserEntry(command.prompt);
+				const accepted = await restricted.turnStorage.acceptTurn({
+					clientTurnId: command.clientTurnId,
+					sessionId: session.sessionId,
+					acceptedTurnId: crypto.randomUUID(),
+					prompt: command.prompt,
+					promptDigest,
+					sessionPath,
+					userEntry: entry,
+				});
+				if (accepted.inserted) {
+					session.sessionManager.adoptRestrictedDurableEntry(entry);
+					acceptedEntry = entry;
+				} else if (!acceptedEntry) {
+					return error(
+						id,
+						"accept_turn",
+						"Persisted acceptance is not owned by this fresh process and cannot be revived",
+						"accepted_turn_not_live",
+					);
+				}
+				restrictedTurn = accepted.turn;
+				return success(id, "accept_turn", accepted.turn);
+			}
+
+			case "activate_turn": {
+				if (!restricted) return error(id, "activate_turn", "activate_turn requires a restricted RPC host profile");
+				if (restrictedTurn?.state === "accepted" && !acceptedEntry) {
+					return error(id, "activate_turn", "Accepted turn is not live in this process", "accepted_turn_not_live");
+				}
+				const activation = await restricted.turnStorage.activateTurn(command.clientTurnId, command.acceptedTurnId);
+				restrictedTurn = activation.turn;
+				if (activation.schedule) {
+					const entry = acceptedEntry;
+					if (!entry) {
+						return error(
+							id,
+							"activate_turn",
+							"Accepted turn is not live in this process",
+							"accepted_turn_not_live",
+						);
+					}
+					const task = session
+						.activateRestrictedAcceptedTurn(entry)
+						.then(async invoked => {
+							if (!invoked) await persistTerminal("failed", { type: "activation_not_invoked" });
+						})
+						.catch(async activationError => {
+							await persistTerminal("failed", {
+								type: "activation_error",
+								message: activationError instanceof Error ? activationError.message : String(activationError),
+							});
+						});
+					terminalTasks.add(task);
+					void task.finally(() => terminalTasks.delete(task));
+				}
+				return success(id, "activate_turn", activation.turn);
+			}
 
 			case "prompt": {
 				const skillResult = await tryRunRpcSkillCommand(session, command.message, command.streamingBehavior);
@@ -1079,6 +1269,9 @@ export async function runRpcMode(
 			}
 
 			case "abort": {
+				if (restricted && restrictedTurn?.state !== "active") {
+					return error(id, "abort", "No active restricted turn to abort");
+				}
 				await session.abort({ reason: USER_INTERRUPT_LABEL });
 				return success(id, "abort");
 			}
@@ -1130,6 +1323,17 @@ export async function runRpcMode(
 						examples: tool.examples,
 					})),
 					contextUsage: session.getContextUsage(),
+					...(restricted
+						? {
+								restrictedProfileReceipt: buildRestrictedProfileReceipt({
+									runtime: restricted.runtime,
+									systemPrompt: session.systemPrompt,
+									tools: session.agent.state.tools,
+									model: session.model,
+								}),
+								...(restrictedTurn ? { restrictedTurn } : {}),
+							}
+						: {}),
 				};
 				return success(id, "get_state", state);
 			}
@@ -1155,7 +1359,10 @@ export async function runRpcMode(
 			}
 
 			case "set_host_tools": {
-				const tools = normalizeHostToolDefinitions(command.tools);
+				if (restricted && restrictedTurn) {
+					return error(id, "set_host_tools", "Host tool catalog is immutable after turn acceptance");
+				}
+				const tools = normalizeHostToolDefinitions(command.tools, Boolean(restricted));
 				const rpcTools = hostToolBridge.setTools(tools);
 				await session.refreshRpcHostTools(rpcTools);
 				return success(id, "set_host_tools", { toolNames: tools.map(tool => tool.name) });
@@ -1531,6 +1738,9 @@ export async function runRpcMode(
 	hostUriBridge.clear("RPC client disconnected before host URI request completed");
 	await inputDispatcher.drain();
 	await shutdownCoordinator.drain();
+	while (terminalTasks.size > 0) {
+		await Promise.allSettled([...terminalTasks]);
+	}
 	subagentRegistry?.dispose();
 	// Dispose the main session before exiting so the browser reaper and other
 	// bounded teardown run on the stdin-EOF path too (#5643). Idempotent: a

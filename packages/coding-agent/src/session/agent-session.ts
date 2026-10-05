@@ -332,7 +332,7 @@ import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
+import type { BranchSummaryEntry, NewSessionOptions, SessionMessageEntry } from "./session-entries";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -5450,6 +5450,35 @@ export class AgentSession {
 	}
 
 	/**
+	 * Activate a user message already committed by RestrictedTurnStorage.
+	 * Bypasses slash/template/magic discovery and preserves its exact timestamp,
+	 * allowing the normal message_end persistence path to dedupe the adopted row.
+	 */
+	async activateRestrictedAcceptedTurn(entry: SessionMessageEntry): Promise<boolean> {
+		if (entry.message.role !== "user") throw new Error("Restricted accepted entry must be a user message");
+		if (this.isStreaming) throw new AgentBusyError();
+		const content = entry.message.content;
+		const promptText =
+			typeof content === "string"
+				? content
+				: content
+						.filter((item): item is TextContent => item.type === "text")
+						.map(item => item.text)
+						.join("");
+		this.#advisors.autoResumeSuppressed = false;
+		this.#planModeReminderCount = 0;
+		this.#planModeReminderAwaitingProgress = false;
+		this.#toolChoiceQueue.removeByLabel("plan-mode-decision");
+		return this.#promptWithMessage(entry.message, promptText);
+	}
+
+	/** Wait for agent_end persistence and make every transcript append durable. */
+	async flushRestrictedTerminalTranscript(): Promise<void> {
+		await this.#drainInFlightEventHandlers();
+		await this.sessionManager.flush();
+	}
+
+	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
 	 * - Expands file-based prompt templates by default
@@ -5465,6 +5494,7 @@ export class AgentSession {
 	 * steer/follow-up. Callers that render a UI or manage turn lifecycle (e.g.
 	 * the ACP agent) use this to know whether to expect an `agent_end` event.
 	 */
+
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
 		// A manual `/compact` runs with the agent subscription disconnected until its
 		// cleanup finally re-drains the preserved queues. Starting a turn before then
