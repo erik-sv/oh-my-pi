@@ -95,6 +95,13 @@ describe("handleRpcEphemeralTurn", () => {
 		expect(session.runCalls).toBe(0);
 	});
 
+	test("rejects while a goal continuation is scheduled without invoking the primitive", async () => {
+		const session = makeSession({});
+		await expect(
+			handleRpcEphemeralTurn(session, { type: "ephemeral_turn", prompt: "recap please" }, () => true),
+		).rejects.toThrow("Cannot run ephemeral turn while the session has active or pending work");
+		expect(session.runCalls).toBe(0);
+	});
 	test("rejects while compaction is in progress without invoking the primitive", async () => {
 		const session = makeSession({ isCompacting: true });
 

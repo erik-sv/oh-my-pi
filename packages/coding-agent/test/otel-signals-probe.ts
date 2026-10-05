@@ -11,8 +11,11 @@
  * protobuf POST at both /v1/logs and /v1/metrics.
  */
 
-import type { AgentRunCoverage, AgentRunSummary, ChatUsageEvent } from "@oh-my-pi/pi-agent-core";
-import { emptyAgentRunCoverage, emptyAgentRunSummary } from "@oh-my-pi/pi-agent-core";
+import { agentLoop } from "@oh-my-pi/pi-agent-core/agent-loop";
+import type { AgentContext, AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core/types";
+import { type } from "@oh-my-pi/omptype";
+import type { Message } from "@oh-my-pi/pi-ai";
+import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import {
 	createTelemetryExportConfig,
 	flushTelemetryExport,
@@ -102,6 +105,18 @@ function assertSingleMetricPoint(metricName: string): void {
 		throw new Error(`${metricName} expected one dimensioned point, got ${counts.join(",")}`);
 	}
 }
+function assertMetricPresent(metricName: string): void {
+	const counts = metricPayloads.map(payload => pointCountForMetric(payload, metricName));
+	if (!counts.some(count => count !== undefined && count > 0)) {
+		throw new Error(`${metricName} expected a dimensioned point, got ${counts.join(",")}`);
+	}
+}
+
+function identityConverter(messages: AgentMessage[]): Message[] {
+	return messages.filter(
+		message => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
+	) as Message[];
+}
 
 function histogramObservationForMetric(
 	bytes: Uint8Array,
@@ -149,13 +164,17 @@ function histogramObservationForMetric(
 	return undefined;
 }
 
+const PROBE_TOOL_SLEEP_MS = 20;
 function assertIndividualToolDurations(metricName: string): void {
 	const observations = metricPayloads
 		.map(payload => histogramObservationForMetric(payload, metricName))
 		.filter((value): value is { points: number; count: number; sum: number } => value !== undefined);
-	if (!observations.some(value => value.points === 1 && value.count === 2 && value.sum === 100)) {
+	// Two real probe calls, each sleeping PROBE_TOOL_SLEEP_MS; the injected
+	// skipped call (999ms) must be excluded.
+	const minSum = PROBE_TOOL_SLEEP_MS * 2 - 4;
+	if (!observations.some(value => value.points === 1 && value.count === 2 && value.sum >= minSum && value.sum < 999)) {
 		throw new Error(
-			`${metricName} expected two individual observations summing to 100ms: ${JSON.stringify(observations)}`,
+			`${metricName} expected two individual probe observations (sum >= ${minSum}ms, skipped excluded): ${JSON.stringify(observations)}`,
 		);
 	}
 }
@@ -191,7 +210,7 @@ if (!isTelemetryExportEnabled()) {
 	process.exit(2);
 }
 
-const config = createTelemetryExportConfig(undefined);
+const config = createTelemetryExportConfig(undefined, () => true);
 if (!config) {
 	console.error("PROBE: export config not produced");
 	await server.stop(true);
@@ -201,63 +220,55 @@ if (!config) {
 // Bridged utility logger -> OTel log record.
 logger.error("probe error", { code: "probe" });
 
-// Metric instruments via the agent telemetry hooks.
-const usage: ChatUsageEvent = {
-	span: undefined as never,
-	operation: "chat",
-	agent: { id: "main", name: "Main" },
-	conversationId: "probe-session",
-	stepNumber: 0,
-	model: "claude-haiku-4-5",
+// Run the real agent-loop usage path. The mock response carries a provider
+// charge, but the ChatUsageEvent only gets a cost when the resolver installed
+// by createTelemetryExportConfig() runs.
+const mock = createMockModel({
 	provider: "anthropic",
-	serviceTier: undefined,
-	usage: {
-		inputTokens: 1000,
-		outputTokens: 200,
-		totalTokens: 1200,
-		cachedInputTokens: 0,
-		cacheWriteTokens: 0,
-		reasoningOutputTokens: 0,
-	},
-	cost: { usd: 0.01 },
-	attributes: undefined,
-	headers: undefined,
-};
-await config.onChatUsage?.(usage);
-
-const summary: AgentRunSummary = {
-	...emptyAgentRunSummary(),
-	chats: { total: 1, byStopReason: { end_turn: 1 }, totalLatencyMs: 1500 },
-	tools: {
-		total: 2,
-		ok: 2,
-		error: 0,
-		skipped: 0,
-		blocked: 0,
-		timeout: 0,
-		aborted: 0,
-		totalLatencyMs: 100,
-		byName: {
-			read: { total: 2, ok: 2, error: 0, skipped: 0, blocked: 0, timeout: 0, aborted: 0, totalLatencyMs: 100 },
+	id: "probe-model",
+	responses: [
+		{
+			// Two calls through the real tool path: the duration histogram must
+			// record each call individually, not one aggregate per run.
+			content: [
+				{ type: "toolCall", id: "probe-call-1", name: "probe", arguments: {} },
+				{ type: "toolCall", id: "probe-call-2", name: "probe", arguments: {} },
+			],
+			usage: {
+				input: 1000,
+				output: 200,
+				cost: { input: 0.02, output: 0.03, cacheRead: 0, cacheWrite: 0, total: 0.05 },
+			},
 		},
+		{ content: ["ok"], usage: { input: 20, output: 5 } },
+	],
+});
+const probeTool: AgentTool = {
+	name: "probe",
+	label: "Probe",
+	description: "Records one tool call for the exporter probe.",
+	parameters: type({}),
+	execute: async () => {
+		await Bun.sleep(PROBE_TOOL_SLEEP_MS);
+		return { content: [{ type: "text", text: "ok" }], details: {} };
 	},
-	stepCount: 1,
 };
-const coverage: AgentRunCoverage = {
-	...emptyAgentRunCoverage(),
-	toolsAvailable: ["read", "write"],
-	toolsInvoked: ["read"],
-	toolsUnused: ["write"],
-	modelsUsed: ["claude-haiku-4-5"],
-	providersUsed: ["anthropic"],
-};
-config.onToolUsage?.({ toolName: "read", status: "ok", durationMs: 42, errorType: undefined });
-config.onToolUsage?.({ toolName: "read", status: "ok", durationMs: 58, errorType: undefined });
-config.onToolUsage?.({ toolName: "read", status: "skipped", durationMs: 999, errorType: "tool_skipped" });
-config.onRunEnd?.(summary, coverage);
+const context: AgentContext = { systemPrompt: [], messages: [], tools: [probeTool] };
+for await (const _event of agentLoop(
+	[{ role: "user", content: "probe", timestamp: Date.now() }],
+	context,
+	{ model: mock.model, convertToLlm: identityConverter, telemetry: config },
+	undefined,
+	mock.stream,
+)) {
+	// Drain the real agent-loop event stream.
+}
+// A skipped call never ran, so it must not add a duration observation.
+config.onToolUsage?.({ toolName: "probe", status: "skipped", durationMs: 999, errorType: "tool_skipped" });
 
 await flushTelemetryExport();
-assertSingleMetricPoint("omp.agent.chat.calls");
+assertSingleMetricPoint("omp.agent.chat.cost.estimated_usd");
+assertMetricPresent("omp.agent.chat.calls");
 assertSingleMetricPoint("omp.agent.tool.calls");
 assertIndividualToolDurations("omp.agent.tool.duration");
 await server.stop(true);

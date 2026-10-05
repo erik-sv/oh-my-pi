@@ -10,6 +10,33 @@
 
 - Fixed process references resolving against the wrong PID namespace when `/proc` belongs to an ancestor namespace, as it does for a supervisor running inside a child PID namespace with the host `/proc` still mounted. `Process` pinned identity through a pidfd but read `/proc/<pid>` with the same number, so `fromPid` returned `null` for a live owned child - leaving stops with nothing to signal - and, where a host process held the same number, validated against a stranger and enumerated that stranger's children as descendants. Both PID spaces are now tracked separately: the procfs number comes from the pidfd's fdinfo, discovered children are translated back through `NSpid` and re-verified by reverse mapping, and processes absent from our namespace are refused.
 - Fixed native shell sessions hanging when foreground pipeline children stopped before SIGCHLD monitoring began.
+## [18.6.2] - 2026-10-04
+
+### Fixed
+
+- Fixed short snapcompact PNGs being emitted below the minimum dimensions accepted by some vision backends ([#14355](https://github.com/can1357/oh-my-pi/issues/14355)).
+
+## [18.6.1] - 2026-10-04
+
+### Fixed
+
+- Fixed concurrent searches through host-provided filesystem callbacks so they no longer starve other asynchronous filesystem operations, and ensured canceled searches release promptly.
+
+## [18.5.1] - 2026-10-03
+
+### Fixed
+
+- Fixed macOS computer-use scrolling so takeover and desktop scroll actions move iPhone Mirroring and other pixel-forwarding windows reliably, with smooth mouse-like wheel steps.
+- Fixed macOS computer-use value entry for date and time controls, including Calendar date pickers, with support for ISO 8601 dates and date-times and clear validation for unsupported formats.
+- Fixed macOS computer-use value entry for popup buttons, allowing options to be selected by title with confirmation and reporting available options when a title is not found.
+- Fixed macOS accessibility values for checkboxes, radio buttons, and radio groups so snapshots, attributes, and window information return usable numbers, titles, and referenced element values instead of debug representations.
+
+## [18.5.0] - 2026-10-03
+
+### Fixed
+
+- Fixed Ctrl+V on Windows sometimes pasting text with a few characters replaced by unrelated glyphs (for example `https://` turning into `՞ttp缀難//`); clipboard reads and writes no longer run at the same time ([#14144](https://github.com/can1357/oh-my-pi/pull/14144) by [@H4vC](https://github.com/H4vC))
+
 ## [18.4.10] - 2026-10-02
 
 ### Fixed

@@ -253,16 +253,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
-		const normalizedDir = dir.replaceAll("\\", "/");
-		const prefix = normalizedDir.endsWith("/") ? normalizedDir : `${normalizedDir}/`;
+		// Fork: SQL-backed listing matches nested globs (`*/*.jsonl`) relative to `dir`;
+		// both sides are resolved so platform separators and relative dirs compare equal.
+		const resolvedDir = path.resolve(dir).replaceAll("\\", "/");
+		const prefix = resolvedDir.endsWith("/") ? resolvedDir : `${resolvedDir}/`;
 		const glob = new Bun.Glob(pattern);
 		const out: string[] = [];
-		for (const path of this.#index.keys()) {
-			const normalizedPath = path.replaceAll("\\", "/");
-			if (!normalizedPath.startsWith(prefix)) continue;
-			const relativePath = normalizedPath.slice(prefix.length);
-			if (!glob.match(relativePath)) continue;
-			out.push(path);
+		for (const key of this.#index.keys()) {
+			const normalizedKey = path.resolve(key).replaceAll("\\", "/");
+			if (!normalizedKey.startsWith(prefix)) continue;
+			if (!glob.match(normalizedKey.slice(prefix.length))) continue;
+			out.push(key);
 		}
 		return out;
 	}
