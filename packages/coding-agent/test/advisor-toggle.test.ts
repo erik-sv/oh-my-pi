@@ -885,8 +885,8 @@ describe("AgentSession advisor toggle", () => {
 		const entryId = sessionManager.getLeafId();
 		if (!entryId) throw new Error("Expected a branchable entry");
 		const createBranchedSession = sessionManager.createBranchedSession.bind(sessionManager);
-		vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(parentId => {
-			const result = createBranchedSession(parentId);
+		vi.spyOn(sessionManager, "createBranchedSession").mockImplementation(async parentId => {
+			const result = await createBranchedSession(parentId);
 			queueMicrotask(() => appendAdvisorCost(advisor, 9, 3));
 			return result;
 		});

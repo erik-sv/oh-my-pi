@@ -134,6 +134,12 @@ export interface SessionStorage {
 	 * it.
 	 */
 	confirmWrites?(path: string): Promise<void>;
+	/**
+	 * Hydrate all session metadata before synchronous listings. Backends that
+	 * initialize with a complete index omit this; direct SQL resume may seed
+	 * only its requested session and hydrate the rest on demand.
+	 */
+	ensureCompleteIndex?(): Promise<void>;
 	ensureDirSync(dir: string): void;
 	existsSync(path: string): boolean;
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void;

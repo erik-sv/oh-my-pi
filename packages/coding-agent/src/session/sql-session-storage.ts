@@ -80,6 +80,12 @@ export interface SqlSessionStorageOptions {
 	 * session deletion so a forged SQL path cannot target arbitrary directories.
 	 */
 	sessionRoot?: string;
+	/**
+	 * Seed only this explicit resume path and its fixed sidecars at startup.
+	 * Other paths become visible when ensureCompleteIndex() or an async
+	 * unknown-path operation hydrates the full index. Omit for normal startup.
+	 */
+	initialPath?: string;
 }
 
 interface DialectQueries {
@@ -93,6 +99,7 @@ interface DialectQueries {
 	delete: string;
 	rename: string;
 	loadIndex: string;
+	loadPathIndex: string;
 	readChunks: string;
 	readFirstChunks: string;
 	/**
@@ -195,6 +202,12 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			: adapter === "postgres"
 				? "octet_length(content)"
 				: "length(cast(content AS blob))";
+	const selectIndex =
+		`SELECT path, SUM(${byteLengthExpr}) AS byte_len, MAX(mtime_ms) AS mtime_ms, ` +
+		`MAX(CASE WHEN seq = 0 THEN title END) AS title, ` +
+		`MAX(CASE WHEN seq = 0 THEN title_source END) AS title_source, ` +
+		`MAX(CASE WHEN seq = 0 THEN title_updated_at END) AS title_updated_at ` +
+		`FROM ${table}`;
 
 	if (adapter === "mysql") {
 		return {
@@ -221,12 +234,8 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 			updateTitle: `UPDATE ${table} SET title = ?, title_source = ?, title_updated_at = ?, mtime_ms = ? WHERE path = ? AND seq = 0`,
 			delete: `DELETE FROM ${table} WHERE path = ?`,
 			rename: `UPDATE ${table} SET path = ?, mtime_ms = ? WHERE path = ?`,
-			loadIndex:
-				`SELECT path, SUM(${byteLengthExpr}) AS byte_len, MAX(mtime_ms) AS mtime_ms, ` +
-				`MAX(CASE WHEN seq = 0 THEN title END) AS title, ` +
-				`MAX(CASE WHEN seq = 0 THEN title_source END) AS title_source, ` +
-				`MAX(CASE WHEN seq = 0 THEN title_updated_at END) AS title_updated_at ` +
-				`FROM ${table} GROUP BY path`,
+			loadIndex: `${selectIndex} GROUP BY path`,
+			loadPathIndex: `${selectIndex} WHERE path = ? GROUP BY path`,
 			readChunks: `SELECT content FROM ${table} WHERE path = ? ORDER BY seq`,
 			readFirstChunks: `SELECT seq, content, title, title_source, title_updated_at FROM ${table} WHERE path = ? ORDER BY seq LIMIT 2`,
 			chunkSizes: `SELECT ${byteLengthExpr} AS byte_len FROM ${table} WHERE path = ? FOR UPDATE`,
@@ -258,12 +267,8 @@ function buildQueries(adapter: SqlSessionStorageAdapter, table: string): Dialect
 		updateTitle: `UPDATE ${table} SET title = ${placeholder(1)}, title_source = ${placeholder(2)}, title_updated_at = ${placeholder(3)}, mtime_ms = ${placeholder(4)} WHERE path = ${placeholder(5)} AND seq = 0`,
 		delete: `DELETE FROM ${table} WHERE path = ${placeholder(1)}`,
 		rename: `UPDATE ${table} SET path = ${placeholder(1)}, mtime_ms = ${placeholder(2)} WHERE path = ${placeholder(3)}`,
-		loadIndex:
-			`SELECT path, SUM(${byteLengthExpr}) AS byte_len, MAX(mtime_ms) AS mtime_ms, ` +
-			`MAX(CASE WHEN seq = 0 THEN title END) AS title, ` +
-			`MAX(CASE WHEN seq = 0 THEN title_source END) AS title_source, ` +
-			`MAX(CASE WHEN seq = 0 THEN title_updated_at END) AS title_updated_at ` +
-			`FROM ${table} GROUP BY path`,
+		loadIndex: `${selectIndex} GROUP BY path`,
+		loadPathIndex: `${selectIndex} WHERE path = ${placeholder(1)} GROUP BY path`,
 		readChunks: `SELECT content FROM ${table} WHERE path = ${placeholder(1)} ORDER BY seq`,
 		readFirstChunks: `SELECT seq, content, title, title_source, title_updated_at FROM ${table} WHERE path = ${placeholder(1)} ORDER BY seq LIMIT 2`,
 		chunkSizes:
@@ -355,13 +360,19 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 
 	/**
 	 * Apply the dialect-correct DDL (unless `createTable: false` is set) and warm
-	 * the metadata index with every existing path. Must be awaited before passing
-	 * the storage into `SessionManager.create()`.
+	 * the metadata index, optionally limited to an explicit resume path. Must
+	 * be awaited before passing the storage into `SessionManager.create()`.
 	 */
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const backend = new SqlSessionStorageBackend(options);
 		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table, options.sessionRoot);
-		await storage.initialize();
+		const initialPath = options.initialPath === undefined ? undefined : path.resolve(options.initialPath);
+		const initialPaths = initialPath === undefined ? undefined : [initialPath, `${initialPath}.bak`];
+		if (initialPath?.endsWith(".jsonl")) {
+			const artifactsDir = initialPath.slice(0, -".jsonl".length);
+			initialPaths?.push(path.join(artifactsDir, "draft.txt"), path.join(artifactsDir, ".draft-only-session"));
+		}
+		await storage.initialize(initialPaths);
 		return storage;
 	}
 
@@ -476,8 +487,14 @@ class SqlSessionStorageBackend implements SessionStorageBackend {
 		if (this.#table === DEFAULT_TABLE) await this.#migrateDefaultLegacyRows(client);
 	}
 
-	async loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
-		const rows = (await this.#client.unsafe(this.#q.loadIndex)) as IndexRow[];
+	async loadIndex(paths?: readonly string[]): Promise<Iterable<SessionStorageIndexEntry>> {
+		// Equality-bound paths use the leftmost primary-key column; do not scan
+		// the whole session root just to bootstrap one explicit resume.
+		const rows = (
+			paths
+				? (await Promise.all(paths.map(path => this.#client.unsafe(this.#q.loadPathIndex, [path])))).flat()
+				: await this.#client.unsafe(this.#q.loadIndex)
+		) as IndexRow[];
 		return rows.map(row => ({
 			path: row.path,
 			size: toNumber(row.byte_len),

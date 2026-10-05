@@ -6,6 +6,7 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core/thinking";
 import { EventLoopKeepalive } from "@oh-my-pi/pi-agent-core/utils/yield";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
@@ -114,7 +115,7 @@ import {
 import type { ForeignSessionInfo, ForeignSessionSource, ForeignSessionStore } from "./session/foreign-session-store";
 import { resolveResumableSession, type SessionInfo } from "./session/session-listing";
 import { ForkSourceNotFoundError, SessionManager, SessionMoveRefusedError } from "./session/session-manager";
-import { setDefaultSessionStorage } from "./session/session-storage";
+import { getDefaultSessionStorage, setDefaultSessionStorage } from "./session/session-storage";
 import { SqlSessionStorage } from "./session/sql-session-storage";
 import { shouldShowStartupSplash } from "./startup-splash";
 import {
@@ -535,6 +536,7 @@ async function loadTrustedSessionExtensions(
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
+		await getDefaultSessionStorage().ensureCompleteIndex?.();
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
@@ -1192,7 +1194,7 @@ export function parseSqlSessionDbOptions(optionsJson: string): {
  * silently falling back to files (which would split a deployment's transcripts
  * across two backends).
  */
-async function setupSessionStorageBackend(parsed: Args): Promise<void> {
+export async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 	if (parsed.sessionStorage !== "sql") return;
 
 	const url = $env.OMP_SESSION_DB_URL?.trim();
@@ -1211,10 +1213,23 @@ async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 		createTable = parsedOptions.createTable;
 	}
 
+	// Only direct RPC resumes can skip discovery during startup. Every picker,
+	// import, fork, and new-session flow keeps the complete metadata index.
+	const initialPath =
+		parsed.mode === "rpc" &&
+		!parsed.noSession &&
+		!parsed.continue &&
+		!parsed.fork &&
+		!isForeignSessionImport(parsed) &&
+		typeof parsed.resume === "string" &&
+		isSessionPath(parsed.resume)
+			? path.resolve(parsed.resume)
+			: undefined;
 	const storage = await SqlSessionStorage.create({
 		client,
 		createTable,
 		sessionRoot: parsed.sessionDir ?? getSessionsDir(),
+		initialPath,
 	});
 	setDefaultSessionStorage(storage);
 	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
@@ -1228,6 +1243,10 @@ function validateSessionPersistenceArgs(parsed: Pick<Args, "continue" | "noSessi
 	if (parsed.continue) {
 		throw new SessionResolutionError("--continue requires session persistence");
 	}
+}
+
+function isSessionPath(sessionArg: string): boolean {
+	return sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl");
 }
 /**
  * Resolves CLI session flags into an existing, forked, in-memory, or cancelled session manager.
@@ -1247,7 +1266,7 @@ export async function createSessionManager(
 			throw new SessionResolutionError("--fork requires session persistence");
 		}
 		const forkSource = parsed.fork;
-		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
+		if (isSessionPath(forkSource)) {
 			try {
 				return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
 			} catch (err) {
@@ -1282,7 +1301,7 @@ export async function createSessionManager(
 
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
-		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
+		if (isSessionPath(sessionArg)) {
 			return await SessionManager.open(sessionArg, parsed.sessionDir);
 		}
 		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
@@ -1330,6 +1349,7 @@ export async function createSessionManager(
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
+		await getDefaultSessionStorage().ensureCompleteIndex?.();
 		return SessionManager.create(cwd, parsed.sessionDir);
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior

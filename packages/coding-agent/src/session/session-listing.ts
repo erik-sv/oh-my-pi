@@ -562,6 +562,7 @@ async function collectSessionsFromFiles(
  * Exported for testing.
  */
 export async function recoverOrphanedBackups(sessionDir: string, storage: SessionStorage): Promise<void> {
+	await storage.ensureCompleteIndex?.();
 	let backups: string[];
 	try {
 		backups = storage.listFilesSync(sessionDir, "*.bak");
@@ -631,6 +632,7 @@ async function scanSessionDirReadOnly(
 	storage: SessionStorage,
 	withStatus: boolean,
 ): Promise<SessionInfo[]> {
+	await storage.ensureCompleteIndex?.();
 	try {
 		const files = storage.listFilesSync(sessionDir, "*.jsonl");
 		return await collectSessionsFromFiles(files, storage, withStatus);
@@ -659,6 +661,7 @@ export async function listAllSessions(
 	storage: SessionStorage = getDefaultSessionStorage(),
 	sessionsRoot: string = getSessionsDir(),
 ): Promise<SessionInfo[]> {
+	await storage.ensureCompleteIndex?.();
 	try {
 		const files = storage.listFilesSync(sessionsRoot, "*/*.jsonl");
 		return await collectSessionsFromFiles(files, storage, true);
@@ -737,6 +740,7 @@ async function newestSessionFiles(
 	pattern: string,
 	storage: SessionStorage,
 ): Promise<StatedSessionFile[]> {
+	await storage.ensureCompleteIndex?.();
 	let files: string[];
 	try {
 		files =
