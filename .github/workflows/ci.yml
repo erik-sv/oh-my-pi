@@ -337,6 +337,8 @@ jobs:
          # cache version hashes the literal path list, so kata (save) and
          # hosted (restore) must spell it identically, and upload-artifact
          # skips dot-directories by default.
+         # Exact key only: a non-exact (older) main entry would be overwritten
+         # by the source build below, and its read-only files block that copy.
          - name: Restore main-built native addons
            id: natives-cache
            if: github.event_name == 'pull_request'
@@ -344,8 +346,6 @@ jobs:
            with:
               path: ci-natives
               key: ${{ steps.natives-key.outputs.key }}
-              restore-keys: |
-                 ${{ steps.natives-key.outputs.prefix }}
          # Make the addon source visible whenever it is not source-matched,
          # instead of leaving a reviewer to wonder which addons the tests ran.
          - name: Report native addon source
