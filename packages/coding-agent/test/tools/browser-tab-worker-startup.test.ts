@@ -1,15 +1,19 @@
 import { describe, expect, it } from "bun:test";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import { initializeTabWorkerForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import type { WorkerHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker-host";
 
-class FakeStartupWorker {
+class FakeStartupWorker implements WorkerHandle {
 	#errorHandlers = new Set<(error: Error) => void>();
 	#messageHandlers = new Set<(msg: WorkerOutbound) => void>();
 	readonly sent: WorkerInbound[] = [];
 	readonly mode = "worker" as const;
+	readonly id = 1;
+	readonly alive = true;
 
-	send(msg: WorkerInbound): void {
+	send(msg: WorkerInbound): boolean {
 		this.sent.push(msg);
+		return true;
 	}
 
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void {

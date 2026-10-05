@@ -1,7 +1,7 @@
-import { getPuppeteerDir, logger, postmortem, Snowflake, withTimeout, workerHostEntry } from "@oh-my-pi/pi-utils";
+import { getPuppeteerDir, logger, postmortem, Snowflake, withTimeout } from "@oh-my-pi/pi-utils";
 import type { Page, Target } from "puppeteer-core";
 import { callSessionTool } from "../../eval/js/tool-bridge";
-import { buildChildEnv, hasSecretBearingEnv } from "../../exec/child-env";
+import { hasSecretBearingEnv } from "../../exec/child-env";
 import { webpExclusionForModel } from "../../utils/image-loading";
 import type { ToolSession } from "../index";
 import { expandPath } from "../path-utils";
@@ -23,23 +23,12 @@ import type {
 	RunErrorPayload,
 	RunResultOk,
 	SessionSnapshot,
-	Transferable,
-	Transport,
 	WorkerInbound,
 	WorkerInitPayload,
 	WorkerOutbound,
 } from "./tab-protocol";
-
-// Coding-agent binary/bundle workers route through the CLI entrypoint with a
-// hidden argv mode, so compiled/npm builds only need one JavaScript entry.
-
-interface WorkerHandle {
-	send(msg: WorkerInbound, transferList?: Transferable[]): void;
-	onMessage(handler: (msg: WorkerOutbound) => void): () => void;
-	onError(handler: (error: Error) => void): () => void;
-	terminate(): Promise<void>;
-	readonly mode: "worker" | "inline";
-}
+import type { WorkerHandle } from "./tab-worker-host";
+import * as tabWorkerHost from "./tab-worker-host";
 
 export type DialogPolicy = "accept" | "dismiss";
 
@@ -49,6 +38,15 @@ export interface PendingRun {
 	session: ToolSession;
 	signal?: AbortSignal;
 	toolCalls: Map<string, AbortController>;
+	/**
+	 * Worker generation this run was dispatched to (worker backend only).
+	 * Cancellation and tool replies address THIS handle, never `tab.worker`:
+	 * a recycle terminates the timed-out generation and installs a
+	 * replacement, so a late abort would otherwise post to a terminated
+	 * worker (fatal `InvalidStateError`) or cancel an unrelated run on the
+	 * replacement.
+	 */
+	worker?: WorkerHandle;
 	/**
 	 * Fires when `releaseTab` closes the tab out from under an in-flight run
 	 * (sibling `browser close --all`, session-scoped reap, etc.). Composed
@@ -251,7 +249,7 @@ async function acquireTabImpl(
 	let worker: WorkerHandle;
 	try {
 		initPayload = await buildInitPayload(browser, opts);
-		worker = await spawnTabWorker();
+		worker = await tabWorkerHost.spawnTabWorker();
 	} catch (error) {
 		// Failing before the worker took its own hold must release the
 		// temporary one, or the browser's refCount never reaches 0 again.
@@ -272,12 +270,12 @@ async function acquireTabImpl(
 		}
 		if (hasSecretBearingEnv(process.env)) {
 			if (tempHold || browser.refCount === 0) await releaseBrowser(browser, { kill: false });
-			throw inlineFallbackBlockedError("Browser tab Worker initialization failed", error);
+			throw tabWorkerHost.inlineFallbackBlockedError("Browser tab Worker initialization failed", error);
 		}
 		logger.warn("Tab worker init failed; retrying with inline tab worker (no sync-loop guard)", {
 			error: error instanceof Error ? error.message : String(error),
 		});
-		worker = await spawnInlineWorker();
+		worker = await tabWorkerHost.spawnInlineWorker();
 		try {
 			info = await initializeTabWorker(worker, initPayload, opts.timeoutMs + GRACE_MS);
 		} catch (inlineError) {
@@ -316,7 +314,7 @@ async function acquireTabImpl(
 		kindTag: browser.kind.kind,
 		ownerSessionId: opts.ownerSessionId,
 	};
-	worker.onMessage(msg => handleTabMessage(tab, msg));
+	attachWorker(tab, worker);
 	tabs.set(name, tab);
 	return { tab, created: true };
 }
@@ -471,14 +469,34 @@ async function runInTabWithSnapshot(
 			tab.pending.delete(id);
 		}
 	}
+	// Pin the generation at dispatch. `tab.worker` is replaced by a recycle and
+	// terminated by a kill; addressing it later either posts to a dead worker or
+	// cancels somebody else's run on the replacement.
+	const worker = tab.worker;
+	pending.worker = worker;
 	const abort = (): void => {
-		tab.worker.send({ type: "abort", id });
-		for (const ctrl of pending.toolCalls.values()) ctrl.abort(opts.signal?.reason);
+		// Abort listeners run inside whoever fired the signal. For eval cells
+		// that is a bare `setTimeout` in `IdleTimeout`. A throw here is an
+		// uncaught exception, not a rejected promise, so it would kill the
+		// process instead of failing this run.
+		try {
+			worker.send({ type: "abort", id });
+			for (const ctrl of pending.toolCalls.values()) ctrl.abort(opts.signal?.reason);
+		} catch (error) {
+			logBrowserFailure("abort-dispatch", tab, { runId: id, worker, error, session: opts.session });
+		}
+	};
+	let detached = false;
+	const detach = (): void => {
+		if (detached) return;
+		detached = true;
+		opts.signal?.removeEventListener("abort", abort);
+		tab.pending.delete(id);
 	};
 	if (opts.signal?.aborted) abort();
 	else opts.signal?.addEventListener("abort", abort, { once: true });
 	try {
-		tab.worker.send({
+		const dispatched = worker.send({
 			type: "run",
 			id,
 			name,
@@ -486,38 +504,63 @@ async function runInTabWithSnapshot(
 			timeoutMs: opts.timeoutMs,
 			session: snapshot,
 		});
-		try {
-			return await raceWithTimeout(
-				promise,
-				opts.timeoutMs + GRACE_MS,
-				"Browser code execution hung past grace; tab killed",
-				async reason => await forceKillTab(name, reason),
-			);
-		} catch (error) {
-			const runTimedOut =
-				error instanceof ToolError && error.message.startsWith("Browser code execution timed out after ");
-			if (runTimedOut || error instanceof RecoverableWorkerError) {
-				try {
-					if (tab.worker.mode === "inline") {
-						const reason = runTimedOut
-							? "Browser code execution timed out; tab killed"
-							: "Browser request interception cleanup failed; tab killed";
-						await forceKillTab(name, reason);
-					} else {
-						await recycleTimedOutWorkerTab(tab, opts.timeoutMs + GRACE_MS);
-					}
-				} catch (recycleError) {
-					logger.warn("Failed to recycle browser tab worker; killing tab", {
-						error: recycleError instanceof Error ? recycleError.message : String(recycleError),
-					});
-					await forceKillTab(name, "Browser tab worker recovery failed; tab killed");
-				}
-			}
-			throw error;
+		if (!dispatched) {
+			throw new ToolError(`Tab ${JSON.stringify(name)} worker is gone. Reopen it with action:"open".`);
 		}
+		return await raceWithTimeout(
+			promise,
+			opts.timeoutMs + GRACE_MS,
+			"Browser code execution hung past grace; tab killed",
+			async reason => {
+				// Teardown terminates this generation; the run's cancellation
+				// must not outlive it.
+				detach();
+				logBrowserFailure("grace-timeout", tab, {
+					runId: id,
+					worker,
+					reason,
+					timeoutMs: opts.timeoutMs,
+					session: opts.session,
+				});
+				await forceKillTab(tab, reason);
+			},
+		);
+	} catch (error) {
+		// Detach BEFORE recovery: recycling terminates this generation and the
+		// awaits below are exactly the window the incident's abort landed in.
+		detach();
+		const runTimedOut =
+			error instanceof ToolError && error.message.startsWith("Browser code execution timed out after ");
+		if (runTimedOut || error instanceof RecoverableWorkerError) {
+			logBrowserFailure("run-timeout", tab, {
+				runId: id,
+				worker,
+				error,
+				timeoutMs: opts.timeoutMs,
+				session: opts.session,
+			});
+			try {
+				if (worker.mode === "inline") {
+					const reason = runTimedOut
+						? "Browser code execution timed out; tab killed"
+						: "Browser request interception cleanup failed; tab killed";
+					await forceKillTab(tab, reason);
+				} else {
+					await recycleTimedOutWorkerTab(tab, worker, opts.timeoutMs + GRACE_MS);
+				}
+			} catch (recycleError) {
+				logBrowserFailure("recycle-failed", tab, {
+					runId: id,
+					worker,
+					error: recycleError,
+					session: opts.session,
+				});
+				await forceKillTab(tab, "Browser tab worker recovery failed; tab killed");
+			}
+		}
+		throw error;
 	} finally {
-		opts.signal?.removeEventListener("abort", abort);
-		tab.pending.delete(id);
+		detach();
 	}
 }
 
@@ -531,11 +574,9 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	tab.state = "dead";
 	const closeError = postmortem.markExpectedCleanupError(new ToolError(`Tab ${JSON.stringify(name)} was closed`));
 	for (const [id, pending] of tab.pending) {
-		if (tab.backend === "worker") {
-			try {
-				tab.worker.send({ type: "abort", id, expectedCleanup: true });
-			} catch {}
-		}
+		// Cancel on the generation that owns the run; `send` reports delivery
+		// instead of throwing, so an already-dead worker is simply skipped.
+		if (tab.backend === "worker") (pending.worker ?? tab.worker).send({ type: "abort", id, expectedCleanup: true });
 		for (const ctrl of pending.toolCalls.values()) ctrl.abort(closeError);
 		// Propagate the closure into the cmux run's abort signal so
 		// `wait(...)`, in-flight cmux socket calls, and the facade proxies
@@ -580,18 +621,23 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 		} catch (error) {
 			closeError ??= error;
 		} finally {
-			tabs.delete(name);
+			evictTab(name, tab);
 		}
 		if (closeError) throw closeError;
 		return true;
 	}
 	let cleanupError: unknown;
-	let forced = false;
+	let forced = !wasAlive;
 	if (wasAlive) {
-		try {
-			tab.worker.send({ type: "close" });
-			await waitForClosed(tab);
-		} catch {
+		// An undeliverable close means the worker is already gone: skip the
+		// handshake and go straight to the orphan-target sweep.
+		if (tab.worker.send({ type: "close" })) {
+			try {
+				await waitForClosed(tab);
+			} catch {
+				forced = true;
+			}
+		} else {
 			forced = true;
 		}
 	}
@@ -617,7 +663,7 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	} catch (error) {
 		cleanupError ??= error;
 	} finally {
-		tabs.delete(name);
+		evictTab(name, tab);
 	}
 	if (cleanupError) throw cleanupError;
 	return true;
@@ -697,7 +743,20 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 	};
 }
 
-function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {
+/**
+ * Bind a worker generation to the tab it now serves. Both listeners are
+ * released by {@link WorkerHandle.terminate}, so a replaced generation cannot
+ * keep talking to the tab.
+ */
+function attachWorker(tab: WorkerTabSession, worker: WorkerHandle): void {
+	worker.onMessage(msg => handleTabMessage(tab, worker, msg));
+	worker.onError(error => handleWorkerFailure(tab, worker, error));
+}
+
+function handleTabMessage(tab: WorkerTabSession, worker: WorkerHandle, msg: WorkerOutbound): void {
+	// A superseded generation can still have messages queued; they must never
+	// settle work the replacement owns.
+	if (tab.worker !== worker) return;
 	if (msg.type === "result") {
 		const pending = tab.pending.get(msg.id);
 		if (!pending) return;
@@ -714,19 +773,55 @@ function handleTabMessage(tab: WorkerTabSession, msg: WorkerOutbound): void {
 		return;
 	}
 	if (msg.type === "tool-call") {
-		void dispatchToolCall(tab, msg);
+		void dispatchToolCall(tab, worker, msg);
 		return;
 	}
 	if (msg.type === "log") logWorkerMessage(msg);
 }
 
+/**
+ * A worker generation died on its own (uncaught worker error, `messageerror`).
+ * Reclaiming the browser hold stays with `releaseTab`/`acquireTab`: starting
+ * async CDP teardown from an event handler would race the very teardown paths
+ * this ownership model fixes.
+ */
+function handleWorkerFailure(tab: WorkerTabSession, worker: WorkerHandle, error: Error): void {
+	if (tab.worker !== worker || tab.state !== "alive") return;
+	logBrowserFailure("worker-error", tab, { worker, error });
+	abandonWorkerGeneration(tab, worker, `Browser tab worker failed: ${boundedDetail(error.message)}`);
+}
+
+/**
+ * The generation can no longer be talked to. Settle the runs it owed instead of
+ * making each caller wait out its grace window, and mark the tab dead so the
+ * next `run` says why and the next `open` rebuilds it.
+ */
+function abandonWorkerGeneration(tab: WorkerTabSession, worker: WorkerHandle, reason: string): void {
+	if (tab.worker !== worker || tab.state !== "alive") return;
+	tab.state = "dead";
+	killedTabs.set(tab.name, reason);
+	settlePendingRuns(tab, worker, new ToolError(reason));
+	void worker.terminate().catch(() => undefined);
+}
+
+/** Settle every run owned by `worker`; that generation can no longer answer. */
+function settlePendingRuns(tab: WorkerTabSession, worker: WorkerHandle, error: Error): void {
+	for (const [id, pending] of tab.pending) {
+		if (pending.worker && pending.worker !== worker) continue;
+		tab.pending.delete(id);
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
+		pending.reject(error);
+	}
+}
+
 async function dispatchToolCall(
 	tab: WorkerTabSession,
+	worker: WorkerHandle,
 	msg: Extract<WorkerOutbound, { type: "tool-call" }>,
 ): Promise<void> {
 	const pending = tab.pending.get(msg.runId);
 	if (!pending?.session.cwd) {
-		safeSend(tab, {
+		safeSend(tab, worker, {
 			type: "tool-reply",
 			id: msg.id,
 			reply: {
@@ -750,22 +845,25 @@ async function dispatchToolCall(
 				// already pushes its own helper status via the display channel.
 			},
 		});
-		safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
+		safeSend(tab, worker, { type: "tool-reply", id: msg.id, reply: { ok: true, value } });
 	} catch (error) {
-		safeSend(tab, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toErrorPayload(error) } });
+		safeSend(tab, worker, { type: "tool-reply", id: msg.id, reply: { ok: false, error: toErrorPayload(error) } });
 	} finally {
 		pending.toolCalls.delete(msg.id);
 		pending.signal?.removeEventListener("abort", onParentAbort);
 	}
 }
 
-function safeSend(tab: WorkerTabSession, msg: WorkerInbound): void {
-	if (tab.state !== "alive") return;
-	try {
-		tab.worker.send(msg);
-	} catch (err) {
-		logger.debug("tab worker send failed", { error: err instanceof Error ? err.message : String(err) });
-	}
+/**
+ * Reply to the generation that asked, and only while it still owns the tab. A
+ * reply that cannot be delivered means that generation is gone: the run waiting
+ * on it can never complete, so abandon it now rather than at the grace timeout.
+ */
+function safeSend(tab: WorkerTabSession, worker: WorkerHandle, msg: WorkerInbound): void {
+	if (tab.state !== "alive" || tab.worker !== worker) return;
+	if (worker.send(msg)) return;
+	logBrowserFailure("send-dropped", tab, { worker, reason: msg.type });
+	abandonWorkerGeneration(tab, worker, "Browser tab worker stopped accepting messages");
 }
 
 function toErrorPayload(error: unknown): RunErrorPayload {
@@ -781,9 +879,19 @@ function toErrorPayload(error: unknown): RunErrorPayload {
 	return { name: "Error", message: String(error), isAbort: false, isToolError: false };
 }
 
-async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number): Promise<void> {
-	const oldWorker = tab.worker;
-	await oldWorker.terminate().catch(() => undefined);
+async function recycleTimedOutWorkerTab(
+	tab: WorkerTabSession,
+	previous: WorkerHandle,
+	timeoutMs: number,
+): Promise<void> {
+	await previous.terminate().catch(() => undefined);
+	// Anything still registered against the terminated generation will never be
+	// answered; settle it before a replacement can claim the tab.
+	settlePendingRuns(
+		tab,
+		previous,
+		postmortem.markExpectedCleanupError(new ToolError(`Tab ${JSON.stringify(tab.name)} worker was recycled`)),
+	);
 	const browserWSEndpoint = tab.browser.browser.wsEndpoint();
 	if (!browserWSEndpoint) throw new ToolError("Browser websocket endpoint is unavailable");
 	const payload: WorkerInitPayload = {
@@ -796,25 +904,17 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 		// otherwise init stalls, times out, and the tab gets force-killed.
 		recover: true,
 	};
-	let worker = await spawnTabWorker();
+	let worker = await tabWorkerHost.spawnTabWorker();
 	try {
-		const info = await initializeTabWorker(worker, payload, timeoutMs);
-		tab.worker = worker;
-		tab.info = info;
-		tab.state = "alive";
-		worker.onMessage(msg => handleTabMessage(tab, msg));
+		adoptRecycledWorker(tab, previous, worker, await initializeTabWorker(worker, payload, timeoutMs));
 	} catch (error) {
 		await worker.terminate().catch(() => undefined);
 		if (hasSecretBearingEnv(process.env)) {
-			throw inlineFallbackBlockedError("Timed-out browser tab Worker recycling failed", error);
+			throw tabWorkerHost.inlineFallbackBlockedError("Timed-out browser tab Worker recycling failed", error);
 		}
-		worker = await spawnInlineWorker();
+		worker = await tabWorkerHost.spawnInlineWorker();
 		try {
-			const info = await initializeTabWorker(worker, payload, timeoutMs);
-			tab.worker = worker;
-			tab.info = info;
-			tab.state = "alive";
-			worker.onMessage(msg => handleTabMessage(tab, msg));
+			adoptRecycledWorker(tab, previous, worker, await initializeTabWorker(worker, payload, timeoutMs));
 		} catch (inlineError) {
 			await worker.terminate().catch(() => undefined);
 			const finalError = new ToolError(
@@ -826,23 +926,60 @@ async function recycleTimedOutWorkerTab(tab: WorkerTabSession, timeoutMs: number
 	}
 }
 
-async function forceKillTab(name: string, reason: string): Promise<void> {
-	const tab = tabs.get(name);
-	if (!tab) return;
-	killedTabs.set(name, reason);
+/**
+ * Publish a freshly initialized generation onto the tab, but only while the
+ * tab is still registered, still owned by the generation we replaced, and still
+ * alive. Losing that race means a concurrent `releaseTab`/`forceKillTab`/reopen
+ * owns the name now: adopting anyway would resurrect a torn-down tab and strand
+ * the new worker outside the registry.
+ */
+function adoptRecycledWorker(tab: WorkerTabSession, previous: WorkerHandle, next: WorkerHandle, info: ReadyInfo): void {
+	if (tabs.get(tab.name) !== tab || tab.worker !== previous || tab.state !== "alive") {
+		logBrowserFailure("recycle-superseded", tab, { worker: next });
+		void next.terminate().catch(() => undefined);
+		return;
+	}
+	tab.worker = next;
+	tab.info = info;
+	attachWorker(tab, next);
+}
+
+/**
+ * Tear down the tab a run owns. The caller passes the tab it dispatched to, not
+ * a name: teardown awaits CDP and browser cleanup, and by the time a wedged run
+ * gets here the name may already belong to a reopened tab or to a concurrent
+ * `releaseTab`. Claiming the registry entry up front makes teardown single-owner
+ * (a losing caller returns instead of releasing a browser hold twice) and
+ * frees the name for an immediate reopen.
+ */
+async function forceKillTab(tab: TabSession, reason: string): Promise<void> {
+	if (tabs.get(tab.name) !== tab || tab.state !== "alive") return;
 	tab.state = "dead";
+	tabs.delete(tab.name);
+	killedTabs.set(tab.name, reason);
 	const error = postmortem.markExpectedCleanupError(new ToolError(reason));
-	for (const pending of tab.pending.values()) pending.reject(error);
+	for (const pending of tab.pending.values()) {
+		for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
+		pending.reject(error);
+	}
 	tab.pending.clear();
 	if (tab.backend === "cmux") {
 		await releaseBrowser(tab.browser, { kill: false });
-		tabs.delete(name);
 		return;
 	}
 	await tab.worker.terminate().catch(() => undefined);
 	if (tab.kindTag === "headless") await closeOrphanTarget(tab);
 	await releaseBrowser(tab.browser, { kill: false });
-	tabs.delete(name);
+}
+
+/**
+ * Drop the registry entry only while it still points at the tab we tore down.
+ * Teardown awaits CDP and browser cleanup, and another caller can reopen the
+ * name inside that window; deleting blindly strands the newer tab's worker and
+ * browser hold (same guard `releaseBrowser` applies to handles).
+ */
+function evictTab(name: string, tab: TabSession): void {
+	if (tabs.get(name) === tab) tabs.delete(name);
 }
 
 async function closeOrphanTarget(tab: WorkerTabSession): Promise<void> {
@@ -927,92 +1064,69 @@ async function raceWithTimeout<T>(
 	}
 }
 
-async function spawnTabWorker(): Promise<WorkerHandle> {
-	try {
-		const hostEntry = workerHostEntry();
-		const env = buildChildEnv("untrusted-js", { parentEnv: process.env });
-		const worker = hostEntry
-			? new Worker(hostEntry, { type: "module", argv: ["__omp_worker_tab"], env })
-			: new Worker(new URL("./tab-worker-entry.ts", import.meta.url).href, { type: "module", env });
-		return wrapBunWorker(worker);
-	} catch (err) {
-		if (hasSecretBearingEnv(process.env)) throw inlineFallbackBlockedError("Bun Worker spawn failed", err);
-		logger.warn("Bun Worker spawn failed; using inline tab worker (no sync-loop guard)", {
-			error: err instanceof Error ? err.message : String(err),
-		});
-		return spawnInlineWorker();
-	}
+type BrowserFailurePhase =
+	| "abort-dispatch"
+	| "grace-timeout"
+	| "run-timeout"
+	| "recycle-failed"
+	| "recycle-superseded"
+	| "send-dropped"
+	| "worker-error";
+
+interface BrowserFailureDetail {
+	runId?: string;
+	worker?: WorkerHandle;
+	error?: unknown;
+	reason?: string;
+	timeoutMs?: number;
+	session?: ToolSession;
 }
 
-function inlineFallbackBlockedError(context: string, cause: unknown): ToolError {
-	const error = new ToolError(`${context}; inline fallback is disabled while the parent environment contains secrets`);
-	Object.defineProperty(error, "cause", { value: cause, configurable: true });
-	return error;
+const FAILURE_DETAIL_LIMIT = 300;
+
+/** Keep a wedged page's multi-kilobyte error out of the log file. */
+function boundedDetail(text: string): string {
+	return text.length <= FAILURE_DETAIL_LIMIT
+		? text
+		: `${text.slice(0, FAILURE_DETAIL_LIMIT)}...(+${text.length - FAILURE_DETAIL_LIMIT} chars)`;
 }
 
-function wrapBunWorker(worker: Worker): WorkerHandle {
-	return {
-		mode: "worker",
-		send(msg, transferList) {
-			worker.postMessage(msg, { transfer: transferList ?? [] });
-		},
-		onMessage(handler) {
-			const wrap = (event: MessageEvent): void => handler(event.data as WorkerOutbound);
-			worker.addEventListener("message", wrap);
-			return () => worker.removeEventListener("message", wrap);
-		},
-		onError(handler) {
-			const onError = (event: ErrorEvent): void => handler(errorFromWorkerEvent(event));
-			const onMessageError = (event: MessageEvent): void =>
-				handler(new ToolError(`Tab worker message error: ${String(event.data)}`));
-			worker.addEventListener("error", onError);
-			worker.addEventListener("messageerror", onMessageError);
-			return () => {
-				worker.removeEventListener("error", onError);
-				worker.removeEventListener("messageerror", onMessageError);
-			};
-		},
-		async terminate() {
-			worker.terminate();
-		},
-	};
-}
+/** `error` marks a failure that ended a run or a tab; `warn` marks recovery. */
+const FAILURE_LOG_LEVEL: Record<BrowserFailurePhase, "error" | "warn"> = {
+	"abort-dispatch": "error",
+	"grace-timeout": "warn",
+	"run-timeout": "warn",
+	"recycle-failed": "error",
+	"recycle-superseded": "warn",
+	"send-dropped": "error",
+	"worker-error": "error",
+};
 
 /**
- * Inline fallback for environments where Bun cannot compile or spawn the worker
- * entry. This preserves normal browser behavior but cannot interrupt synchronous
- * infinite loops because user code runs on the main thread.
+ * Forensics for the worker/timeout boundaries that produced the fatal browser
+ * crash: enough identity to correlate a log line with a tab, run, session and
+ * worker generation, and nothing else. Evaluated code, page content, prompts,
+ * and environment never reach the log; the cause string is bounded.
  */
-async function spawnInlineWorker(): Promise<WorkerHandle> {
-	const hostListeners = new Set<(message: WorkerOutbound) => void>();
-	const workerListeners = new Set<(message: WorkerInbound) => void>();
-	const workerTransport: Transport = {
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of hostListeners) listener(msg as WorkerOutbound);
-			}),
-		onMessage: handler => {
-			const typed = handler as (message: WorkerInbound) => void;
-			workerListeners.add(typed);
-			return () => workerListeners.delete(typed);
-		},
-		close: () => {},
-	};
-	const { WorkerCore } = await import("./tab-worker");
-	new WorkerCore(workerTransport);
-	return {
-		mode: "inline",
-		send: msg =>
-			queueMicrotask(() => {
-				for (const listener of workerListeners) listener(msg);
-			}),
-		onMessage: handler => {
-			hostListeners.add(handler);
-			return () => hostListeners.delete(handler);
-		},
-		onError: () => () => {},
-		async terminate() {},
-	};
+function logBrowserFailure(phase: BrowserFailurePhase, tab: TabSession, detail: BrowserFailureDetail = {}): void {
+	const { error } = detail;
+	const log = FAILURE_LOG_LEVEL[phase] === "error" ? logger.error : logger.warn;
+	log("Browser tab failure", {
+		phase,
+		tab: tab.name,
+		backend: tab.backend,
+		browser: tab.kindTag,
+		target: tab.targetId,
+		runId: detail.runId,
+		sessionId: detail.session?.getSessionId?.() ?? tab.ownerSessionId,
+		worker: detail.worker && `${detail.worker.mode}#${detail.worker.id}`,
+		workerAlive: detail.worker?.alive,
+		pendingRuns: tab.pending.size,
+		timeoutMs: detail.timeoutMs,
+		reason: detail.reason,
+		errorName: error instanceof Error ? error.name : undefined,
+		error: error === undefined ? undefined : boundedDetail(error instanceof Error ? error.message : String(error)),
+	});
 }
 
 async function initializeTabWorker(
@@ -1030,7 +1144,9 @@ async function initializeTabWorker(
 		reject(new ToolError(`Tab worker failed during startup: ${error.message}`));
 	});
 	try {
-		worker.send({ type: "init", payload });
+		if (!worker.send({ type: "init", payload })) {
+			throw new ToolError("Tab worker exited before initialization");
+		}
 		return await raceWithTimeout(promise, timeoutMs, "Timed out initializing browser tab worker");
 	} finally {
 		unlisten();
@@ -1044,10 +1160,4 @@ export function initializeTabWorkerForTest(
 	timeoutMs: number,
 ): Promise<ReadyInfo> {
 	return initializeTabWorker(worker, payload, timeoutMs);
-}
-
-function errorFromWorkerEvent(event: ErrorEvent): Error {
-	if (event.error instanceof Error) return event.error;
-	if (event.message) return new Error(event.message);
-	return new Error("Unknown tab worker error");
 }

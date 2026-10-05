@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Bound browser cancellation and teardown to the worker generation that owns each run. Timeout, recycle, and close races no longer post to terminated workers, abort replacement runs, or remove reopened tabs.
+- Settle browser runs when worker replies cannot be delivered, detach worker listeners during teardown, and log bounded tab/run/session/generation diagnostics at failure boundaries.
+
 ## [17.0.5] - 2026-07-18
 
 ### Added
