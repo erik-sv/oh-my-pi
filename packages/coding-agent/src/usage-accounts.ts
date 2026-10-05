@@ -18,7 +18,7 @@ export interface UsageAccountIdentity {
 /** Read only account identity fields from the credential pool. Secret values never leave AuthStorage. */
 export function collectStoredUsageAccounts(authStorage: AuthStorage): UsageAccountIdentity[] {
 	const accounts: UsageAccountIdentity[] = [];
-	const all = authStorage.getAll();
+	const all = authStorage.credentials.all();
 	for (const provider in all) {
 		const entry = all[provider];
 		const credentials = Array.isArray(entry) ? entry : [entry];
@@ -166,11 +166,12 @@ export function isActionableUsageDisable(
 }
 
 /** Account label composed only from non-secret identity fields. */
-export function usageAccountLabel(account: UsageAccountIdentity): string {
+export function usageAccountLabel(account: UsageAccountIdentity, redaction?: Map<string, string>): string {
 	if (account.type === "api_key") return "API key";
 	const base = account.email ?? account.accountId ?? account.projectId ?? account.enterpriseUrl ?? "OAuth account";
+	const masked = redaction?.get(base) ?? base;
 	const org = account.orgName ?? account.orgId;
-	return !org || org === base ? base : `${base} · ${org}`;
+	return !org || org === base ? masked : `${masked} · ${redaction?.get(org) ?? org}`;
 }
 
 /** Disabled account label composed only from non-secret tombstone identity fields. */

@@ -4,13 +4,13 @@ Bitmap-frame context compression for vision-capable LLMs.
 
 Instead of asking an LLM to summarize discarded conversation history, snapcompact serializes it and renders the text into dense PNG frames of pixel-font glyphs that vision models read back directly. The whole pass is local and deterministic — no LLM call, no API key, no latency beyond rendering. Rasterization and PNG encoding happen in native code (`@oh-my-pi/pi-natives`).
 
-Built for [oh-my-pi](https://github.com/can1357/oh-my-pi)'s compaction pipeline, but the rendering API works on arbitrary text.
+Built for [omp](https://github.com/can1357/oh-my-pi)'s compaction pipeline, but the rendering API works on arbitrary text.
 
 ## How it works
 
 1. Discarded history is serialized to compact text (`serializeConversation`), with per-tool-result and per-argument character caps.
 2. Text is normalized for the selected native font (`normalize`): ANSI sequences stripped, whitespace collapsed, newline runs folded into a single full-block glyph, box drawing and compatibility symbols folded to ASCII, semantic emoji folded to ASCII labels, decorative emoji dropped, and non-Latin glyphs preserved when either the selected font or the embedded Silver fallback can render them.
-3. Pages of text are rasterized into PNG frames (`render` / `renderMany`). Frame width is fixed per shape; height hugs the rows actually printed, so a partially filled frame never bills blank pixel rows.
+3. Pages of text are rasterized into PNG frames (`render` / `renderMany`). Frame width is fixed per shape; height hugs the rows actually printed, with a 64px minimum so short final frames remain valid for vision processors.
 4. Frames persist in the compaction entry's `preserveData` and are re-attached to the summary message on every context rebuild.
 
 Frame shapes are provider-aware, chosen by SQuAD recall evals (see `research/`) against real provider billing:

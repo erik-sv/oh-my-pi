@@ -5,17 +5,9 @@ import {
 	ASIDE_MESSAGE_DISCARD,
 	type CommittableAsideMessage,
 } from "@oh-my-pi/pi-agent-core";
-import {
-	type AsyncJob,
-	AsyncJobManager,
-	type AsyncJobType,
-	getAsyncJobDurationMs,
-} from "@oh-my-pi/pi-coding-agent/async";
+import { type AsyncJob, AsyncJobManager, type AsyncJobType } from "@oh-my-pi/pi-coding-agent/async";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { YieldQueue } from "@oh-my-pi/pi-coding-agent/session/yield-queue";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { type CoordinationDetails } from "@oh-my-pi/pi-tui/tools/hub";
-import { HubTool } from "../src/tools/hub";
 
 type AsyncEntry = {
 	jobId: string;
@@ -58,20 +50,6 @@ function asyncDetails(message: AgentMessage): AsyncDetails {
 	return (message as CustomMessage<AsyncDetails>).details ?? { jobs: [] };
 }
 
-function createToolSession(asyncJobManager?: AsyncJobManager): ToolSession {
-	return {
-		cwd: process.cwd(),
-		hasUI: false,
-		settings: {
-			get: () => undefined,
-		},
-		getSessionFile: () => null,
-		getSessionSpawns: () => null,
-		getAgentId: () => null,
-		asyncJobManager,
-	} as unknown as ToolSession;
-}
-
 function createHarness(initialStreaming: boolean) {
 	let streaming = initialStreaming;
 	const followUps: AgentMessage[] = [];
@@ -100,7 +78,7 @@ function createHarness(initialStreaming: boolean) {
 				jobId,
 				result,
 				job,
-				durationMs: job ? getAsyncJobDurationMs(job) : undefined,
+				durationMs: job ? Math.max(0, Date.now() - job.startTime) : undefined,
 			});
 		},
 	});
@@ -126,22 +104,6 @@ afterEach(async () => {
 });
 
 describe("async result yield queue delivery", () => {
-	test("job poll acknowledgement suppresses already staged completion", async () => {
-		const harness = createHarness(true);
-		const jobId = harness.manager.register("bash", "race job", async () => "inline result");
-
-		await harness.manager.waitForAll();
-		expect(await harness.manager.drainDeliveries({ timeoutMs: 2_000 })).toBe(true);
-
-		const tool = new HubTool(createToolSession(harness.manager));
-		const result = await tool.execute("tool-call", { op: "wait", ids: [jobId] });
-		expect((result.details as CoordinationDetails)?.jobs?.find(job => job.id === jobId)?.status).toBe("completed");
-
-		await harness.queue.flush("streaming");
-
-		expect(harness.followUps).toHaveLength(0);
-	});
-
 	test("multiple completions in one yield window become one follow-up", async () => {
 		const harness = createHarness(true);
 		const firstJobId = harness.manager.register("bash", "first", async () => "first result");

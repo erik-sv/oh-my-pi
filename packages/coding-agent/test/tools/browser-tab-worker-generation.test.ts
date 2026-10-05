@@ -24,6 +24,7 @@
  */
 
 import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { type } from "@oh-my-pi/omptype";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
@@ -160,7 +161,7 @@ function makeSession(): ToolSession {
 	return {
 		cwd: process.cwd(),
 		hasUI: false,
-		settings: { get: () => undefined },
+		settings: Settings.isolated(),
 		getSessionFile: () => null,
 		getSessionId: () => "session-generation",
 	} as unknown as ToolSession;
@@ -440,7 +441,7 @@ describe("browser tab-supervisor: worker generations", () => {
 		const session = {
 			cwd: process.cwd(),
 			hasUI: false,
-			settings: { get: () => undefined },
+			settings: Settings.isolated(),
 			getSessionFile: () => null,
 			getSessionId: () => "session-containment",
 			getToolByName: () => ({

@@ -31,6 +31,7 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import {
@@ -183,7 +184,7 @@ describe("browser tab-supervisor: abort during force-kill", () => {
 		const session = {
 			cwd: process.cwd(),
 			hasUI: false,
-			settings: { get: () => undefined },
+			settings: Settings.isolated(),
 			getSessionFile: () => null,
 			getSessionId: () => "session-abort-during-kill",
 		} as unknown as ToolSession;

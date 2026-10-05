@@ -74,16 +74,18 @@ bun install
 
 # 5.5) Ensure the host's native addon matches both this release and its source.
 #      `*.node` is gitignored and the workspace ships no prebuilt, so a fresh
-#      checkout on any OS must compile crates/pi-natives once. A version sentinel
-#      catches cross-release skew, while a source fingerprint catches native
+#      checkout on any OS must compile crates/pi-natives once. The post-link
+#      version stamp (`__piNativesBuildVersion()`, written by
+#      scripts/stamp-native-version.ts) catches cross-release skew, while a source fingerprint catches native
 #      changes made without a package-version bump. Finally, a fresh Bun process
 #      loads the addon and checks required exports. Isolating that dlopen keeps a
 #      stale or CPU-incompatible addon from taking down this updater process.
 NATIVE_DIR="$FORK_DIR/packages/natives/native"
 HOST_TAG="$(bun -e 'process.stdout.write(process.platform + "-" + process.arch)')"
 NATIVE_VER="$(grep -m1 '"version"' packages/natives/package.json | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo '0.0.0')"
-SENTINEL="__piNativesV$(printf '%s' "$NATIVE_VER" | tr -c 'A-Za-z0-9' '_')"
-REQUIRED_NATIVE_EXPORTS="$SENTINEL,snapcompactSupportedChars"
+# Byte prefix of the stamp slot; the exact version is confirmed by the probe.
+VERSION_STAMP="PI_NATIVES_VERSION_STAMP:$NATIVE_VER"
+REQUIRED_NATIVE_EXPORTS="__piNativesBuildVersion,snapcompactSupportedChars"
 NATIVE_FINGERPRINT_FILE="$NATIVE_DIR/.source-fingerprint-$HOST_TAG.node"
 CURRENT_NATIVE_SOURCE="$(
   git rev-parse \
@@ -95,7 +97,7 @@ CURRENT_NATIVE_SOURCE="$(
 )"
 
 native_exports_present() {
-  PI_REQUIRED_NATIVE_EXPORTS="$REQUIRED_NATIVE_EXPORTS" bun -e '
+  PI_REQUIRED_NATIVE_EXPORTS="$REQUIRED_NATIVE_EXPORTS" PI_NATIVE_VERSION="$NATIVE_VER" bun -e '
     const { pathToFileURL } = await import("node:url");
     const entrypoint = pathToFileURL(`${process.cwd()}/packages/natives/native/index.js`);
     entrypoint.searchParams.set("update-smoke", `${Date.now()}-${Math.random()}`);
@@ -106,6 +108,11 @@ native_exports_present() {
       console.error(`missing required native exports: ${missing.join(", ")}`);
       process.exit(1);
     }
+    const stamped = bindings.__piNativesBuildVersion();
+    if (stamped !== process.env.PI_NATIVE_VERSION) {
+      console.error(`native addon stamped ${stamped ?? "(unstamped)"}, want ${process.env.PI_NATIVE_VERSION}`);
+      process.exit(1);
+    }
   ' >/dev/null 2>&1
 }
 
@@ -113,7 +120,7 @@ native_addon_current() {
   local f recorded_fingerprint=""
   for f in "$NATIVE_DIR/pi_natives.${HOST_TAG}"*.node; do
     [ -e "$f" ] || continue
-    grep -qa "$SENTINEL" "$f" || continue
+    grep -qaF "$VERSION_STAMP" "$f" || continue
     [ -f "$NATIVE_FINGERPRINT_FILE" ] || return 1
     IFS= read -r recorded_fingerprint < "$NATIVE_FINGERPRINT_FILE" || return 1
     [ "$recorded_fingerprint" = "$CURRENT_NATIVE_SOURCE" ] || return 1

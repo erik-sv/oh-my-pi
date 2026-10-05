@@ -9,6 +9,7 @@ import {
 	type WriteTextAtomicOptions,
 } from "./session-storage";
 import { isAssistantMessageLine } from "./session-entries";
+import { enoent } from "./session-storage-errors";
 import {
 	overlayTitleSlotContent,
 	overlayTitleSlotPrefix,
@@ -91,15 +92,6 @@ interface IndexAppend {
 }
 
 const RESOLVED = Promise.resolve();
-
-function enoent(p: string): NodeJS.ErrnoException {
-	const err = new Error(`ENOENT: no such file, '${p}'`) as NodeJS.ErrnoException;
-	err.code = "ENOENT";
-	err.errno = -2;
-	err.path = p;
-	err.syscall = "open";
-	return err;
-}
 
 function byteLength(text: string): number {
 	return Buffer.byteLength(text, "utf-8");
@@ -261,16 +253,17 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
-		const normalizedDir = dir.replaceAll("\\", "/");
-		const prefix = normalizedDir.endsWith("/") ? normalizedDir : `${normalizedDir}/`;
+		// Fork: SQL-backed listing matches nested globs (`*/*.jsonl`) relative to `dir`;
+		// both sides are resolved so platform separators and relative dirs compare equal.
+		const resolvedDir = path.resolve(dir).replaceAll("\\", "/");
+		const prefix = resolvedDir.endsWith("/") ? resolvedDir : `${resolvedDir}/`;
 		const glob = new Bun.Glob(pattern);
 		const out: string[] = [];
-		for (const path of this.#index.keys()) {
-			const normalizedPath = path.replaceAll("\\", "/");
-			if (!normalizedPath.startsWith(prefix)) continue;
-			const relativePath = normalizedPath.slice(prefix.length);
-			if (!glob.match(relativePath)) continue;
-			out.push(path);
+		for (const key of this.#index.keys()) {
+			const normalizedKey = path.resolve(key).replaceAll("\\", "/");
+			if (!normalizedKey.startsWith(prefix)) continue;
+			if (!glob.match(normalizedKey.slice(prefix.length))) continue;
+			out.push(key);
 		}
 		return out;
 	}

@@ -11,11 +11,15 @@ export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
 export const COMPUTER_WORKER_ARG = "__omp_worker_computer";
 /** Daemon-broker selector shared by the CLI dispatcher and worker launcher. */
 export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
+/** IDA-host selector shared by the CLI dispatcher and the broker daemon spec. */
+export const IDA_HOST_WORKER_ARG = "__omp_worker_ida_host";
 /** LSP-multiplexer selector shared by the CLI dispatcher and worker launcher. */
 export const LSP_MUX_WORKER_ARG = "__omp_worker_lsp_mux";
 /** Activity-worker selector shared by the CLI dispatcher and worker launcher. */
 export const STATS_ACTIVITY_WORKER_ARG = "__omp_worker_stats_activity";
 /** Browser-tab subprocess selector shared by the CLI dispatcher and worker launcher. */
 export const TAB_PROCESS_WORKER_ARG = "__omp_worker_tab_process";
+/** Text-prediction daemon selector shared by the CLI dispatcher and the broker daemon spec. */
+export const TEXT_PREDICT_WORKER_ARG = "__omp_worker_text_predict";
 /** Terminal-output selector shared by the CLI dispatcher and worker launcher. */
 export const TERMINAL_OUTPUT_WORKER_ARG = "__omp_worker_terminal_output";

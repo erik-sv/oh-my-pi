@@ -6,8 +6,9 @@ description: >
 
    omp-kata jobs use the cluster remote cache. GitHub-hosted jobs use an
    actions/cache-backed disk cache, seeded per scope by whichever job owns
-   it (ci.yml's native_addons for `linux` and rust_validate for
-   `linux-validate`; bazel-cache-warm for the `release-darwin-*` scopes)
+   it (ci.yml's native_addons for `linux-x64`, native_addons_cross for
+   `linux`, rust_validate for `linux-validate`; bazel-cache-warm for the
+   `release-darwin-*` scopes)
    on the same runner image — cross-host action keys never hit, so the disk
    cache is hosted-only and its key carries a schema version (v1 was
    poisoned by a kata-produced export that silently missed every action).
@@ -26,10 +27,24 @@ description: >
    entries untouched for 14 days are pruned before the build so
    ever-seeding archives don't grow without bound.
 
+   Only main saves. actions/cache entries are scoped to the ref that saved
+   them: a tag or branch run can read main's archives, but whatever it saves
+   is readable only by that same ref, while still counting against the
+   shared 10 GB repo quota. A tag-dispatched release saved a ~5 GB darwin
+   archive under refs/tags/v18.2.10 and GitHub's LRU eviction then dropped
+   main's darwin archives, so the next release built cold.
+
 inputs:
    scope:
       description: Disk-cache key discriminator; one producing job per scope
       required: true
+   fallback-scope:
+      description: >
+         Optional scope whose newest archive is the last restore fallback
+         (e.g. the sibling darwin target on the same runner image, which
+         shares every exec-config action). Empty disables it.
+      required: false
+      default: ""
 
 outputs:
    rc:
@@ -39,7 +54,7 @@ outputs:
       description: Exact GitHub cache key for a later explicit save
       value: ${{ steps.backend.outputs.cache-key }}
    save-needed:
-      description: Whether a disk-cache build can save a new exact-key archive
+      description: Whether this run should save a new exact-key disk-cache archive (hosted, inexact restore, on main)
       value: ${{ steps.compose.outputs.save-needed }}
    remote:
       description: Whether the shell probe selected the cluster remote cache
@@ -67,11 +82,16 @@ runs:
            key="bazel-disk-v3-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-$CONFIG_HASH-$SOURCE_HASH"
            prefix="bazel-disk-v3-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-$CONFIG_HASH-"
            bare_prefix="bazel-disk-v3-${{ inputs.scope }}-${{ runner.os }}-${{ runner.arch }}-"
+           fallback_prefix=""
+           if [ -n "${{ inputs.fallback-scope }}" ]; then
+             fallback_prefix="bazel-disk-v3-${{ inputs.fallback-scope }}-${{ runner.os }}-${{ runner.arch }}-"
+           fi
            {
              echo "remote=$remote"
              echo "cache-key=$key"
              echo "cache-prefix=$prefix"
              echo "cache-bare-prefix=$bare_prefix"
+             echo "cache-fallback-prefix=$fallback_prefix"
            } >> "$GITHUB_OUTPUT"
 
       - name: Restore bazel disk cache
@@ -96,6 +116,7 @@ runs:
            restore-keys: |
               ${{ steps.backend.outputs.cache-prefix }}
               ${{ steps.backend.outputs.cache-bare-prefix }}
+              ${{ steps.backend.outputs.cache-fallback-prefix }}
 
       - name: Compose cache config
         id: compose
@@ -103,10 +124,11 @@ runs:
         env:
            REMOTE: ${{ steps.backend.outputs.remote }}
            RESTORE_HIT: ${{ steps.restore.outputs.cache-hit }}
+           ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
         run: |
            set -euo pipefail
            save_needed=false
-           if [ "$REMOTE" != "true" ] && [ "$RESTORE_HIT" != "true" ]; then
+           if [ "$REMOTE" != "true" ] && [ "$RESTORE_HIT" != "true" ] && [ "$ON_MAIN" = "true" ]; then
              save_needed=true
            fi
 

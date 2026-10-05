@@ -155,6 +155,12 @@ describe("task live progress rendering", () => {
 		expect(text).toContain("line 8");
 	});
 
+	it("shows the extension routing note on async progress rows after completion", () => {
+		setViewportRows(40);
+		const progress = { ...makeProgress([]), status: "completed" as const, resolvedModelRoute: "pool b (quota)" };
+		expect(renderProgressText(progress, false, uiTheme)).toContain("routed: pool b (quota)");
+	});
+
 	it("strips bash footer notices from expanded subagent recent output", () => {
 		setViewportRows(40);
 		const chronological = [
@@ -358,5 +364,30 @@ describe("taskCardAgentIds", () => {
 		expect(taskCardAgentIds(undefined)).toEqual([]);
 		expect(taskCardAgentIds(null)).toEqual([]);
 		expect(taskCardAgentIds({ results: [{ id: 42 }, null, {}] })).toEqual([]);
+	});
+});
+
+describe("task preflight error rendering", () => {
+	it("renders an error header with empty task details", async () => {
+		const theme = await getThemeByName("dark");
+		if (!theme) throw new Error("theme unavailable");
+		const content = [{ type: "text", text: "Invalid model selector." }];
+		const options = { expanded: false, isPartial: false };
+		const ordinary = renderResult({ content, isError: true }, options, theme).render(90);
+		const preflight = renderResult(
+			{
+				content,
+				isError: true,
+				details: {
+					projectAgentsDir: null,
+					results: [],
+					totalDurationMs: 0,
+				},
+			},
+			options,
+			theme,
+		).render(90);
+		expect(strip(preflight.slice(0, 1))).toBe(strip(ordinary.slice(0, 1)));
+		expect(strip(preflight)).toContain("Invalid model selector.");
 	});
 });
