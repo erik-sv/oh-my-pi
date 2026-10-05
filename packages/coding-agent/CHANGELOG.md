@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Task subagents can select any available model per invocation with the model picker's selector syntax, including different models for items in one batch.
+
 ## [18.1.10] - 2026-09-04
 
 ### Changed

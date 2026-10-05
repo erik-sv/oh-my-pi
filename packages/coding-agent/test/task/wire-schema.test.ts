@@ -6,7 +6,7 @@ import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { getTaskSchema, oneLineLabel } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
-// Contract: the task tool's wire shape is flat `{ name?, agent?, task, isolated? }`
+// Contract: the task tool's wire shape is flat `{ name?, agent?, model?, task, isolated? }`
 // (batch: `{ context, tasks[] }` of the same items). `agent` defaults to the
 // schema's spawn-policy default, and unknown keys sent by stale callers (`role`,
 // `description`) are stripped by the schema's `+: "delete"` — never rejected.
@@ -118,14 +118,16 @@ describe("task approval details surface the dispatch", () => {
 		} as unknown as ToolSession);
 	}
 
-	it("surfaces agent, name, and task for a flat spawn", async () => {
+	it("surfaces agent, model, name, and task for a flat spawn", async () => {
 		const tool = await makeTool();
 		const lines = tool.formatApprovalDetails({
 			agent: "reviewer",
+			model: "anthropic/claude-fable-5-1:high",
 			name: "ReviewAuth",
 			task: "audit the auth module",
 		});
 		expect(lines).toContain("Agent: reviewer");
+		expect(lines).toContain("Model: anthropic/claude-fable-5-1:high");
 		expect(lines).toContain("Name: ReviewAuth");
 		expect(lines).toContain("Task:\naudit the auth module");
 	});
@@ -138,6 +140,7 @@ describe("task approval details surface the dispatch", () => {
 				{
 					name: "DbMigrator",
 					task: "migrate the schema",
+					model: "openai-codex/gpt-6-astra:xhigh",
 				},
 				{ task: "second item" },
 			],
@@ -146,6 +149,7 @@ describe("task approval details surface the dispatch", () => {
 		expect(lines).toContain("Batch agents: scout ×2");
 		expect(lines).toContain("Name: DbMigrator");
 		expect(lines).toContain("Agent: scout");
+		expect(lines).toContain("Model: openai-codex/gpt-6-astra:xhigh");
 		expect(lines).toContain("Task:\nmigrate the schema");
 		expect(lines).toContain("+1 more task");
 	});

@@ -26,6 +26,18 @@ describe("task schema (single-spawn)", () => {
 		}
 	});
 
+	it("accepts a model picker selector", () => {
+		const parsed = taskSchema({
+			agent: "reviewer",
+			model: "anthropic/claude-fable-5-1:high",
+			task: "Review the change.",
+		});
+		expect(parsed instanceof type.errors).toBe(false);
+		if (!(parsed instanceof type.errors)) {
+			expect(parsed.model).toBe("anthropic/claude-fable-5-1:high");
+		}
+	});
+
 	it("requires task", () => {
 		const parsed = taskSchema({ agent: "scout" });
 		expect(parsed instanceof type.errors).toBe(true);

@@ -117,6 +117,7 @@ describe("task.batch schema gating", () => {
 		expect(offProperties.context).toBeUndefined();
 		expect(offProperties.task).toBeDefined();
 		expect(offProperties.name).toBeDefined();
+		expect(offProperties.model).toBeDefined();
 		expect(offProperties.outputSchema).toBeDefined();
 		expect(typeof offProperties.outputSchema).toBe("object");
 		expect(offProperties.schemaMode).toBeDefined();
@@ -136,9 +137,19 @@ describe("task.batch schema gating", () => {
 		expect(itemProperties.task).toBeDefined();
 		expect(itemProperties.name).toBeDefined();
 		expect(itemProperties.agent).toBeDefined();
+		expect(itemProperties.model).toBeDefined();
 		expect(itemProperties.outputSchema).toBeDefined();
 		expect(typeof itemProperties.outputSchema).toBe("object");
 		expect(itemProperties.schemaMode).toBeDefined();
+	});
+
+	it("explains direct model-picker routing", async () => {
+		mockDiscovery();
+		const tool = await TaskTool.create(createSession({ settings: { "task.batch": true } }));
+
+		expect(tool.description).toContain("`model`: Model-picker selector");
+		expect(tool.description).toContain("MUST pass `model`");
+		expect(tool.description).toContain('omp models find "<name>" --json');
 	});
 
 	it("requires coordination instead of promising same-file auto-resolution", async () => {
@@ -375,12 +386,14 @@ describe("task.batch spawning", () => {
 				{
 					name: "Alpha",
 					task: "Do A.",
+					model: "anthropic/claude-fable-5-1:high",
 					outputSchema: alphaSchema,
 					schemaMode: "strict",
 				},
 				{
 					name: "Beta",
 					task: "Do B.",
+					model: "openai-codex/gpt-6-astra:xhigh",
 					outputSchema: betaSchema,
 					schemaMode: "permissive",
 				},
@@ -409,8 +422,10 @@ describe("task.batch spawning", () => {
 		}
 		const byId = new Map(seen.map(spawn => [spawn.id, spawn]));
 		expect(byId.get("Alpha")?.outputSchema).toEqual(alphaSchema);
+		expect(byId.get("Alpha")?.modelOverride).toEqual(["anthropic/claude-fable-5-1:high"]);
 		expect(byId.get("Alpha")?.outputSchemaMode).toBe("strict");
 		expect(byId.get("Beta")?.outputSchema).toEqual(betaSchema);
+		expect(byId.get("Beta")?.modelOverride).toEqual(["openai-codex/gpt-6-astra:xhigh"]);
 		expect(byId.get("Beta")?.outputSchemaMode).toBe("permissive");
 		expect(seen.map(spawn => spawn.assignment).sort()).toEqual(["Do A.", "Do B."]);
 		for (const spawn of seen) expect(spawn.parentAgentId).toBe("ParentA");
@@ -567,6 +582,7 @@ describe("task.batch spawning", () => {
 			agent: "task",
 			name: "Flat",
 			task: "Do the thing.",
+			model: "anthropic/claude-fable-5-1:high",
 			outputSchema: callerSchema,
 			schemaMode: "strict",
 		} as TaskParams);
@@ -575,7 +591,7 @@ describe("task.batch spawning", () => {
 		const job = manager.getJob(result.details!.async!.jobId)!;
 		await job.promise;
 		expect(job.status).toBe("completed");
-		expect(captured?.modelOverride).toEqual(["openai/gpt-4.1-mini"]);
+		expect(captured?.modelOverride).toEqual(["anthropic/claude-fable-5-1:high"]);
 		expect(captured?.outputSchema).toEqual(callerSchema);
 		expect(captured?.outputSchemaMode).toBe("strict");
 		expect(captured?.outputSchemaSource).toBe("caller");

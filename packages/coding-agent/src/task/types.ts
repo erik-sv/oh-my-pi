@@ -114,6 +114,7 @@ const effortRule = '"lo" | "med" | "hi"' as const;
 export const taskItemSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
+	"model?": "string",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
@@ -123,6 +124,7 @@ export const taskItemSchema = type({
 const taskItemSchemaIsolated = type({
 	"name?": "string",
 	agent: "string = 'task'",
+	"model?": "string",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
@@ -137,6 +139,8 @@ export interface TaskItem {
 	name?: string;
 	/** Agent type to run this item (e.g. "scout"). Defaults to the spawn policy's default agent. */
 	agent?: string;
+	/** Model picker selector for this invocation. Overrides settings and agent model defaults. */
+	model?: string;
 	/** The work; required by the schema. */
 	task?: string;
 	/** Per-spawn thinking effort: lowest/middle/highest level the resolved model supports. Overrides the agent's default selector (e.g. `auto`). */
@@ -154,6 +158,7 @@ export interface TaskItem {
 export const taskSchema = type({
 	"name?": "string",
 	agent: "string = 'task'",
+	"model?": "string",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
@@ -164,6 +169,7 @@ export const taskSchema = type({
 const taskSchemaNoIsolation = type({
 	"name?": "string",
 	agent: "string = 'task'",
+	"model?": "string",
 	task: "string",
 	"outputSchema?": outputSchemaInputSchema,
 	"schemaMode?": '"permissive" | "strict"',
@@ -213,6 +219,7 @@ function createTaskSchema(options: {
 			const item = type.raw({
 				"name?": "string",
 				agent,
+				"model?": "string",
 				task: "string",
 				...effortField,
 				"outputSchema?": outputSchemaInputSchema,
@@ -230,6 +237,7 @@ function createTaskSchema(options: {
 		const item = type.raw({
 			"name?": "string",
 			agent,
+			"model?": "string",
 			task: "string",
 			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
@@ -247,6 +255,7 @@ function createTaskSchema(options: {
 		return type.raw({
 			"name?": "string",
 			agent,
+			"model?": "string",
 			task: "string",
 			...effortField,
 			"outputSchema?": outputSchemaInputSchema,
@@ -259,6 +268,7 @@ function createTaskSchema(options: {
 	return type.raw({
 		"name?": "string",
 		agent,
+		"model?": "string",
 		task: "string",
 		...effortField,
 		"outputSchema?": outputSchemaInputSchema,
@@ -294,7 +304,7 @@ export function getTaskSchema(options: {
 
 /**
  * Runtime params union over both wire shapes. The model sees exactly one shape
- * (`{ context, tasks[] }` when `task.batch` is on, `{ name?, agent?, task }`
+ * (`{ context, tasks[] }` when `task.batch` is on, `{ name?, agent?, model?, task }`
  * otherwise); runtime stays permissive so internal callers and stale
  * transcripts using the flat form keep working under either setting.
  */
@@ -303,6 +313,8 @@ export interface TaskParams {
 	name?: string;
 	/** Agent type to spawn (flat form); omitted values resolve from the session spawn policy. */
 	agent?: string;
+	/** Model picker selector for this invocation. Overrides settings and agent model defaults. */
+	model?: string;
 	/** The work (flat form). */
 	task?: string;
 	/** Per-spawn thinking effort (flat form): lowest/middle/highest level the resolved model supports. */
