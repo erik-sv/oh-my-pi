@@ -1,5 +1,5 @@
 # Upstream 18.4.10 AgentDesk Integration
-Status: Integration committed and verified; artifact staged; production activation pending.
+Status: Superseded by upstream-18-6-2-agentdesk.md (activated 2026-10-05).
 Current Goal: Activate the staged artifact together with the auth broker/gateway units without disturbing live sessions.
 
 ## Overview
