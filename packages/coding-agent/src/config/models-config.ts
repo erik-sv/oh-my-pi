@@ -25,6 +25,7 @@ export interface ProviderValidationConfig {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	apiKey?: string;
+	apiKeyCacheTtlMs?: number;
 	api?: Api;
 	auth?: ProviderAuthMode;
 	oauthConfigured?: boolean;
@@ -43,6 +44,16 @@ export function validateProviderConfiguration(
 ): void {
 	const hasProviderApi = !!config.api;
 	const models = config.models;
+	if (
+		config.apiKeyCacheTtlMs !== undefined &&
+		(!Number.isSafeInteger(config.apiKeyCacheTtlMs) ||
+			config.apiKeyCacheTtlMs <= 0 ||
+			!config.apiKey?.startsWith("!"))
+	) {
+		throw new Error(
+			`Provider ${providerName}: apiKeyCacheTtlMs requires a command API key and a positive safe integer.`,
+		);
+	}
 
 	if (models.length === 0) {
 		if (mode === "models-config") {
@@ -118,6 +129,7 @@ export const ModelsConfigFile = new ConfigFile<ModelsConfig>("models", ModelsCon
 					baseUrl: providerConfig.baseUrl,
 					headers: providerConfig.headers,
 					apiKey: providerConfig.apiKey,
+					apiKeyCacheTtlMs: providerConfig.apiKeyCacheTtlMs,
 					api: providerConfig.api as Api | undefined,
 					auth: (providerConfig.auth ?? "apiKey") as ProviderAuthMode,
 					discovery: providerConfig.discovery as ProviderDiscovery | undefined,

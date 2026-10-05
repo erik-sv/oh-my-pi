@@ -152,7 +152,9 @@ providers:
       X-Team-Key: "!bw get password omp-team-key"
 ```
 
-Successful command outputs are cached for the process lifetime so the command is not re-run for every model.
+Successful command outputs are cached for the process lifetime by default. For a command that issues short-lived API keys, set the provider's `apiKeyCacheTtlMs` to a positive safe integer in milliseconds, shorter than the credential lifetime. This option requires a command-backed `apiKey`; it also controls the generated `authHeader` bearer, but does not change caching for unrelated header commands.
+
+The next resolution after expiry runs the command again. An explicit credential `forceRefresh` also runs it again, bypassing both success and failure caches. Empty or failed refreshes discard the old key and generated authorization header; they do not fall back to stored or service credentials. Ordinary failed resolutions retain the existing 30-second retry window.
 
 ## Merge and override order
 

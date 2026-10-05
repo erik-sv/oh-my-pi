@@ -1286,6 +1286,8 @@ export interface ProviderConfig {
 	baseUrl?: string;
 	/** API key or environment variable name. Required when defining models unless oauth is provided. */
 	apiKey?: string;
+	/** Maximum cached command-key age in milliseconds; omitted means process-lifetime caching. */
+	apiKeyCacheTtlMs?: number;
 	/** API type identifier. Required when registering streamSimple or when models don't specify one. */
 	api?: Api;
 	/** Custom streaming function for non-built-in APIs. */

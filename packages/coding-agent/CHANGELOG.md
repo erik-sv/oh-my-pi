@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in `apiKeyCacheTtlMs` for command-backed provider keys, including generated authorization headers, so short-lived credentials renew without restarting OMP.
+
+### Fixed
+
+- Fixed explicit credential refresh ignoring command-backed keys. Expired or failed refreshes no longer retain the old generated authorization header or fall back to another credential.
+
 ## [17.0.5] - 2026-07-18
 
 ### Added

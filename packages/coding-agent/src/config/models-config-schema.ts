@@ -261,6 +261,7 @@ export type ProviderDiscovery = typeof ProviderDiscoverySchema.infer;
 const ProviderConfigSchema = type({
 	"baseUrl?": "string",
 	"apiKey?": "string",
+	"apiKeyCacheTtlMs?": "number",
 	"api?": ApiSchema,
 	"headers?": { "[string]": "string" },
 	"compat?": OpenAICompatSchema,

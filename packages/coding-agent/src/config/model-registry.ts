@@ -119,6 +119,7 @@ interface ProviderOverride {
 	baseUrl?: string;
 	headers?: Record<string, string>;
 	apiKey?: string;
+	apiKeyCacheTtlMs?: number;
 	authHeader?: boolean;
 	compat?: ModelSpec<Api>["compat"];
 	remoteCompaction?: RemoteCompactionConfig<Api>;
@@ -272,7 +273,12 @@ interface CustomModelsResult {
 	found: boolean;
 }
 
-const commandValueCache = new Map<string, string>();
+interface ProviderApiKeyConfig {
+	value: string;
+	cacheTtlMs?: number;
+}
+
+const commandValueCache = new Map<string, { value: string; resolvedAt: number }>();
 // Failed `!command` resolutions (non-zero exit, empty stdout) are negative-cached
 // with a TTL instead of forever: a transient failure (locked password manager,
 // network hiccup) must not disable the key until process restart, but re-running
@@ -285,11 +291,17 @@ function isCommandConfigValue(valueConfig: string | undefined): valueConfig is s
 	return valueConfig?.startsWith("!") === true;
 }
 
-function resolveCommandConfig(command: string): string | undefined {
+function resolveCommandConfig(command: string, cacheTtlMs?: number, forceRefresh = false): string | undefined {
+	const now = Date.now();
 	const cached = commandValueCache.get(command);
-	if (cached !== undefined) return cached;
+	if (!forceRefresh && cached !== undefined) {
+		const age = now - cached.resolvedAt;
+		if (cacheTtlMs === undefined || (age >= 0 && age < cacheTtlMs)) return cached.value;
+	}
+	commandValueCache.delete(command);
+	if (forceRefresh) commandFailureRetryAt.delete(command);
 	const retryAt = commandFailureRetryAt.get(command);
-	if (retryAt !== undefined && Date.now() < retryAt) return undefined;
+	if (retryAt !== undefined && now < retryAt) return undefined;
 	try {
 		const stdout = execSync(command, {
 			encoding: "utf8",
@@ -303,7 +315,7 @@ function resolveCommandConfig(command: string): string | undefined {
 			return undefined;
 		}
 		commandFailureRetryAt.delete(command);
-		commandValueCache.set(command, trimmed);
+		commandValueCache.set(command, { value: trimmed, resolvedAt: Date.now() });
 		return trimmed;
 	} catch {
 		commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
@@ -320,8 +332,8 @@ interface CommandApiKeyResolution {
  * `!cmd` runs a shell command and returns trimmed stdout, otherwise env vars are
  * checked first and the input falls back to a literal value.
  */
-function resolveConfigValue(valueConfig: string): string | undefined {
-	if (valueConfig.startsWith("!")) return resolveCommandConfig(valueConfig.slice(1).trim());
+function resolveConfigValue(valueConfig: string, cacheTtlMs?: number, forceRefresh = false): string | undefined {
+	if (valueConfig.startsWith("!")) return resolveCommandConfig(valueConfig.slice(1).trim(), cacheTtlMs, forceRefresh);
 	const envValue = Bun.env[valueConfig];
 	if (envValue) return envValue;
 	return valueConfig;
@@ -332,6 +344,7 @@ type HeaderSource = Record<string, string> | undefined;
 interface HeaderResolutionOptions {
 	authHeader?: boolean;
 	apiKeyConfig?: string;
+	apiKeyCacheTtlMs?: number;
 }
 
 function materializeConfigHeaderSources(
@@ -347,7 +360,10 @@ function materializeConfigHeaderSources(
 		}
 	}
 	if (options?.authHeader && options.apiKeyConfig) {
-		const resolvedKey = resolveConfigValue(options.apiKeyConfig);
+		const resolvedKey = resolveConfigValue(options.apiKeyConfig, options.apiKeyCacheTtlMs);
+		for (const key in resolved) {
+			if (key.toLowerCase() === "authorization") delete resolved[key];
+		}
 		if (resolvedKey) resolved.Authorization = `Bearer ${resolvedKey}`;
 	}
 	return Object.keys(resolved).length > 0 ? resolved : undefined;
@@ -584,16 +600,18 @@ function mergeCustomModelHeaders(
 	modelHeaders: Record<string, string> | undefined,
 	authHeader: boolean | undefined,
 	apiKeyConfig: string | undefined,
+	apiKeyCacheTtlMs?: number,
 ): Record<string, string> | undefined {
-	return createLiveConfigHeaders([providerHeaders, modelHeaders], { authHeader, apiKeyConfig });
+	return createLiveConfigHeaders([providerHeaders, modelHeaders], { authHeader, apiKeyConfig, apiKeyCacheTtlMs });
 }
 
 function mergeAuthHeaderSources(
 	sources: readonly HeaderSource[],
 	authHeader: boolean | undefined,
 	apiKeyConfig: string | undefined,
+	apiKeyCacheTtlMs?: number,
 ): Record<string, string> | undefined {
-	return createLiveConfigHeaders(sources, { authHeader, apiKeyConfig });
+	return createLiveConfigHeaders(sources, { authHeader, apiKeyConfig, apiKeyCacheTtlMs });
 }
 
 /**
@@ -621,6 +639,7 @@ function buildCustomModelOverlay(
 	providerAuth: ProviderAuthMode | undefined,
 	providerRemoteCompaction: RemoteCompactionConfig<Api> | undefined,
 	modelDef: CustomModelDefinitionLike,
+	apiKeyCacheTtlMs?: number,
 ): CustomModelOverlay | undefined {
 	const api = modelDef.api ?? providerApi;
 	if (!api) return undefined;
@@ -638,7 +657,7 @@ function buildCustomModelOverlay(
 		contextWindow: modelDef.contextWindow,
 		maxTokens: modelDef.maxTokens,
 		omitMaxOutputTokens: modelDef.omitMaxOutputTokens,
-		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey),
+		headers: mergeCustomModelHeaders(providerHeaders, modelDef.headers, authHeader, providerApiKey, apiKeyCacheTtlMs),
 		compat: mergeCompat(providerCompat, modelDef.compat),
 		contextPromotionTarget: modelDef.contextPromotionTarget,
 		compactionModel: modelDef.compactionModel,
@@ -748,7 +767,7 @@ function getDisabledProviderIdsFromSettings(): Set<string> {
  */
 export class ModelRegistry {
 	#models: Model<Api>[] = [];
-	#customProviderApiKeys: Map<string, string> = new Map();
+	#customProviderApiKeys: Map<string, ProviderApiKeyConfig> = new Map();
 	#keylessProviders: Set<string> = new Set();
 	#discoverableProviders: DiscoveryProviderConfig[] = [];
 	#customModelOverlays: CustomModelOverlay[] = [];
@@ -766,7 +785,7 @@ export class ModelRegistry {
 	// Runtime extension model overlays — persist across refresh() cycles so that
 	// models registered by extensions survive the model selector's offline reload.
 	#runtimeModelOverlays: CustomModelOverlay[] = [];
-	#runtimeProviderApiKeys: Map<string, string> = new Map();
+	#runtimeProviderApiKeys: Map<string, ProviderApiKeyConfig> = new Map();
 	#runtimeProviderOverrides: Map<string, ProviderOverride> = new Map();
 	#runtimeProvidersBySource: Map<string, Set<string>> = new Map();
 	#runtimeProviderSourceByName: Map<string, string> = new Map();
@@ -775,10 +794,10 @@ export class ModelRegistry {
 	#runtimeModelManagers: Map<string, { options: ModelManagerOptions<Api>; sourceId: string }> = new Map();
 	#fetch: FetchImpl;
 
-	#resolveCommandBackedApiKey(provider: string): CommandApiKeyResolution {
+	#resolveCommandBackedApiKey(provider: string, forceRefresh = false): CommandApiKeyResolution {
 		const keyConfig = this.#customProviderApiKeys.get(provider);
-		if (!isCommandConfigValue(keyConfig)) return { configured: false };
-		const value = resolveConfigValue(keyConfig);
+		if (!keyConfig || !isCommandConfigValue(keyConfig.value)) return { configured: false };
+		const value = resolveConfigValue(keyConfig.value, keyConfig.cacheTtlMs, forceRefresh);
 		if (value) {
 			this.authStorage.setConfigApiKey(provider, value);
 			return { configured: true, value };
@@ -787,12 +806,12 @@ export class ModelRegistry {
 		return { configured: true };
 	}
 
-	#installProviderApiKey(provider: string, keyConfig: string): void {
+	#installProviderApiKey(provider: string, keyConfig: ProviderApiKeyConfig): void {
 		this.#customProviderApiKeys.set(provider, keyConfig);
-		const resolved = resolveConfigValue(keyConfig);
+		const resolved = resolveConfigValue(keyConfig.value, keyConfig.cacheTtlMs);
 		if (resolved) {
 			this.authStorage.setConfigApiKey(provider, resolved);
-		} else if (isCommandConfigValue(keyConfig)) {
+		} else if (isCommandConfigValue(keyConfig.value)) {
 			this.authStorage.removeConfigApiKey(provider);
 		}
 	}
@@ -822,7 +841,7 @@ export class ModelRegistry {
 		this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
 			if (!keyConfig) return undefined;
-			return resolveConfigValue(keyConfig);
+			return resolveConfigValue(keyConfig.value, keyConfig.cacheTtlMs);
 		});
 		// Load models synchronously in constructor.
 		this.#loadModels();
@@ -1367,6 +1386,7 @@ export class ModelRegistry {
 							: providerConfig.baseUrl,
 					headers: resolvedProviderHeaders,
 					apiKey: providerConfig.apiKey,
+					apiKeyCacheTtlMs: providerConfig.apiKeyCacheTtlMs,
 					authHeader: providerConfig.authHeader,
 					compat: mergeCompat(providerConfig.compat, disableStrictCompat),
 					remoteCompaction: providerConfig.remoteCompaction,
@@ -1401,7 +1421,10 @@ export class ModelRegistry {
 			// bearer in models.yml (e.g. for an auth-gateway baseUrl), that bearer
 			// must authenticate the outbound request.
 			if (providerConfig.apiKey) {
-				this.#installProviderApiKey(providerName, providerConfig.apiKey);
+				this.#installProviderApiKey(providerName, {
+					value: providerConfig.apiKey,
+					cacheTtlMs: providerConfig.apiKeyCacheTtlMs,
+				});
 			}
 
 			// Parse per-model overrides
@@ -1891,13 +1914,14 @@ export class ModelRegistry {
 		entry: T,
 		override: Pick<
 			ProviderOverride,
-			"baseUrl" | "headers" | "authHeader" | "apiKey" | "remoteCompaction" | "transport"
+			"baseUrl" | "headers" | "authHeader" | "apiKey" | "apiKeyCacheTtlMs" | "remoteCompaction" | "transport"
 		>,
 	): T {
 		const headers = mergeAuthHeaderSources(
 			override.headers ? [entry.headers, override.headers] : [entry.headers],
 			override.authHeader,
 			override.apiKey,
+			override.apiKeyCacheTtlMs,
 		);
 		return {
 			...entry,
@@ -1975,7 +1999,10 @@ export class ModelRegistry {
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
 			const resolvedProviderHeaders = resolveConfigHeaders(providerConfig.headers);
 			if (providerConfig.apiKey) {
-				this.#installProviderApiKey(providerName, providerConfig.apiKey);
+				this.#installProviderApiKey(providerName, {
+					value: providerConfig.apiKey,
+					cacheTtlMs: providerConfig.apiKeyCacheTtlMs,
+				});
 			}
 			for (const modelDef of modelDefs) {
 				const providerCompat = providerConfig.disableStrictTools
@@ -1992,6 +2019,7 @@ export class ModelRegistry {
 					(providerConfig.auth as ProviderAuthMode | undefined) ?? undefined,
 					providerConfig.remoteCompaction,
 					modelDef as CustomModelDefinitionLike,
+					providerConfig.apiKeyCacheTtlMs,
 				);
 				if (!model) continue;
 				models.push(model);
@@ -2056,7 +2084,7 @@ export class ModelRegistry {
 	hasConfiguredAuth(model: Model<Api>): boolean {
 		const keyConfig = this.#customProviderApiKeys.get(model.provider);
 		return (
-			isCommandConfigValue(keyConfig) ||
+			isCommandConfigValue(keyConfig?.value) ||
 			this.#keylessProviders.has(model.provider) ||
 			this.authStorage.hasAuth(model.provider)
 		);
@@ -2070,7 +2098,7 @@ export class ModelRegistry {
 	 */
 	hasCommandBackedApiKey(provider: string): boolean {
 		const keyConfig = this.#customProviderApiKeys.get(provider);
-		return isCommandConfigValue(keyConfig);
+		return isCommandConfigValue(keyConfig?.value);
 	}
 
 	getDiscoverableProviders(): string[] {
@@ -2131,7 +2159,7 @@ export class ModelRegistry {
 		sessionId?: string,
 		options?: { baseUrl?: string; modelId?: string; forceRefresh?: boolean; signal?: AbortSignal },
 	): Promise<string | undefined> {
-		const commandKey = this.#resolveCommandBackedApiKey(provider);
+		const commandKey = this.#resolveCommandBackedApiKey(provider, options?.forceRefresh);
 		if (commandKey.configured) return commandKey.value;
 		if (this.#keylessProviders.has(provider) && !this.authStorage.hasAuth(provider)) {
 			return kNoAuth;
@@ -2244,6 +2272,7 @@ export class ModelRegistry {
 				baseUrl: config.baseUrl,
 				headers: config.headers,
 				apiKey: config.apiKey,
+				apiKeyCacheTtlMs: config.apiKeyCacheTtlMs,
 				api: config.api,
 				oauthConfigured: Boolean(config.oauth),
 				models: (config.models ?? []) as ProviderValidationModel[],
@@ -2290,9 +2319,10 @@ export class ModelRegistry {
 		}
 
 		if (config.apiKey) {
-			this.#installProviderApiKey(providerName, config.apiKey);
-			// Persist runtime API keys so they survive #reloadStaticModels() cycles
-			this.#runtimeProviderApiKeys.set(providerName, config.apiKey);
+			const keyConfig = { value: config.apiKey, cacheTtlMs: config.apiKeyCacheTtlMs };
+			this.#installProviderApiKey(providerName, keyConfig);
+			// Persist runtime API keys so they survive #reloadStaticModels() cycles.
+			this.#runtimeProviderApiKeys.set(providerName, keyConfig);
 		}
 
 		if (config.models && config.models.length > 0) {
@@ -2310,6 +2340,7 @@ export class ModelRegistry {
 					undefined,
 					config.remoteCompaction,
 					modelDef as CustomModelDefinitionLike,
+					config.apiKeyCacheTtlMs,
 				);
 				if (!overlay) {
 					throw new Error(`Provider ${providerName}, model ${modelDef.id}: no "api" specified.`);
@@ -2401,6 +2432,7 @@ export class ModelRegistry {
 				baseUrl: config.baseUrl,
 				headers: config.headers,
 				apiKey: config.apiKey,
+				apiKeyCacheTtlMs: config.apiKeyCacheTtlMs,
 				authHeader: config.authHeader,
 				remoteCompaction: config.remoteCompaction,
 				transport: config.transport,
@@ -2470,6 +2502,7 @@ export class ModelRegistry {
 export interface ProviderConfigInput {
 	baseUrl?: string;
 	apiKey?: string;
+	apiKeyCacheTtlMs?: number;
 	api?: Api;
 	streamSimple?: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream;
 	headers?: Record<string, string>;

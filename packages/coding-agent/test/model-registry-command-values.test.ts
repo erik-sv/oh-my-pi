@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -166,6 +166,81 @@ describe("ModelRegistry command-resolved models.yml values", () => {
 		]) {
 			expect(observed[key], `${key} must not cross the provider command boundary`).toBeUndefined();
 		}
+	});
+
+	test("expiring command keys renew headers and fail closed until explicit recovery", async () => {
+		const keyFile = path.join(tempDir, "employee-key");
+		const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+			`process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(keyFile)}, "utf8"))`,
+		)}`;
+		fs.writeFileSync(keyFile, "first-employee-key");
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					anthropic: {
+						baseUrl: "https://employee-proxy.example.com/v1",
+						apiKey: `!${command}`,
+						apiKeyCacheTtlMs: 60_000,
+						authHeader: true,
+					},
+				},
+			}),
+		);
+		authStorage.set("anthropic", { type: "api_key", key: "stored-key-must-not-escape" });
+		let now = Date.now();
+		const clock = spyOn(Date, "now").mockImplementation(() => now);
+		try {
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			const model = registry.getAll().find(entry => entry.provider === "anthropic")!;
+			expect(await registry.getApiKey(model)).toBe("first-employee-key");
+			fs.writeFileSync(keyFile, "second-employee-key");
+			now += 59_999;
+			expect(await registry.getApiKey(model)).toBe("first-employee-key");
+			now += 1;
+			expect(model.headers?.Authorization).toBe("Bearer second-employee-key");
+			expect(await registry.getApiKey(model)).toBe("second-employee-key");
+			fs.writeFileSync(keyFile, "");
+			now += 60_000;
+			expect(await registry.getApiKey(model)).toBeUndefined();
+			expect(model.headers?.Authorization).toBeUndefined();
+			fs.writeFileSync(keyFile, "recovered-employee-key");
+			expect(await registry.getApiKey(model)).toBeUndefined();
+			expect(await registry.getApiKeyForProvider("anthropic", undefined, { forceRefresh: true })).toBe(
+				"recovered-employee-key",
+			);
+			expect(model.headers?.Authorization).toBe("Bearer recovered-employee-key");
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	test("explicit refresh replaces a successful process-cached command key", async () => {
+		const keyFile = path.join(tempDir, "refresh-key");
+		const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(
+			`process.stdout.write(require("node:fs").readFileSync(${JSON.stringify(keyFile)}, "utf8"))`,
+		)}`;
+		fs.writeFileSync(keyFile, "old-key");
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		registry.registerProvider("command-refresh", {
+			baseUrl: "https://refresh.example.com/v1",
+			apiKey: `!${command}`,
+		});
+		expect(await registry.getApiKeyForProvider("command-refresh")).toBe("old-key");
+		fs.writeFileSync(keyFile, "new-key");
+		expect(await registry.getApiKeyForProvider("command-refresh")).toBe("old-key");
+		expect(await registry.getApiKeyForProvider("command-refresh", undefined, { forceRefresh: true })).toBe("new-key");
+	});
+
+	test("rejects a command cache lifetime that cannot bound credential age", () => {
+		const registry = new ModelRegistry(authStorage, modelsPath);
+		expect(() =>
+			registry.registerProvider("invalid-command-ttl", {
+				baseUrl: "https://refresh.example.com/v1",
+				apiKey: `!${stdoutCommand("scoped-key")}`,
+				apiKeyCacheTtlMs: 0,
+			}),
+		).toThrow(Error);
 	});
 
 	test("resolveCommandConfig caches failed executions so they do not retry", async () => {
