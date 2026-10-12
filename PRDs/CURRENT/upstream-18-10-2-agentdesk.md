@@ -1,5 +1,5 @@
 # Upstream 18.10.2 AgentDesk Integration
-Status: Integrated and verified. Artifact published to the runtime root; selector activation recorded below.
+Status: Merged to fork main (PR #11) and verified. Artifact published to the runtime root. Selector activation is blocked; see Activation.
 Current Goal: Stop AgentDesk chats failing with `unsupported_native_inflight_message` when a user sends a message during a running Codex turn, and bring the fork current with upstream.
 
 ## Overview
@@ -45,6 +45,22 @@ Every contract decision from the 18.4.10 and 18.6.2 integrations still holds. In
 - Native addon SHA-256 `19bbb65bb21a3641ef39a73eecbd515830ee887c5de08a6ff23b715f3c904d19`. It was built with the cargo `local` profile and then stripped (`strip --strip-unneeded`).
 - Compiled with Bun 1.4.3. Bun 1.4.0 produced a binary that failed with `parseFromSourceCode failed`.
 - The build receipt is stored next to the binary.
+
+## Activation (blocked)
+`switch-omp-runtime.py` refused to publish with "untrusted owner for /". Since the host restart on 2026-10-12, the agent tool namespace shows root-owned paths as uid 65534. The publisher requires every path component to be owned by root or by the caller. The selector is still at generation 5 (18.6.2 direct SQL resume). Run this from an operator shell where `/` shows as root-owned:
+
+```bash
+sudo -u agentdesk python3 /home/agentdesk/code/agentdesk/scripts/switch-omp-runtime.py \
+  --root /home/agentdesk/code/omp-runtimes \
+  --selector /home/agentdesk/data/omp-runtime.json \
+  --artifact /home/agentdesk/code/omp-runtimes/omp-v18.10.2-agentdesk-67c3c3e724-27b0e5ea9116/omp \
+  --sha256 27b0e5ea91166b8429c4966fe0c54f5d5ed52bf0ff31c765a197b59545cb90bb \
+  --version 18.10.2 --manifest-id omp-v18.10.2-agentdesk-67c3c3e724-27b0e5ea9116 \
+  --compatibility-generation 18 --capability rpc --capability sql-session-storage \
+  --expected-generation 5
+```
+
+Then start one throwaway chat and confirm `omp_supervisor_sessions.payload->'runtimeArtifact'` names the 18.10.2 manifest (`docs/filesystem-layout.md` in AgentDesk).
 
 ## Rollback
 Republish the 18.6.2 direct-SQL-resume artifact, with the expected generation set to the generation this activation produced:
