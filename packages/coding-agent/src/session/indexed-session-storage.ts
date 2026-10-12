@@ -44,7 +44,7 @@ export interface SessionStorageIndexEntry {
 
 export interface SessionStorageBackend {
 	init(): Promise<void>;
-	loadIndex(): Promise<Iterable<SessionStorageIndexEntry>>;
+	loadIndex(paths?: readonly string[]): Promise<Iterable<SessionStorageIndexEntry>>;
 	readFull(path: string): Promise<string | null>;
 	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]>;
 	/**
@@ -123,6 +123,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	 * caller tracking a durable byte size must wait for {@link drain}.
 	 */
 	readonly defersSyncPublish = true;
+	ensureCompleteIndex?: () => Promise<void>;
 	readonly #backend: SessionStorageBackend;
 	readonly #index = new Map<string, IndexEntry>();
 	readonly #writers = new Set<IndexedSessionStorageWriter>();
@@ -141,6 +142,26 @@ export class IndexedSessionStorage implements SessionStorage {
 	readonly #pendingFrames = new Map<string, IndexAppend[]>();
 	#nextMtimeMs = 0;
 	#firstDrainError: Error | undefined;
+	#knownPaths: Set<string> | undefined;
+	#refreshPromise: Promise<void> | undefined;
+	#refreshChanges: Set<string> | undefined;
+
+	#assertPathKnown(path: string): void {
+		if (this.#knownPaths && !this.#knownPaths.has(path)) {
+			throw new Error(
+				`Session index is incomplete for ${path}; await ensureCompleteIndex() before synchronous access`,
+			);
+		}
+	}
+
+	#ensurePaths(...paths: string[]): Promise<void> {
+		return this.#knownPaths && paths.some(path => !this.#knownPaths?.has(path)) ? this.refresh() : RESOLVED;
+	}
+
+	#markIndexChanged(path: string): void {
+		this.#refreshChanges?.add(path);
+		this.#knownPaths?.add(path);
+	}
 	#assertExpectedSize(path: string, expectedSize: number | null | undefined): void {
 		if (expectedSize === undefined) return;
 		const actualSize = this.#index.get(path)?.size ?? null;
@@ -153,20 +174,51 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#backend = backend;
 	}
 
-	async initialize(): Promise<void> {
+	async initialize(initialPaths?: readonly string[]): Promise<void> {
 		await this.#backend.init();
-		await this.refresh();
+		if (initialPaths) {
+			this.#knownPaths = new Set(initialPaths);
+			this.ensureCompleteIndex = () => this.refresh();
+			await this.#reloadIndex(initialPaths);
+		} else {
+			await this.refresh();
+		}
 	}
 
-	async refresh(): Promise<void> {
+	refresh(): Promise<void> {
+		if (this.#refreshPromise) return this.#refreshPromise;
+		const pending = this.#reloadIndex().finally(() => {
+			this.#refreshPromise = undefined;
+		});
+		this.#refreshPromise = pending;
+		return pending;
+	}
+
+	async #reloadIndex(paths?: readonly string[]): Promise<void> {
 		await this.drain();
-		const rows = await this.#backend.loadIndex();
-		this.#index.clear();
-		for (const row of rows) {
-			const title = row.titleUpdatedAt
-				? { title: row.title, source: row.titleSource, updatedAt: row.titleUpdatedAt }
-				: null;
-			this.#setIndex(row.path, row.size, row.mtimeMs, title);
+		// The SQL snapshot may finish after a local queued write has already
+		// settled. Preserve every touched path, not just still-pending frames.
+		const changed = new Set(this.#pendingFrames.keys());
+		this.#refreshChanges = changed;
+		try {
+			const rows = await this.#backend.loadIndex(paths);
+			this.#refreshChanges = undefined;
+			for (const key of this.#index.keys()) {
+				if (!changed.has(key)) this.#index.delete(key);
+			}
+			for (const row of rows) {
+				if (changed.has(row.path)) continue;
+				const title = row.titleUpdatedAt
+					? { title: row.title, source: row.titleSource, updatedAt: row.titleUpdatedAt }
+					: null;
+				this.#setIndex(row.path, row.size, row.mtimeMs, title);
+			}
+			if (!paths) {
+				this.#knownPaths = undefined;
+				this.ensureCompleteIndex = undefined;
+			}
+		} finally {
+			this.#refreshChanges = undefined;
 		}
 	}
 
@@ -189,6 +241,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	existsSync(path: string): boolean {
+		this.#assertPathKnown(path);
 		return this.#index.has(path);
 	}
 
@@ -203,6 +256,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	writeTextSync(path: string, content: string, options?: SessionStorageWriteOptions): void {
+		this.#assertPathKnown(path);
 		this.#assertExpectedSize(path, options?.expectedSize);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
@@ -218,6 +272,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async updateSessionTitle(path: string, title: SessionTitleUpdate): Promise<void> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
@@ -230,6 +285,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			mtimeMs,
 		};
 		this.#index.set(path, next);
+		this.#markIndexChanged(path);
 		this.#pushFrame(path, { mtimeMs, previous });
 		const pending = this.#enqueuePath(path, () => this.#backend.updateSessionTitle(path, title, mtimeMs), {
 			trackDrain: false,
@@ -243,6 +299,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	statSync(path: string): SessionStorageStat {
+		this.#assertPathKnown(path);
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		return {
@@ -253,6 +310,9 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	listFilesSync(dir: string, pattern: string): string[] {
+		if (this.#knownPaths) {
+			throw new Error("Session index is incomplete; await ensureCompleteIndex() before listing");
+		}
 		// Fork: SQL-backed listing matches nested globs (`*/*.jsonl`) relative to `dir`;
 		// both sides are resolved so platform separators and relative dirs compare equal.
 		const resolvedDir = path.resolve(dir).replaceAll("\\", "/");
@@ -268,14 +328,16 @@ export class IndexedSessionStorage implements SessionStorage {
 		return out;
 	}
 
-	exists(path: string): Promise<boolean> {
-		return Promise.resolve(this.existsSync(path));
+	async exists(path: string): Promise<boolean> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
+		return this.existsSync(path);
 	}
 
 	async readText(path: string): Promise<string> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
+		await this.#awaitPath(path);
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
-		await this.#awaitPath(path);
 		const content = await this.#backend.readFull(path);
 		if (content === null) throw enoent(path);
 		const title = titleUpdateForIndex(entry);
@@ -283,12 +345,13 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async readTextSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
+		await this.#awaitPath(path);
 		const entry = this.#index.get(path);
 		if (!entry) throw enoent(path);
 		const prefixLimit = normalizeByteLimit(prefixBytes);
 		const suffixLimit = normalizeByteLimit(suffixBytes);
 		if (prefixLimit === 0 && suffixLimit === 0) return ["", ""];
-		await this.#awaitPath(path);
 		const [prefix, suffix] = await this.#backend.readSlices(path, prefixLimit, suffixLimit);
 		const title = titleUpdateForIndex(entry);
 		return [title ? overlayTitleSlotPrefix(prefix, prefixLimit, title) : prefix, suffix];
@@ -302,6 +365,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async writeText(path: string, content: string): Promise<void> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		const mtimeMs = this.#allocMtimeMs();
@@ -318,6 +382,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	async writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void> {
 		const commitGuard = options?.commitGuard;
 		if (commitGuard && !commitGuard()) return;
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
 		await this.#awaitPath(path);
 		// A concurrent flushSync (writeTextSync) may have taken over during the
 		// awaitPath yield and bumped the epoch. Re-check before touching the
@@ -365,6 +430,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async rename(src: string, dst: string): Promise<void> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(src, dst);
 		await this.#awaitPath(src);
 		await this.#awaitPath(dst);
 		const entry = this.#index.get(src);
@@ -374,6 +440,8 @@ export class IndexedSessionStorage implements SessionStorage {
 			return;
 		}
 		const dstPrevious = this.#index.get(dst);
+		this.#markIndexChanged(src);
+		this.#markIndexChanged(dst);
 		this.#index.delete(src);
 		this.#index.set(dst, { ...entry });
 		this.#pushFrame(src, { mtimeMs: entry.mtimeMs, previous: entry });
@@ -390,9 +458,11 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async unlink(path: string): Promise<void> {
+		if (this.ensureCompleteIndex) await this.#ensurePaths(path);
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
 		if (!previous) throw enoent(path);
+		this.#markIndexChanged(path);
 		this.#index.delete(path);
 		this.#pushFrame(path, { mtimeMs: previous.mtimeMs, previous });
 		try {
@@ -405,6 +475,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async deleteSessionWithArtifacts(sessionPath: string): Promise<void> {
+		if (this.ensureCompleteIndex) await this.ensureCompleteIndex();
 		await this.#awaitPath(sessionPath);
 		const sessionEntry = this.#index.get(sessionPath);
 		if (!sessionEntry) throw enoent(sessionPath);
@@ -422,6 +493,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		for (const path of paths) {
 			const entry = this.#index.get(path);
 			if (entry) previous.set(path, entry);
+			this.#markIndexChanged(path);
 			this.#index.delete(path);
 		}
 		for (const [path, entry] of previous) this.#pushFrame(path, { mtimeMs: sessionEntry.mtimeMs, previous: entry });
@@ -446,6 +518,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	_truncateForWriter(path: string): number {
+		this.#assertPathKnown(path);
 		const mtimeMs = this.#allocMtimeMs();
 		this.#pushFrame(path, { mtimeMs, previous: this.#index.get(path) });
 		this.#setIndex(path, 0, mtimeMs, null);
@@ -467,6 +540,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	_appendForWriter(path: string, line: string): IndexAppend {
+		this.#assertPathKnown(path);
 		const mtimeMs = this.#allocMtimeMs();
 		const previous = this.#index.get(path);
 		const size = (previous?.size ?? 0) + byteLength(line);
@@ -490,7 +564,14 @@ export class IndexedSessionStorage implements SessionStorage {
 		return tracked;
 	}
 
+	/** Prepare an async writer append without yielding for already-indexed paths. */
+	_prepareAppend(path: string): Promise<void> | undefined {
+		if (this.#knownPaths && !this.#knownPaths.has(path)) return this.refresh();
+		return undefined;
+	}
+
 	#restoreIndex(path: string, entry: IndexEntry | undefined): void {
+		this.#markIndexChanged(path);
 		if (entry) {
 			this.#index.set(path, entry);
 		} else {
@@ -504,6 +585,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		mtimeMs: number,
 		title: SessionTitleUpdate | null | undefined = undefined,
 	): void {
+		this.#markIndexChanged(path);
 		const current = title === undefined ? this.#index.get(path) : undefined;
 		this.#index.set(path, {
 			size,
@@ -687,6 +769,12 @@ class IndexedSessionStorageWriter implements SessionStorageWriter {
 	async append(line: string): Promise<void> {
 		if (this.#closed) throw new Error("Writer closed");
 		if (this.#error) throw this.#error;
+		const ready = this.#storage._prepareAppend(this.#path);
+		if (ready) {
+			await ready;
+			if (this.#closed) throw new Error("Writer closed");
+			if (this.#error) throw this.#error;
+		}
 		const append = this.#storage._appendForWriter(this.#path, line);
 		await this.#trackPromise(this.#storage._queueAppend(this.#path, line, append, () => this.#error));
 	}

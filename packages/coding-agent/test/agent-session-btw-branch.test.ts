@@ -163,8 +163,8 @@ describe("AgentSession.branchFromBtw", () => {
 		const createBranchedSession = activeSession.sessionManager.createBranchedSession.bind(
 			activeSession.sessionManager,
 		);
-		vi.spyOn(activeSession.sessionManager, "createBranchedSession").mockImplementation(parentId => {
-			const result = createBranchedSession(parentId);
+		vi.spyOn(activeSession.sessionManager, "createBranchedSession").mockImplementation(async parentId => {
+			const result = await createBranchedSession(parentId);
 			const lateMessage = createBtwAssistant();
 			lateMessage.usage.cost.total = 9;
 			advisor.emitExternalEvent({ type: "message_end", message: lateMessage });

@@ -201,6 +201,7 @@ import {
 import { describeUsageFallback } from "./session/retry-fallback-reason";
 import { getRestorableSessionModels } from "./session/session-context";
 import { SessionManager } from "./session/session-manager";
+import { getDefaultSessionStorage } from "./session/session-storage";
 import {
 	collectMountedMCPToolRoutes,
 	projectMountedMCPXdevGuidance,
@@ -1784,6 +1785,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				})
 			: undefined;
 	discoveredSkillsPromise?.catch(() => {});
+
+	if (!options.sessionManager) await getDefaultSessionStorage().ensureCompleteIndex?.();
 
 	const sessionManager =
 		options.sessionManager ??

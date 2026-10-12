@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `SessionManager.createBranchedSession()` is now asynchronous; await it before reading or writing the new branch.
+
 ### Added
 
 - Added `/account` and `omp account` views that group every authenticated provider subscription by account and show all reported usage windows, reset times, freshness, and unavailable or disabled accounts.
@@ -16,6 +20,7 @@
 
 ### Fixed
 
+- Fixed RPC startup timeouts when continuing SQL-backed chats in large session databases.
 - Unsupported RPC commands now preserve the request ID in error replies, so strict clients reject the request without terminating the session.
 - Disabled subscriptions remain visible when another organization or member still has an active credential.
 - Browser timeouts and tab shutdown no longer post cancellation to a terminated or replacement worker, crash the parent, or evict a tab reopened during cleanup.

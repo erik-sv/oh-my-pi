@@ -2170,6 +2170,9 @@ export class SessionManager {
 		this.#sessionClaim = undefined;
 
 		const resolvedSessionFile = path.resolve(sessionFile);
+		// SQL direct-resume storage may have only the initial path indexed. Its
+		// async existence check hydrates unknown paths before the loader's sync stat.
+		if (!loadedSession && this.#storage.ensureCompleteIndex) await this.#storage.exists(resolvedSessionFile);
 		const loaded = loadedSession ?? (await loadSessionFile(resolvedSessionFile, this.#storage));
 		const sourceSize =
 			loaded.sourceSize !== undefined
@@ -2252,6 +2255,7 @@ export class SessionManager {
 	 * from selecting the previous conversation as the most recent session.
 	 */
 	async newSession(options?: NewSessionOptions): Promise<string | undefined> {
+		await this.#storage.ensureCompleteIndex?.();
 		await this.#drainAndCloseWriter();
 		const sessionFile = this.#resetToNewSession(options);
 		await this.ensureOnDisk();
@@ -2274,6 +2278,7 @@ export class SessionManager {
 	 */
 	async fork(): Promise<{ oldSessionFile: string; newSessionFile: string } | undefined> {
 		if (!this.#persist || !this.#sessionFile) return undefined;
+		await this.#storage.ensureCompleteIndex?.();
 
 		const oldSessionFile = this.#sessionFile;
 		const parentSessionId = this.#sessionId;
@@ -2334,6 +2339,7 @@ export class SessionManager {
 		) {
 			return;
 		}
+		await this.#storage.ensureCompleteIndex?.();
 
 		// A move writes both paths: it must neither move a session another live
 		// omp process writes nor replace a destination one writes. Checked before
@@ -2538,6 +2544,7 @@ export class SessionManager {
 		options?: { sessionDir?: string; suppressBreadcrumb?: boolean },
 		storage: SessionStorage = getDefaultSessionStorage(),
 	): Promise<SessionManager> {
+		await storage.ensureCompleteIndex?.();
 		const sessionDir = options?.sessionDir ?? SessionManager.getDefaultSessionDir(this.#cwd, undefined, storage);
 		const manager = new SessionManager(this.#cwd, sessionDir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
@@ -3688,7 +3695,8 @@ export class SessionManager {
 	 * `artifact://`, so kept references stay valid and new ids cannot collide.
 	 * Returns the new file path, or undefined when not persisting.
 	 */
-	createBranchedSession(leafId: string, options?: { copyArtifacts?: boolean }): string | undefined {
+	async createBranchedSession(leafId: string, options?: { copyArtifacts?: boolean }): Promise<string | undefined> {
+		await this.#storage.ensureCompleteIndex?.();
 		const sourceSessionFile = this.#sessionFile;
 		const branchPath = this.getBranch(leafId);
 		if (branchPath.length === 0) throw new Error(`Entry ${leafId} not found`);
@@ -3833,6 +3841,7 @@ export class SessionManager {
 			repairInterruptedTail?: boolean;
 		},
 	): Promise<SessionManager> {
+		await storage.ensureCompleteIndex?.();
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const manager = new SessionManager(cwd, dir, true, storage);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
@@ -3971,6 +3980,10 @@ export class SessionManager {
 		storage: SessionStorage = getDefaultSessionStorage(),
 		options?: { initialCwd?: string; parentSession?: string; suppressBreadcrumb?: boolean; throwIfMissing?: boolean },
 	): Promise<SessionManager> {
+		filePath = path.resolve(filePath);
+		// Seeded direct resumes stay local; switching/opening another path must
+		// make its metadata available before loadSessionFile's synchronous stat.
+		if (storage.ensureCompleteIndex) await storage.exists(filePath);
 		const probed = await loadSessionFile(filePath, storage, { throwIfMissing: options?.throwIfMissing });
 		const header = probed.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		// Resume into the session's recorded cwd only when it is verifiably
@@ -4030,6 +4043,7 @@ export class SessionManager {
 		};
 
 		try {
+			if (storage.ensureCompleteIndex) await storage.exists(path.resolve(filePath));
 			await visitEntriesFromFile(filePath, visit, storage);
 		} catch {
 			return null;
@@ -4044,6 +4058,7 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = getDefaultSessionStorage(),
 	): Promise<SessionManager> {
+		await storage.ensureCompleteIndex?.();
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const resolvedCwd = path.resolve(cwd);
 		const breadcrumb = await readTerminalBreadcrumbEntry();

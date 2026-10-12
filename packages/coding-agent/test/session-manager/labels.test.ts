@@ -85,7 +85,7 @@ describe("SessionManager labels", () => {
 		expect(msg2Node?.label).toBe("response");
 	});
 
-	it("labels not on path are not preserved in createBranchedSession", () => {
+	it("labels not on path are not preserved in createBranchedSession", async () => {
 		const session = SessionManager.inMemory();
 
 		const msg1Id = session.appendMessage({ role: "user", content: "hello", timestamp: 1 });
@@ -114,7 +114,7 @@ describe("SessionManager labels", () => {
 		session.appendLabelChange(msg3Id, "third");
 
 		// Branch from msg2 (excludes msg3)
-		session.createBranchedSession(msg2Id);
+		await session.createBranchedSession(msg2Id);
 
 		// Only labels for msg1 and msg2 should be preserved
 		expect(session.getLabel(msg1Id)).toBe("first");
