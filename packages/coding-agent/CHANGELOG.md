@@ -17,9 +17,12 @@
 - RPC message lifecycle frames carry upstream's per-process `messageId` only after the host sends `set_event_filter`, so hosts that reconcile by provider `responseId` (AgentDesk) see unchanged frames; prompts that fail before reaching the agent still emit `prompt_error` ahead of their `prompt_result`.
 - Integrated upstream v18.6.2. The RPC wire schema and generated Python/Rust/Go clients include the fork's `ephemeral_turn` command and `prompt_error` frame; `ephemeral_turn` is also refused while an RPC goal continuation is scheduled.
 - A `releaseTab` that lands while a browser tab is being force-killed now joins that teardown instead of reporting an unknown tab.
+- Integrated upstream v18.10.2. Sending a message while a Codex turn is running no longer fails the turn with `unsupported_native_inflight_message`: the rejected steer stops steering for that session and the turn retries on the same model. The RPC wire schema keeps the fork's `ephemeral_turn` beside upstream's `open_session` `provider`/`modelId` binding.
+- Browser tabs recover from a renderer crash or a failed request-interception reset by reattaching a new tab subprocess; the fork does not adopt upstream's in-process worker fallback.
 
 ### Fixed
 
+- Resuming a session by path reads its SQL transcript once; upstream's missing-path check re-read it as a freshness gate.
 - Fixed RPC startup timeouts when continuing SQL-backed chats in large session databases.
 - Unsupported RPC commands now preserve the request ID in error replies, so strict clients reject the request without terminating the session.
 - Disabled subscriptions remain visible when another organization or member still has an active credential.
