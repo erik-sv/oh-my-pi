@@ -77,6 +77,297 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		await client.end();
 	});
 
+	it("bootstraps only an explicit UTF-8 resume path and its fixed sidecars, then discovers all history", async () => {
+		const { client: database, storage: seed } = await createSqlite();
+		const sessionPath = "/sessions/p/a%_'雪.jsonl";
+		const otherPath = "/sessions/p/other.jsonl";
+		const artifactsDir = sessionPath.slice(0, -".jsonl".length);
+		const draftPath = path.join(artifactsDir, "draft.txt");
+		const markerPath = path.join(artifactsDir, ".draft-only-session");
+		const backupPath = `${sessionPath}.bak`;
+		const title = { title: "Resume 雪", source: "user" as const, updatedAt: "2026-10-01T00:00:00Z" };
+		const content = `${serializeTitleSlot(title)}first 雪\nsecond 🙂\n`;
+		let allowFullIndex = false;
+		const client: SqlSessionStorageClient = {
+			options: { adapter: "sqlite" },
+			async unsafe(sql, values) {
+				if (sql.startsWith("SELECT path, SUM") && !sql.includes("WHERE path =") && !allowFullIndex) {
+					throw new Error("direct resume attempted to scan unrelated session metadata");
+				}
+				if (sql.startsWith("SELECT content") && values?.includes(otherPath)) {
+					throw new Error("direct resume attempted to open an unrelated transcript");
+				}
+				return await database.unsafe(sql, values);
+			},
+			async begin(callback) {
+				return await database.begin(callback);
+			},
+		};
+		try {
+			await seed.writeText(sessionPath, content);
+			await seed.writeText(otherPath, "unrelated history\n");
+			await seed.writeText(draftPath, "draft 雪");
+			await seed.writeText(markerPath, "");
+			await seed.writeText(backupPath, "backup\n");
+			await database.unsafe("UPDATE omp_session_chunks SET mtime_ms = ? WHERE path = ?", [123456, sessionPath]);
+
+			const storage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			expect(() => storage.listFilesSync("/sessions/p", "*.jsonl")).toThrow();
+			expect(storage.statSync(sessionPath)).toMatchObject({ size: Buffer.byteLength(content), mtimeMs: 123456 });
+			expect(await storage.readText(sessionPath)).toBe(content);
+			expect(await storage.readText(draftPath)).toBe("draft 雪");
+			expect(storage.existsSync(markerPath)).toBe(true);
+			expect(storage.statSync(markerPath).size).toBe(0);
+			expect(await storage.readText(backupPath)).toBe("backup\n");
+
+			allowFullIndex = true;
+			await storage.ensureCompleteIndex?.();
+			expect(storage.listFilesSync("/sessions/p", "*.jsonl").sort()).toEqual([sessionPath, otherPath].sort());
+			expect(storage.statSync(otherPath).size).toBe(Buffer.byteLength("unrelated history\n"));
+			const normalStartup = await SqlSessionStorage.create({ client: database, createTable: false });
+			expect(normalStartup.listFilesSync("/sessions/p", "*.jsonl").sort()).toEqual([sessionPath, otherPath].sort());
+		} finally {
+			await database.end();
+		}
+	});
+
+	it("rejects missing-file CAS on an unseeded UTF-8 session without discarding its content or title", async () => {
+		const { client, storage: seed } = await createSqlite();
+		const sessionPath = "/sessions/p/resume.jsonl";
+		const unseenPath = "/sessions/p/unseen.jsonl";
+		const title = { title: "Keep this title", source: "user" as const, updatedAt: "2026-10-01T00:00:00Z" };
+		const original = `${serializeTitleSlot(title)}雪🙂\n`;
+		try {
+			await seed.writeText(sessionPath, "resume\n");
+			await seed.writeText(unseenPath, original);
+			const originalStat = seed.statSync(unseenPath);
+			const storage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+
+			await expect(
+				storage.writeTextAtomic(unseenPath, "replacement\n", { expectedSize: null }),
+			).rejects.toMatchObject({
+				name: "SessionWriteConflictError",
+				actualSize: Buffer.byteLength(original),
+			});
+			expect(await storage.readText(unseenPath)).toBe(original);
+			expect(storage.statSync(unseenPath)).toMatchObject(originalStat);
+			expect(storage.listFilesSync("/sessions/p", "*.jsonl").sort()).toEqual([sessionPath, unseenPath].sort());
+
+			await storage.writeTextAtomic(unseenPath, "replacement 雪\n", { expectedSize: Buffer.byteLength(original) });
+			expect(await readChunks(client, unseenPath)).toBe("replacement 雪\n");
+			expect(storage.statSync(unseenPath).size).toBe(Buffer.byteLength("replacement 雪\n"));
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("hydrates an unseeded writer append before computing UTF-8 size and preserves indexed title metadata", async () => {
+		const { client, storage: seed } = await createSqlite();
+		const sessionPath = "/sessions/p/resume.jsonl";
+		const unseenPath = "/sessions/p/unseen.jsonl";
+		const title = { title: "Original", source: "auto" as const, updatedAt: "2026-10-01T00:00:00Z" };
+		const original = `${serializeTitleSlot(title)}雪\n`;
+		const appended = "🙂 appended\n";
+		try {
+			await seed.writeText(sessionPath, "resume\n");
+			await seed.writeText(unseenPath, original);
+			const storage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			const writer = storage.openWriter(unseenPath);
+			await writer.append(appended);
+			await writer.close();
+
+			expect(storage.statSync(unseenPath).size).toBe(Buffer.byteLength(original + appended));
+			expect(await storage.readText(unseenPath)).toBe(original + appended);
+			const [prefix, suffix] = await storage.readTextSlices(
+				unseenPath,
+				Buffer.byteLength(original),
+				Buffer.byteLength(appended),
+			);
+			expect(prefix).toBe(original);
+			expect(suffix).toBe(appended);
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("single-flight hydration preserves committed titles and queued optimistic sidecar metadata", async () => {
+		const { client: database, storage: seed } = await createSqlite();
+		const sessionPath = "/sessions/p/resume.jsonl";
+		const unseenPath = "/sessions/p/unseen.jsonl";
+		const draftPath = "/sessions/p/resume/draft.txt";
+		const oldTitle = { title: "Old", source: "auto" as const, updatedAt: "2026-10-01T00:00:00Z" };
+		const newTitle = { title: "New 雪", source: "user" as const, updatedAt: "2026-10-02T00:00:00Z" };
+		const body = "preserved transcript 雪\n";
+		const snapshotReady = Promise.withResolvers<void>();
+		const snapshotRelease = Promise.withResolvers<void>();
+		const writesRelease = Promise.withResolvers<void>();
+		let holdWrites = false;
+		let fullLoads = 0;
+		const client: SqlSessionStorageClient = {
+			options: { adapter: "sqlite" },
+			async unsafe(sql, values) {
+				const rows = await database.unsafe(sql, values);
+				if (sql.startsWith("SELECT path, SUM") && !sql.includes("WHERE path =")) {
+					fullLoads++;
+					snapshotReady.resolve();
+					await snapshotRelease.promise;
+				}
+				return rows;
+			},
+			async begin(callback) {
+				if (holdWrites) await writesRelease.promise;
+				return await database.begin(callback);
+			},
+		};
+		try {
+			await seed.writeText(sessionPath, `${serializeTitleSlot(oldTitle)}${body}`);
+			await seed.writeText(unseenPath, "other history\n");
+			const storage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			const firstHydration = storage.ensureCompleteIndex?.();
+			const secondHydration = storage.ensureCompleteIndex?.();
+			await snapshotReady.promise;
+
+			await storage.updateSessionTitle(sessionPath, newTitle);
+			const titleStat = storage.statSync(sessionPath);
+			holdWrites = true;
+			storage.writeTextSync(draftPath, "pending draft 🙂", { expectedSize: null });
+			const draftStat = storage.statSync(draftPath);
+			snapshotRelease.resolve();
+			await Promise.all([firstHydration, secondHydration]);
+
+			expect(fullLoads).toBe(1);
+			expect(storage.statSync(sessionPath)).toMatchObject(titleStat);
+			expect(await storage.readText(sessionPath)).toBe(`${serializeTitleSlot(newTitle)}${body}`);
+			expect(storage.statSync(draftPath)).toMatchObject(draftStat);
+			expect(draftStat.size).toBe(Buffer.byteLength("pending draft 🙂"));
+			expect(storage.listFilesSync("/sessions/p", "*.jsonl").sort()).toEqual([sessionPath, unseenPath].sort());
+
+			writesRelease.resolve();
+			await storage.drain();
+			expect(await storage.readText(draftPath)).toBe("pending draft 🙂");
+			expect(storage.statSync(draftPath)).toMatchObject(draftStat);
+		} finally {
+			snapshotRelease.resolve();
+			writesRelease.resolve();
+			await database.end();
+		}
+	});
+
+	it("hydrates unseen title, rename, and unlink metadata instead of treating existing paths as missing", async () => {
+		const { client, storage: seed } = await createSqlite();
+		const sessionPath = "/sessions/p/resume.jsonl";
+		const sourcePath = "/sessions/p/source.jsonl";
+		const destinationPath = "/sessions/p/destination.jsonl";
+		const title = { title: "Source", source: "auto" as const, updatedAt: "2026-10-01T00:00:00Z" };
+		const nextTitle = { title: "Renamed 雪", source: "user" as const, updatedAt: "2026-10-02T00:00:00Z" };
+		const body = "keep source 雪\n";
+		try {
+			await seed.writeText(sessionPath, "resume\n");
+			await seed.writeText(sourcePath, `${serializeTitleSlot(title)}${body}`);
+			await seed.writeText(destinationPath, "replace destination\n");
+			const titleStorage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			await titleStorage.updateSessionTitle(sourcePath, nextTitle);
+			const sourceStat = titleStorage.statSync(sourcePath);
+
+			const moveStorage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			await moveStorage.rename(sourcePath, destinationPath);
+			expect(await moveStorage.exists(sourcePath)).toBe(false);
+			expect(moveStorage.statSync(destinationPath)).toMatchObject(sourceStat);
+			expect(await moveStorage.readText(destinationPath)).toBe(`${serializeTitleSlot(nextTitle)}${body}`);
+			expect(await readChunks(client, destinationPath)).toBe(`${serializeTitleSlot(title)}${body}`);
+
+			const deleteStorage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			await deleteStorage.unlink(destinationPath);
+			expect(deleteStorage.listFilesSync("/sessions/p", "*.jsonl")).toEqual([sessionPath]);
+			expect(await listChunkPaths(client)).toEqual([sessionPath]);
+		} finally {
+			await client.end();
+		}
+	});
+
+	it("rolls back optimistic metadata when a queued write fails after full hydration", async () => {
+		const { client: database, storage: seed } = await createSqlite();
+		const sessionPath = "/sessions/p/resume.jsonl";
+		const unseenPath = "/sessions/p/unseen.jsonl";
+		const title = { title: "Durable", source: "user" as const, updatedAt: "2026-10-01T00:00:00Z" };
+		const original = `${serializeTitleSlot(title)}durable 雪\n`;
+		const snapshotReady = Promise.withResolvers<void>();
+		const snapshotRelease = Promise.withResolvers<void>();
+		const writeRelease = Promise.withResolvers<void>();
+		let rejectWrites = false;
+		const client: SqlSessionStorageClient = {
+			options: { adapter: "sqlite" },
+			async unsafe(sql, values) {
+				const rows = await database.unsafe(sql, values);
+				if (sql.startsWith("SELECT path, SUM") && !sql.includes("WHERE path =")) {
+					snapshotReady.resolve();
+					await snapshotRelease.promise;
+				}
+				return rows;
+			},
+			async begin(callback) {
+				if (rejectWrites) {
+					await writeRelease.promise;
+					throw new Error("forced queued publish failure");
+				}
+				return await database.begin(callback);
+			},
+		};
+		try {
+			await seed.writeText(sessionPath, original);
+			await seed.writeText(unseenPath, "other history\n");
+			const storage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
+			const originalStat = storage.statSync(sessionPath);
+			const hydration = storage.ensureCompleteIndex?.();
+			await snapshotReady.promise;
+			rejectWrites = true;
+			storage.writeTextSync(sessionPath, "not durable 🙂\n", { expectedSize: originalStat.size });
+			snapshotRelease.resolve();
+			await hydration;
+			expect(storage.statSync(sessionPath).size).toBe(Buffer.byteLength("not durable 🙂\n"));
+
+			writeRelease.resolve();
+			await expect(storage.drain()).rejects.toThrow("forced queued publish failure");
+			expect(storage.statSync(sessionPath)).toMatchObject(originalStat);
+			expect(await storage.readText(sessionPath)).toBe(original);
+			expect(await storage.readText(unseenPath)).toBe("other history\n");
+		} finally {
+			snapshotRelease.resolve();
+			writeRelease.resolve();
+			await database.end();
+		}
+	});
+
+	it("hydrates all artifact rows before deleting a seeded session and leaves other sessions intact", async () => {
+		const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-sql-partial-delete-"));
+		const client = new SQL("sqlite::memory:");
+		try {
+			const seed = await SqlSessionStorage.create({ client, sessionRoot: tempDir });
+			const sessionPath = path.join(tempDir, "resume.jsonl");
+			const otherPath = path.join(tempDir, "other.jsonl");
+			const artifactsDir = sessionPath.slice(0, -".jsonl".length);
+			const artifactPath = path.join(artifactsDir, "nested", "output.txt");
+			await seed.writeText(sessionPath, "delete this transcript\n");
+			await seed.writeText(otherPath, "retain other history\n");
+			await seed.writeText(artifactPath, "SQL artifact bytes\n");
+			await Bun.write(path.join(artifactsDir, "tool-output.txt"), "physical artifact bytes\n");
+			const storage = await SqlSessionStorage.create({
+				client,
+				createTable: false,
+				sessionRoot: tempDir,
+				initialPath: sessionPath,
+			});
+
+			await storage.deleteSessionWithArtifacts(sessionPath);
+			expect(await listChunkPaths(client)).toEqual([otherPath]);
+			expect(await storage.readText(otherPath)).toBe("retain other history\n");
+			expect(fs.existsSync(artifactsDir)).toBe(false);
+		} finally {
+			await client.end();
+			await fsp.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("migrates legacy single-row transcripts and title metadata into chunk storage", async () => {
 		const client = new SQL("sqlite::memory:");
 		const sessionPath = "/sessions/legacy/2026-01-02_legacy1234.jsonl";

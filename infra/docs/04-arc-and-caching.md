@@ -423,7 +423,7 @@ bazel build \
   --remote_cache=grpcs://bazel-remote.bazel-cache.svc.cluster.local:9092 \
   --tls_certificate=infra/bazel-remote/ca.crt \
   --remote_header="authorization=Basic $(printf %s "$BAZEL_REMOTE_USER:$BAZEL_REMOTE_PASSWORD" | base64 -w0)" \
-  //:natives-linux-all
+  //:natives-all
 ```
 
 On omp-kata the credentials come from the injected pod env
@@ -437,9 +437,8 @@ main whenever the restore was not an exact hit. Keys carry a config hash
 (toolchain and build settings, including `Cargo.toml`/`Cargo.lock`) and a
 `crates/**` source hash. Cache keys are immutable, so each Linux scope has one
 producer: `native_addons` owns `linux-x64`, `native_addons_cross` owns `linux`
-(the cross-target addon archive) and `rust_validate` owns `linux-validate`. The `release-darwin-*`
-scopes are produced by `bazel-cache-warm` and by the release darwin legs, which
-build the same target for the same scope. A kata job exports nothing of its
+(the cross-target addon archive) and `rust_validate` owns `linux-validate`. A
+kata job exports nothing of its
 own: its rc carries no `--disk_cache`, it writes through to bazel-remote, it
 skips artifact downloads entirely (`--remote_download_toplevel`), and it keeps
 the xwin MSVC splat on the runner-cache PVC (`OMP_XWIN_CACHE_DIR`).

@@ -562,6 +562,7 @@ async function collectSessionsFromFiles(
  * Exported for testing.
  */
 export async function recoverOrphanedBackups(sessionDir: string, storage: SessionStorage): Promise<void> {
+	await storage.ensureCompleteIndex?.();
 	let backups: string[];
 	try {
 		backups = storage.listFilesSync(sessionDir, "*.bak");
@@ -616,10 +617,11 @@ async function scanSessionDir(
 	sessionDir: string,
 	storage: SessionStorage,
 	withStatus: boolean,
+	siblingDirs: readonly string[] = [],
 ): Promise<SessionInfo[]> {
 	try {
 		await recoverOrphanedBackups(sessionDir, storage);
-		const files = storage.listFilesSync(sessionDir, "*.jsonl");
+		const files = [sessionDir, ...siblingDirs].flatMap(dir => storage.listFilesSync(dir, "*.jsonl"));
 		return await collectSessionsFromFiles(files, storage, withStatus);
 	} catch {
 		return [];
@@ -631,6 +633,7 @@ async function scanSessionDirReadOnly(
 	storage: SessionStorage,
 	withStatus: boolean,
 ): Promise<SessionInfo[]> {
+	await storage.ensureCompleteIndex?.();
 	try {
 		const files = storage.listFilesSync(sessionDir, "*.jsonl");
 		return await collectSessionsFromFiles(files, storage, withStatus);
@@ -641,10 +644,16 @@ async function scanSessionDirReadOnly(
 
 /**
  * List sessions in a resolved session directory (newest first), reading each
- * file's lifecycle {@link SessionStatus}.
+ * file's lifecycle {@link SessionStatus}. `siblingDirs` merge into the same
+ * list; they belong to other working directories (see `worktreeSessionDirs`),
+ * so orphaned-backup recovery runs on `sessionDir` only.
  */
-export function listSessions(sessionDir: string, storage: SessionStorage): Promise<SessionInfo[]> {
-	return scanSessionDir(sessionDir, storage, true);
+export function listSessions(
+	sessionDir: string,
+	storage: SessionStorage,
+	siblingDirs: readonly string[] = [],
+): Promise<SessionInfo[]> {
+	return scanSessionDir(sessionDir, storage, true, siblingDirs);
 }
 
 /**
@@ -659,6 +668,7 @@ export async function listAllSessions(
 	storage: SessionStorage = getDefaultSessionStorage(),
 	sessionsRoot: string = getSessionsDir(),
 ): Promise<SessionInfo[]> {
+	await storage.ensureCompleteIndex?.();
 	try {
 		const files = storage.listFilesSync(sessionsRoot, "*/*.jsonl");
 		return await collectSessionsFromFiles(files, storage, true);
@@ -737,6 +747,7 @@ async function newestSessionFiles(
 	pattern: string,
 	storage: SessionStorage,
 ): Promise<StatedSessionFile[]> {
+	await storage.ensureCompleteIndex?.();
 	let files: string[];
 	try {
 		files =

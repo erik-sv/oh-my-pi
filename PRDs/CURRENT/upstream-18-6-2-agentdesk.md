@@ -1,5 +1,5 @@
 # Upstream 18.6.2 AgentDesk Integration
-Status: Integrated, verified, and activated for new local AgentDesk launches, the auth broker/gateway, and the interactive CLI.
+Status: Superseded by upstream-18-10-2-agentdesk.md.
 Current Goal: Observe new AgentDesk sessions on 18.6.2. Move the fixed `OMP_BIN` (remote placements, employee workers) at the next planned AgentDesk restart.
 
 ## Overview
