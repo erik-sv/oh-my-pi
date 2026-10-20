@@ -813,6 +813,10 @@
 				},
 				"itemId": {
 					"type": "string"
+				},
+				"narration": {
+					"type": "boolean",
+					"description": "Prose the model addressed to the user, returned by the provider as thinking; present it as answer text."
 				}
 			},
 			"required": [
@@ -2780,6 +2784,9 @@
 					"type": "object",
 					"properties": {},
 					"additionalProperties": {}
+				},
+				"providerReplayThroughEntryId": {
+					"type": "string"
 				}
 			},
 			"required": [
@@ -3519,6 +3526,13 @@
 			"properties": {
 				"type": {
 					"const": "agent_start"
+				},
+				"resumedToolCallIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Calls of an unpaired assistant tail a continued run executes before its first model request."
 				}
 			},
 			"required": [

@@ -122,6 +122,14 @@ Ensure bun's global bin (`~/.bun/bin`) is on your `PATH`, then run `omp --versio
 
 **Windows:** use WSL2 and follow the steps above, or run the script under Git Bash after installing bun, rustup, and the MSVC C++ Build Tools. A standalone, no-Rust binary can be produced per-OS with `bun run build` (output: `packages/coding-agent/dist/omp`).
 
+#### AgentDesk compatibility
+
+The v18.12.3 integration retains chunked SQL sessions, the two-connection SQL pool cap, direct SQL resume, `ephemeral_turn`, pre-agent `prompt_error` events, opt-in RPC message IDs, per-account usage, and PID-namespace-aware process ownership.
+
+Browser tabs still run in isolated subprocesses. Upstream worker-crash recovery reattaches the same page in a replacement subprocess; it never falls back to running tab code in the host process. Consult (`/seance`) resolves SQL-backed parent and subagent transcripts through the selected session storage.
+
+Build and smoke-test candidates with an isolated HOME and agent directory. Unset inherited `PI_CONFIG_FILES`, `OMP_SESSION_DB_OPTIONS`, and `OMP_SESSION_DB_URL` for tests. Validate new and resumed AgentDesk chats through completed SSE and persisted replies before activation. The local runtime selector, interactive CLI, and fixed service `OMP_BIN` are separate deployment surfaces; updating one does not update the others or replace running children.
+
 ### Shell completions
 
 `omp` generates its own completion scripts for **bash**, **zsh**, and **fish** from the live command/flag metadata, so they never drift from the actual CLI. Subcommands, flags, and enum values complete statically; model names (`--model`, `--smol`, `--slow`, `--plan`) resolve against the bundled model catalog and `--resume` against your on-disk sessions.
@@ -368,7 +376,7 @@ Auth tags below: `oauth` signs in with your provider account, `plan` routes thro
 
 Direct APIs and gateways. Mix providers per role.
 
-Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google Vertex · Google Antigravity `oauth` · xAI · SuperGrok `oauth` · DeepSeek · Mistral · Groq · Cerebras · Fireworks · Together · Baseten · DeepInfra · Hugging Face · NVIDIA · Meta · Amazon Bedrock · Azure OpenAI · SiliconFlow · GMI Cloud · CoreWeave · Sakana AI · Command Code · Charm Hyper · StepFun · Helmcode · OpenRouter · Synthetic · Vercel AI Gateway · Cloudflare AI Gateway · Wafer Serverless
+Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google Vertex · Google Antigravity `oauth` · xAI · SuperGrok `oauth` · DeepSeek · Mistral · Groq · Cerebras · SambaNova · Fireworks · Together · Baseten · DeepInfra · Hugging Face · NVIDIA · Meta · Amazon Bedrock · Azure OpenAI · SiliconFlow · GMI Cloud · CoreWeave · Sakana AI · Command Code · Charm Hyper · StepFun · Helmcode · OpenRouter · Synthetic · Vercel AI Gateway · Cloudflare AI Gateway · Wafer Serverless
 
 ### Coding plans
 

@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as tls from "node:tls";
 import { isAnthropicSigningProxyUrl, isOfficialAnthropicApiUrl } from "@oh-my-pi/pi-catalog/compat/anthropic";
-import { hostMatchesUrl, isVertexRawPredictUrl } from "@oh-my-pi/pi-catalog/hosts";
+import { hostMatchesUrl, isVertexRawPredictUrl, modelMatchesHost } from "@oh-my-pi/pi-catalog/hosts";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { mapEffortToAnthropicAdaptiveEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost, getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -23,11 +23,13 @@ import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { waitForRetry } from "../utils/retry-wait";
 import { getEnvApiKey } from "../env-api-key";
 import { OUTPUT_FALLBACK_BUFFER } from "../stream";
+import { wrapFetchForRequestCompression } from "../utils/request-compression";
 import type {
 	AnthropicCompactionFiles,
 	AnthropicCompactionPayload,
 	AnthropicCompactionRequest,
 	AnthropicFallbackContent,
+	AnthropicFallbackCreditHandle,
 	AnthropicMessagePayload,
 	AnthropicOutputEffort,
 	AnthropicRequestControls,
@@ -141,10 +143,11 @@ import {
 	resolveGitHubCopilotBaseUrl,
 	wrapFetchForCopilotFallback,
 } from "./github-copilot-headers";
-import { servedModelFromAnthropicSignature } from "./anthropic-signature";
+import { prepareAnthropicImageContext } from "./anthropic-images";
+import { isAnthropicNarrationSignature, servedModelFromAnthropicSignature } from "./anthropic-signature";
 import { getOpenAIPromptCacheKey } from "./openai-shared";
 import { applyInferenceHeaders } from "./inference-headers";
-import { redactSensitiveCredentials, transformMessages } from "./transform-messages";
+import { isAnthropicMessagesModel, redactSensitiveCredentials, transformMessages } from "./transform-messages";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "./vision-guard";
 import {
 	injectedClientBaseUrl,
@@ -238,6 +241,12 @@ const contextManagementBeta = "context-management-2025-06-27";
 const structuredOutputsBeta = "structured-outputs-2025-12-15";
 const thinkingTokenCountBeta = "thinking-token-count-2026-05-13";
 const fallbackCreditBeta = "fallback-credit-2026-06-01";
+/**
+ * Redemption window of a refusal's `fallback_credit_token`. `stop_details`
+ * reports no expiry; the documented window is five minutes from the refusal
+ * (https://platform.claude.com/docs/en/build-with-claude/fallback-credit).
+ */
+const FALLBACK_CREDIT_TTL_MS = 5 * 60 * 1000;
 const promptCachingScopeBeta = "prompt-caching-scope-2026-01-05";
 const claudeCodeUtilityBetaDefaults = [
 	oauthAuthBeta,
@@ -592,7 +601,11 @@ type AnthropicProviderSessionState = ProviderSessionState & {
 	 * Cleared on session close.
 	 */
 	cacheControlOptionsUnsupported: boolean;
-	/** Thinking blocks stripped after a prefix-binding 400 forced a retry without `drop_block`. */
+	/**
+	 * Thinking blocks the client strips after a 400 rejected their replay: a
+	 * prefix-binding 400 that forced a retry without `drop_block`, or a latest
+	 * assistant turn whose reasoning the API refused as modified.
+	 */
 	prefixDroppedThinkingBlocks: Set<string>;
 	/**
 	 * Server-reported `prefix_binding_mismatch` drops already warned about. A
@@ -939,15 +952,11 @@ function getUmansWebSearchProvider(headers: Record<string, string> | undefined):
 	return normalizeUmansWebSearchProvider($env.UMANS_WEBSEARCH_PROVIDER);
 }
 
-function isUmansAnthropicModel(model: Model<"anthropic-messages">): boolean {
-	return model.provider === "umans" || model.baseUrl.toLowerCase().includes("api.code.umans.ai");
-}
-
 function getUmansWebSearchHeader(
 	model: Model<"anthropic-messages">,
 	headers: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
-	if (!isUmansAnthropicModel(model)) return undefined;
+	if (!modelMatchesHost(model, "umans")) return undefined;
 	const provider = getUmansWebSearchProvider(headers);
 	return provider ? { [UMANS_WEBSEARCH_PROVIDER_HEADER]: provider } : undefined;
 }
@@ -970,253 +979,6 @@ function encodeAnthropicToolName(
 function decodeAnthropicToolName(name: string, isOAuthToken: boolean, escapeBuiltinToolNames: boolean): string {
 	if (isOAuthToken || escapeBuiltinToolNames) return stripClaudeToolPrefix(name);
 	return name;
-}
-
-const ANTHROPIC_MANY_IMAGE_THRESHOLD = 20;
-const ANTHROPIC_MANY_IMAGE_MAX_DIMENSION = 2000;
-/**
- * Image contract of the canonical Anthropic Messages API, used when resolved
- * model policy names no other: 8000px per side ("At least one of the image
- * dimensions exceed max allowed size: 8000 pixels") and a 10 MB base64
- * payload per block ("image exceeds 10 MB maximum: 14012300 bytes >
- * 10485760 bytes"), measured on the encoded string rather than the decoded
- * bytes. Either rejection poisons every retry and model fallback because the
- * block stays in context, so both are clamped before the request goes out.
- * A host with a different image contract sets `max-image-dimension` /
- * `max-image-payload-bytes` in the KDL compatibility rules.
- */
-const ANTHROPIC_MAX_IMAGE_DIMENSION = 8000;
-const ANTHROPIC_MAX_IMAGE_PAYLOAD_BYTES = 10 * 1024 * 1024;
-/** Headroom for the surrounding JSON and any provider-side accounting. */
-const ANTHROPIC_IMAGE_PAYLOAD_HEADROOM = 0.9;
-/** Re-encode passes allowed to bring one image under the byte budget. */
-const ANTHROPIC_IMAGE_RESIZE_ATTEMPTS = 4;
-
-/**
- * Image bounds for one request. `maxDimension` and `payloadBudget` come from
- * resolved model policy (`max-image-dimension`, `max-image-payload-bytes`) so
- * a deployment whose image contract differs from the canonical API can
- * override them, and the many-image path tightens `maxDimension` further
- * because many images share one request budget.
- */
-interface AnthropicImageCaps {
-	maxDimension: number;
-	payloadBudget: number;
-}
-
-function countAnthropicImageBlocks(messages: Message[]): number {
-	let count = 0;
-	for (const message of messages) {
-		if (message.role !== "user" && message.role !== "developer" && message.role !== "toolResult") continue;
-		if (!Array.isArray(message.content)) continue;
-		for (const block of message.content) {
-			if (block.type === "image") count++;
-		}
-	}
-	return count;
-}
-
-/**
- * Ceiling on encoder output pixels in flight. One 8000x8000 RGBA surface is
- * roughly 256 MiB, so admitting four of them would spike the CLI by a
- * gigabyte; at the full-resolution cap this yields a single pipeline, while
- * the many-image cap encodes at most 2000px and keeps the four-way fan-out.
- */
-const ANTHROPIC_IMAGE_RESIZE_PIXEL_BUDGET = 16_000_000;
-const ANTHROPIC_IMAGE_RESIZE_MAX_CONCURRENCY = 4;
-
-function anthropicImageResizeConcurrency(maxDimension: number): number {
-	const perPipeline = maxDimension * maxDimension;
-	if (perPipeline <= 0) return ANTHROPIC_IMAGE_RESIZE_MAX_CONCURRENCY;
-	return Math.max(
-		1,
-		Math.min(ANTHROPIC_IMAGE_RESIZE_MAX_CONCURRENCY, Math.floor(ANTHROPIC_IMAGE_RESIZE_PIXEL_BUDGET / perPipeline)),
-	);
-}
-
-/**
- * Memoized resize results keyed on ImageContent identity, per cap pair.
- * Callers keep message objects stable across turns, so without this every
- * request (and every in-provider retry of a fresh turn) re-decodes and
- * re-encodes the same oversized screenshots. A cached value identical to the
- * key means "already within bounds / unresizable — skip the decode". The caps
- * depend on image count and on resolved policy, so each pair keeps its own
- * cache: a value cached at 8000px is not reusable at 2000px.
- */
-const anthropicImageResizeCaches = new Map<string, WeakMap<ImageContent, ImageContent>>();
-
-function anthropicImageResizeCache(caps: AnthropicImageCaps): WeakMap<ImageContent, ImageContent> {
-	const key = `${caps.maxDimension}:${caps.payloadBudget}`;
-	const existing = anthropicImageResizeCaches.get(key);
-	if (existing) return existing;
-	const created = new WeakMap<ImageContent, ImageContent>();
-	anthropicImageResizeCaches.set(key, created);
-	return created;
-}
-
-type ResizeLimiter = <R>(fn: () => Promise<R>) => Promise<R>;
-
-/**
- * Bounded-concurrency gate for image decode/encode work. The many-image path
- * fans out over every block of every message; unbounded, 100+ oversized images
- * would decode concurrently and spike memory by gigabytes. Slots are handed
- * off directly to the next waiter on release.
- */
-function createResizeLimiter(limit: number): ResizeLimiter {
-	let active = 0;
-	const queue: (() => void)[] = [];
-	return async fn => {
-		if (active >= limit) {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			queue.push(resolve);
-			await promise;
-		} else {
-			active++;
-		}
-		try {
-			return await fn();
-		} finally {
-			const next = queue.shift();
-			if (next) next();
-			else active--;
-		}
-	};
-}
-
-async function resizeAnthropicImageBlock(block: ImageContent, caps: AnthropicImageCaps): Promise<ImageContent> {
-	const { maxDimension, payloadBudget } = caps;
-	try {
-		const inputBuffer = Buffer.from(block.data, "base64");
-		const { width, height } = await new Bun.Image(inputBuffer).metadata();
-		if (!width || !height) return block;
-		const overDimension = width > maxDimension || height > maxDimension;
-		const overBudget = block.data.length > payloadBudget;
-		if (!overDimension && !overBudget) return block;
-
-		// Fitting the pixel cap does not imply fitting the byte cap: a dense
-		// screenshot re-encodes large even at the cap. Shrink by the overshoot in
-		// area terms until the payload fits or the passes run out.
-		let scale = Math.min(1, maxDimension / width, maxDimension / height);
-		let best: { buffer: Uint8Array; mimeType: string } | undefined;
-		for (let attempt = 0; attempt < ANTHROPIC_IMAGE_RESIZE_ATTEMPTS; attempt++) {
-			const targetWidth = Math.max(1, Math.min(maxDimension, Math.round(width * scale)));
-			const targetHeight = Math.max(1, Math.min(maxDimension, Math.round(height * scale)));
-			// One encoder at a time: a full-resolution surface is hundreds of
-			// megabytes, so the two candidates never coexist.
-			const png = await new Bun.Image(inputBuffer).resize(targetWidth, targetHeight).png().bytes();
-			const jpeg = await new Bun.Image(inputBuffer).resize(targetWidth, targetHeight).jpeg({ quality: 85 }).bytes();
-			best =
-				png.length <= jpeg.length
-					? { buffer: png, mimeType: "image/png" }
-					: { buffer: jpeg, mimeType: "image/jpeg" };
-
-			// Base64 expands three bytes into four characters; the encoded length
-			// is what Anthropic measures, so derive it without encoding.
-			const encoded = Math.ceil(best.buffer.length / 3) * 4;
-			if (encoded <= payloadBudget) break;
-			if (targetWidth === 1 && targetHeight === 1) break;
-			scale *= Math.max(0.25, Math.sqrt(payloadBudget / encoded) * 0.9);
-		}
-		if (!best) return block;
-
-		const data = Buffer.from(best.buffer).toString("base64");
-		// An image inside the pixel cap is only worth replacing if it shrank.
-		if (!overDimension && data.length >= block.data.length) return block;
-		// The rebuilt block carries no `url` or `providerFile`: those reference
-		// the original bytes, and Anthropic validates a referenced image after
-		// fetching it, so keeping either would resend the oversized copy.
-		return {
-			type: "image",
-			data,
-			mimeType: best.mimeType,
-		};
-	} catch (error) {
-		logger.warn("anthropic: failed to resize oversized image", {
-			mimeType: block.mimeType,
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return block;
-	}
-}
-
-async function resizeAnthropicImageContent(
-	content: (TextContent | ImageContent)[],
-	state: { resized: number },
-	limit: ResizeLimiter,
-	caps: AnthropicImageCaps,
-): Promise<(TextContent | ImageContent)[]> {
-	let changed = false;
-	const cache = anthropicImageResizeCache(caps);
-	const next = await Promise.all(
-		content.map(async block => {
-			if (block.type !== "image") return block;
-			let resized = cache.get(block);
-			if (resized === undefined) {
-				resized = await limit(() => resizeAnthropicImageBlock(block, caps));
-				cache.set(block, resized);
-			}
-			if (resized !== block) {
-				changed = true;
-				state.resized++;
-			}
-			return resized;
-		}),
-	);
-	return changed ? next : content;
-}
-
-async function resizeAnthropicImageMessage(
-	message: Message,
-	state: { resized: number },
-	limit: ResizeLimiter,
-	caps: AnthropicImageCaps,
-): Promise<Message> {
-	if (message.role === "user" || message.role === "developer") {
-		if (!Array.isArray(message.content)) return message;
-		const content = await resizeAnthropicImageContent(message.content, state, limit, caps);
-		return content === message.content ? message : { ...message, content };
-	}
-	if (message.role === "toolResult") {
-		const content = await resizeAnthropicImageContent(message.content, state, limit, caps);
-		return content === message.content ? message : { ...message, content };
-	}
-	return message;
-}
-
-async function prepareAnthropicImageContext(context: Context, model: Model<"anthropic-messages">): Promise<Context> {
-	if (!model.input.includes("image")) return context;
-	const imageCount = countAnthropicImageBlocks(context.messages);
-	if (imageCount === 0) return context;
-	// Many images share one request size budget, so they get the tighter cap.
-	// A smaller set only has to clear the host's per-image limit.
-	const hostMaxDimension = model.compat.maxImageDimension ?? ANTHROPIC_MAX_IMAGE_DIMENSION;
-	const maxDimension =
-		imageCount > ANTHROPIC_MANY_IMAGE_THRESHOLD
-			? Math.min(ANTHROPIC_MANY_IMAGE_MAX_DIMENSION, hostMaxDimension)
-			: hostMaxDimension;
-	const maxPayloadBytes = model.compat.maxImagePayloadBytes ?? ANTHROPIC_MAX_IMAGE_PAYLOAD_BYTES;
-	const caps: AnthropicImageCaps = {
-		maxDimension,
-		payloadBudget: Math.floor(maxPayloadBytes * ANTHROPIC_IMAGE_PAYLOAD_HEADROOM),
-	};
-
-	let changed = false;
-	const state = { resized: 0 };
-	const limit = createResizeLimiter(anthropicImageResizeConcurrency(maxDimension));
-	const messages = await Promise.all(
-		context.messages.map(async message => {
-			const next = await resizeAnthropicImageMessage(message, state, limit, caps);
-			if (next !== message) changed = true;
-			return next;
-		}),
-	);
-	if (!changed) return context;
-	logger.debug("anthropic: resized oversized images", {
-		imageCount,
-		resized: state.resized,
-		maxDimension,
-	});
-	return { ...context, messages };
 }
 
 type AnthropicImageSource =
@@ -1360,7 +1122,8 @@ export interface AnthropicOptions extends StreamOptions {
 	 * header is auto-attached; the response parser then honors mid-stream
 	 * `fallback` content blocks and `usage.iterations` for served-model
 	 * promotion and per-attempt pricing. Opt-in ONLY — leaving this
-	 * undefined preserves the pre-fallback behavior on every code path.
+	 * undefined sends neither and keeps both off; a `fallback` block in the
+	 * response (a gateway opted in) is still persisted as a replay boundary.
 	 */
 	fallbacks?: FallbackParam[];
 }
@@ -1375,6 +1138,8 @@ export type AnthropicClientOptionsArgs = {
 	dynamicHeaders?: Record<string, string>;
 	isOAuth?: boolean;
 	hasTools?: boolean;
+	/** Whether a tool in ANTHROPIC_BUFFERED_INPUT_TOOLS is present; suppresses the request-wide fine-grained streaming beta. */
+	hasBufferedInputTools?: boolean;
 	thinkingEnabled?: boolean;
 	thinkingDisplay?: AnthropicThinkingDisplay;
 	disableStrictTools?: boolean;
@@ -1448,7 +1213,7 @@ function resolveAnthropicBaseUrl(model: Model<"anthropic-messages">, apiKey?: st
 	if (model.provider === "github-copilot") {
 		return normalizeAnthropicBaseUrl(resolveGitHubCopilotBaseUrl(model.baseUrl, apiKey) ?? model.baseUrl);
 	}
-	if (model.provider === "anthropic") return resolveDirectAnthropicBaseUrl(model);
+	if (model.compat.firstPartyProvider) return resolveDirectAnthropicBaseUrl(model);
 	return normalizeAnthropicBaseUrl(model.baseUrl);
 }
 
@@ -1511,7 +1276,7 @@ function resolveAnthropicCustomHeaders(
 	model: Model<"anthropic-messages">,
 	baseUrl: string | undefined,
 ): Record<string, string> | undefined {
-	if (model.provider !== "anthropic") return undefined;
+	if (!model.compat.firstPartyProvider) return undefined;
 	return resolveAnthropicCustomHeadersForBaseUrl(baseUrl);
 }
 
@@ -1543,7 +1308,7 @@ function resolvePemValue(value: string | undefined, name: string): string | unde
 }
 
 function resolveFoundryTlsOptions(model: Model<"anthropic-messages">): FoundryTlsOptions | undefined {
-	if (model.provider !== "anthropic") return undefined;
+	if (!model.compat.firstPartyProvider) return undefined;
 	if (!isFoundryEnabled()) return undefined;
 
 	const cacheKey = foundryTlsOptionsCacheKey();
@@ -1572,7 +1337,7 @@ function buildClaudeCodeTlsFetchOptions(
 	model: Model<"anthropic-messages">,
 	baseUrl: string | undefined,
 ): AnthropicFetchOptions | undefined {
-	if (model.provider !== "anthropic") return undefined;
+	if (!model.compat.firstPartyProvider) return undefined;
 	if (!baseUrl) return undefined;
 
 	let serverName: string;
@@ -1817,6 +1582,10 @@ function unwrapAnthropicThinkingEnvelope(text: string): string | undefined {
  * The refused response's content as the continuation prefix: client tool
  * calls (no matching tool_result) are omitted and a trailing text block is
  * right-trimmed, per the fallback-credit continuation contract.
+ *
+ * A `fallback` boundary stays exactly where it appeared: the API accepts it on
+ * any request, beta or not, and uses its position to validate the thinking
+ * blocks on either side, so the echo must not collapse or move it.
  */
 function refusalContinuationPrefix(content: AssistantMessage["content"]): AssistantMessage["content"] {
 	const prefix = structuredClone(content.filter(block => block.type !== "toolCall"));
@@ -1825,40 +1594,54 @@ function refusalContinuationPrefix(content: AssistantMessage["content"]): Assist
 	return prefix;
 }
 
-/** Wire form of {@link refusalContinuationPrefix} for the appended assistant message. */
-function formatEchoedRefusalContent(content: AssistantMessage["content"]): unknown[] {
-	return refusalContinuationPrefix(content).map(block => {
+/**
+ * Wire form of {@link refusalContinuationPrefix} for the appended assistant
+ * message. Blocks with no valid continuation wire shape (unsigned thinking,
+ * anything the Anthropic stream cannot have produced) are dropped.
+ */
+function formatEchoedRefusalContent(content: AssistantMessage["content"]): ContentBlockParam[] {
+	const echoed: ContentBlockParam[] = [];
+	for (const block of refusalContinuationPrefix(content)) {
 		switch (block.type) {
 			case "text":
-				return { type: "text", text: block.text };
+				echoed.push({ type: "text", text: block.text });
+				break;
 			case "thinking":
-				return {
-					type: "thinking",
-					thinking: block.thinking,
-					...(block.thinkingSignature ? { signature: block.thinkingSignature } : {}),
-				};
+				if (block.thinkingSignature) {
+					echoed.push({ type: "thinking", thinking: block.thinking, signature: block.thinkingSignature });
+				}
+				break;
 			case "redactedThinking":
-				return { type: "redacted_thinking", data: block.data };
+				echoed.push({ type: "redacted_thinking", data: block.data });
+				break;
 			case "fallback":
-				return { type: "fallback", from: block.from, to: block.to };
+				echoed.push({ type: "fallback", from: block.from, to: block.to });
+				break;
 			case "anthropicServerTool":
-				return block.block;
-			default:
-				return block;
-		}
-	});
-}
-
-function isAnthropicBadRequest(error: unknown): boolean {
-	if (!error) return false;
-	if (typeof error === "object") {
-		const rec = error as Record<string, unknown>;
-		if (rec.status === 400 || rec.statusCode === 400) return true;
-		if (typeof rec.message === "string" && (/\b400\b/.test(rec.message) || rec.message.includes("BadRequestError"))) {
-			return true;
+				echoed.push(block.block);
+				break;
 		}
 	}
-	return false;
+	return echoed;
+}
+
+/**
+ * The refused request's frozen body retargeted at the fallback model with the
+ * credit token, optionally followed by the echoed refusal prefix.
+ */
+function fallbackCreditRequestBody(
+	redemption: AnthropicFallbackCreditHandle,
+	targetModelId: string,
+	continuation: ContentBlockParam[] | undefined,
+): MessageCreateParamsStreaming {
+	const body = structuredClone(redemption.params);
+	body.model = targetModelId;
+	body.fallback_credit_token = redemption.token;
+	delete body.fallbacks;
+	if (continuation && continuation.length > 0) {
+		body.messages = [...body.messages, { role: "assistant", content: continuation }];
+	}
+	return body;
 }
 
 function createEmptyUsage(premiumRequests?: number): Usage {
@@ -2217,6 +2000,33 @@ function rememberPrefixDroppedThinking(
 	}
 }
 
+/**
+ * Replay keys of the thinking blocks in the request's latest assistant turn.
+ * Anthropic validates every assistant message after the last user message
+ * carrying more than tool results as one "latest assistant message" (its error
+ * indices count blocks across that whole run).
+ */
+function latestAssistantTurnThinkingKeys(params: MessageCreateParamsStreaming): string[] {
+	const keys: string[] = [];
+	for (let index = params.messages.length - 1; index >= 0; index--) {
+		const message = params.messages[index]!;
+		if (message.role !== "assistant") {
+			const toolResultsOnly =
+				Array.isArray(message.content) &&
+				message.content.length > 0 &&
+				message.content.every(block => block.type === "tool_result");
+			if (!toolResultsOnly) break;
+			continue;
+		}
+		if (!Array.isArray(message.content)) continue;
+		for (const block of message.content) {
+			const key = thinkingReplayKey(block);
+			if (key) keys.push(key);
+		}
+	}
+	return keys;
+}
+
 function rememberPrefixBindingFailure(
 	params: MessageCreateParamsStreaming,
 	message: string,
@@ -2426,21 +2236,20 @@ const streamAnthropicOnce = (
 			};
 			let dropAllThinking = droppedAllThinkingForSignature;
 			let prefixBindingRetryAttempted = false;
+			let latestTurnThinkingRetryAttempted = false;
 			// Claude Code's `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS`; the wrapper
 			// already turned the gated compat off, this covers caller/frozen inputs.
 			const killSwitchActive = experimentalBetasDisabled(model);
 			// A live fallback-credit redemption replays its frozen body.
 			const frozenRedemption =
-				options?.fallbackCreditRedemption &&
-				Date.now() <= options.fallbackCreditRedemption.expiresAt &&
-				options.fallbackCreditRedemption.params
+				options?.fallbackCreditRedemption && Date.now() <= options.fallbackCreditRedemption.expiresAt
 					? options.fallbackCreditRedemption
 					: undefined;
 			// A body frozen before the kill switch was set still carries the fields
 			// it withholds; the credit token is bound to that body, so forfeit it
 			// and build a fresh request. Server tools that already ran would re-run
 			// and re-bill on a tokenless retry, so surface that case instead.
-			const frozenBody = frozenRedemption?.params as MessageCreateParamsStreaming | undefined;
+			const frozenBody = frozenRedemption?.params;
 			// The redemption drops `fallbacks` before sending, so they cannot force a forfeit.
 			const forfeitFrozenForKillSwitch =
 				killSwitchActive &&
@@ -2596,12 +2405,14 @@ const streamAnthropicOnce = (
 				// `dropCacheControlOptions` short-circuits it because the breakpoint
 				// it does carry has no `ttl` left to authorize. Both this gate and
 				// buildParams resolve the breakpoint behind the same flags so the
-				// header and the body can never disagree.
+				// header and the body can never disagree. Vertex rawPredict honors
+				// `ttl: "1h"` without the beta and rejects it in either channel.
 				const isOAuth = options?.isOAuth ?? isAnthropicOAuthToken(apiKey);
 				if (
 					!isOAuth &&
 					!dropCacheControl &&
 					!dropCacheControlOptions &&
+					!isVertexRawPredictUrl(baseUrl) &&
 					getCacheControl(model, options?.cacheRetention, isOAuth).cacheControl?.ttl === "1h" &&
 					!extraBetas.includes(extendedCacheTtlBeta)
 				) {
@@ -2620,7 +2431,7 @@ const streamAnthropicOnce = (
 					for (const beta of frozenBetas) {
 						extraBetas.push(beta);
 					}
-					if (!extraBetas.includes(fallbackCreditBeta) && !extraBetas.includes("fallback-credit-2026-06-01")) {
+					if (!extraBetas.some(beta => beta.startsWith("fallback-credit-"))) {
 						extraBetas.push(fallbackCreditBeta);
 					}
 				}
@@ -2658,6 +2469,8 @@ const streamAnthropicOnce = (
 					dynamicHeaders: copilotDynamicHeaders?.headers,
 					isOAuth: options?.isOAuth,
 					hasTools: !!context.tools?.length,
+					hasBufferedInputTools:
+						context.tools?.some(tool => ANTHROPIC_BUFFERED_INPUT_TOOLS.has(tool.name)) ?? false,
 					thinkingEnabled: options?.thinkingEnabled,
 					thinkingDisplay: options?.thinkingDisplay,
 					fetch: options?.fetch,
@@ -2748,30 +2561,17 @@ const streamAnthropicOnce = (
 			// Recheck expiry here: preparation (image resizing) is async, and an
 			// expired token must fall back to a fresh request as before.
 			if (frozenRedemption && !forfeitFrozenForKillSwitch && Date.now() <= frozenRedemption.expiresAt) {
-				const redemption = frozenRedemption;
 				usingFallbackCredit = true;
-				const frozenParams = structuredClone(redemption.params as MessageCreateParamsStreaming);
-				const targetModelId = options?.requestModelId ?? model.requestModelId ?? model.id;
-				frozenParams.model = targetModelId;
-				frozenParams.fallback_credit_token = redemption.token;
-				delete frozenParams.fallbacks;
-				if (
-					redemption.prefillClaim !== false &&
-					redemption.refusedContent &&
-					redemption.refusedContent.length > 0
-				) {
-					fallbackCreditShape = "continuation";
-					const echoed = formatEchoedRefusalContent(redemption.refusedContent);
-					if (echoed.length > 0) {
-						frozenParams.messages = [
-							...frozenParams.messages,
-							{ role: "assistant", content: echoed } as unknown as (typeof frozenParams.messages)[number],
-						];
-					}
-				} else {
-					fallbackCreditShape = "unchanged";
-				}
-				params = frozenParams;
+				const echoed =
+					frozenRedemption.prefillClaim !== false && frozenRedemption.refusedContent
+						? formatEchoedRefusalContent(frozenRedemption.refusedContent)
+						: [];
+				fallbackCreditShape = echoed.length > 0 ? "continuation" : "unchanged";
+				params = fallbackCreditRequestBody(
+					frozenRedemption,
+					options?.requestModelId ?? model.requestModelId ?? model.id,
+					echoed,
+				);
 				rawRequestDump = {
 					provider: model.provider,
 					api: output.api,
@@ -2811,11 +2611,14 @@ const streamAnthropicOnce = (
 					if (unwrappedThinking !== undefined) {
 						block.thinking = unwrappedThinking;
 						block.thinkingSignature = undefined;
-					} else if (!output.upstreamModel && block.thinkingSignature) {
+					} else if (block.thinkingSignature) {
 						// The signature names the model that actually produced the
 						// block; a gateway serving a different model than requested
 						// cannot mint one that says otherwise.
-						output.upstreamModel = servedModelFromAnthropicSignature(block.thinkingSignature);
+						if (!output.upstreamModel) {
+							output.upstreamModel = servedModelFromAnthropicSignature(block.thinkingSignature);
+						}
+						if (isAnthropicNarrationSignature(block.thinkingSignature)) block.narration = true;
 					}
 					stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
 				} else if (block.type === "anthropicServerTool" && block.block.type === "server_tool_use") {
@@ -2900,7 +2703,7 @@ const streamAnthropicOnce = (
 			// max-wait budget covers the whole wait, not one attempt.
 			const slowMode =
 				options?.anthropicSlowMode !== undefined &&
-				model.provider === "anthropic" &&
+				model.compat.firstPartyProvider &&
 				isOAuthToken &&
 				!options.client &&
 				isOfficialAnthropicApiUrl(baseUrl)
@@ -2982,7 +2785,7 @@ const streamAnthropicOnce = (
 								!b.startsWith("server-side-fallback-") &&
 								(!killSwitchActive || killSwitchBetas[b] !== true),
 						);
-					if (!rawBetas.includes(fallbackCreditBeta) && !rawBetas.includes("fallback-credit-2026-06-01")) {
+					if (!rawBetas.some(beta => beta.startsWith("fallback-credit-"))) {
 						rawBetas.push(fallbackCreditBeta);
 					}
 					perRequestHeaders = {
@@ -3212,15 +3015,15 @@ const streamAnthropicOnce = (
 							}
 							if (!firstTokenTime) firstTokenTime = performance.now();
 							if (event.content_block.type === "fallback") {
-								// Fallback boundary is only meaningful when the request
-								// opted into the beta chain — silently drop otherwise so
-								// unopted-in sessions never see the block persisted or
-								// influence downstream converters.
+								// The boundary between the primary's output and the
+								// fallback model's. Persist it even when this request did
+								// not opt into the beta chain: a gateway can opt in on the
+								// client's behalf, and without the marker the replay
+								// converter cannot tell the two models' signed reasoning
+								// apart (see `collapseFallbackSegments`).
 								const fallback = parseAnthropicFallbackWireBlock(event.content_block);
-								if (!serverSideFallback || !fallback) {
-									if (!fallback) {
-										reportAnthropicEnvelopeAnomaly("fallback content_block missing model refs");
-									}
+								if (!fallback) {
+									reportAnthropicEnvelopeAnomaly("fallback content_block missing model refs");
 									openBlocks.set(event.index, { contentIndex: -1, kind: "ignored" });
 									continue;
 								}
@@ -3234,8 +3037,9 @@ const streamAnthropicOnce = (
 								// classifier block on the primary was retried on the
 								// fallback model. Adopt the served id immediately so
 								// pricing decisions downstream (final usage.iterations may
-								// arrive before/after) see the right model.
-								output.model = fallback.to.model;
+								// arrive before/after) see the right model. Served-model
+								// promotion and per-iteration pricing stay opt-in.
+								if (serverSideFallback) output.model = fallback.to.model;
 								continue;
 							}
 							if (event.content_block.type === "text") {
@@ -3492,7 +3296,9 @@ const streamAnthropicOnce = (
 									const label = category ? `Refusal (${category})` : "Refusal";
 									output.errorMessage = explanation ? `${label}: ${explanation}` : label;
 								}
-								if (stopDetails?.fallback_credit_token) {
+								// Only a refusal carries a credit token. Refusal turns are never
+								// written to the session, so the frozen body stays in memory.
+								if (stopDetails?.type === "refusal" && stopDetails.fallback_credit_token) {
 									const sentBetaHeader =
 										getHeaderCaseInsensitive(perRequestHeaders ?? {}, "anthropic-beta") ??
 										getHeaderCaseInsensitive(clientDefaultHeaders ?? {}, "anthropic-beta") ??
@@ -3503,7 +3309,7 @@ const streamAnthropicOnce = (
 										params: structuredClone(params),
 										betas: Array.from(requestExtraBetas),
 										betaHeader: sentBetaHeader,
-										expiresAt: Date.now() + 5 * 60 * 1000,
+										expiresAt: Date.now() + FALLBACK_CREDIT_TTL_MS,
 										refusedContent: output.content ? structuredClone(output.content) : undefined,
 									};
 								}
@@ -3625,9 +3431,14 @@ const streamAnthropicOnce = (
 						resetStreamOutputState();
 						continue;
 					}
-					if (usingFallbackCredit && firstTokenTime === undefined && isAnthropicBadRequest(streamFailure)) {
+					if (
+						usingFallbackCredit &&
+						frozenRedemption &&
+						firstTokenTime === undefined &&
+						AIError.status(streamFailure) === 400
+					) {
 						const errMessage = streamFailure instanceof Error ? streamFailure.message : String(streamFailure);
-						const redemption = options!.fallbackCreditRedemption!;
+						const redemption = frozenRedemption;
 						if (errMessage.includes("redemption temporarily unavailable")) {
 							if (Date.now() < redemption.expiresAt && fallbackCreditTransientRetries < 2) {
 								fallbackCreditTransientRetries++;
@@ -3653,12 +3464,11 @@ const streamAnthropicOnce = (
 								},
 							);
 							fallbackCreditShape = "unchanged";
-							const frozenParams = structuredClone(redemption.params as MessageCreateParamsStreaming);
-							const targetModelId = options?.requestModelId ?? model.requestModelId ?? model.id;
-							frozenParams.model = targetModelId;
-							frozenParams.fallback_credit_token = redemption.token;
-							delete frozenParams.fallbacks;
-							params = frozenParams;
+							params = fallbackCreditRequestBody(
+								redemption,
+								options?.requestModelId ?? model.requestModelId ?? model.id,
+								undefined,
+							);
 							resetStreamOutputState();
 							continue;
 						}
@@ -3732,6 +3542,50 @@ const streamAnthropicOnce = (
 						output.stopReason = "stop";
 						firstTokenTime = undefined;
 						continue;
+					}
+					if (
+						!latestTurnThinkingRetryAttempted &&
+						firstTokenTime === undefined &&
+						!streamedReplayUnsafeContent &&
+						AIError.isImmutableLatestThinkingText(streamFailureMessage)
+					) {
+						// The API refused the latest assistant turn's reasoning as modified
+						// (e.g. a mid-turn fallback persisted without its boundary marker).
+						// Resending the turn fails the same way forever, so drop its
+						// reasoning on the wire — stored history keeps it — and retry once.
+						// The session remembers the dropped blocks so later requests replay
+						// the same prefix; without session state, drop every block instead.
+						const keys = latestAssistantTurnThinkingKeys(params);
+						if (keys.length > 0) {
+							logger.warn(
+								"anthropic: latest assistant turn's thinking rejected as modified, dropping it and retrying",
+								{
+									provider: model.provider,
+									model: model.id,
+									baseUrl,
+									blocks: keys.length,
+								},
+							);
+							latestTurnThinkingRetryAttempted = true;
+							if (providerSessionState) {
+								for (const key of keys) providerSessionState.prefixDroppedThinkingBlocks.add(key);
+							} else {
+								dropAllThinking = true;
+							}
+							params = await rebuildParams(streamFailure);
+							providerRetryAttempt = 0;
+							output.content.length = 0;
+							output.model = model.id;
+							output.responseId = undefined;
+							output.upstreamModel = undefined;
+							output.errorMessage = undefined;
+							output.inputTransformations = undefined;
+							output.providerPayload = undefined;
+							output.usage = createEmptyUsage(copilotDynamicHeaders?.premiumRequests);
+							output.stopReason = "stop";
+							firstTokenTime = undefined;
+							continue;
+						}
 					}
 					if (
 						!forceDemoteUnsignedThinking &&
@@ -3983,18 +3837,16 @@ const streamAnthropicOnce = (
 					firstTokenTime = undefined;
 				}
 			}
-			if (
-				usingFallbackCredit &&
-				fallbackCreditShape === "continuation" &&
-				options?.fallbackCreditRedemption?.refusedContent
-			) {
-				// The response continues the echoed prefix; keep it in the stored turn in
-				// AssistantMessage form so later replays keep signatures and server tools.
-				output.content.unshift(...refusalContinuationPrefix(options.fallbackCreditRedemption.refusedContent));
+			if (usingFallbackCredit && fallbackCreditShape === "continuation" && frozenRedemption?.refusedContent) {
+				// The response continues the echoed prefix; keep it, signatures included, in
+				// the stored turn. A tool loop requires the turn to open with its thinking
+				// block, and a later rejection of the refused model's signature is
+				// recovered by the invalid-signature retry.
+				output.content.unshift(...refusalContinuationPrefix(frozenRedemption.refusedContent));
 			}
 			output.duration = performance.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			if (dropFastMode && model.provider === "anthropic" && options?.serviceTier === "priority") {
+			if (dropFastMode && model.compat.firstPartyProvider && options?.serviceTier === "priority") {
 				output.disabledFeatures = [...(output.disabledFeatures ?? []), "priority"];
 			}
 			if (forceDemoteUnsignedThinking && model.compat.replayUnsignedThinking) {
@@ -4234,6 +4086,7 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		headers,
 		dynamicHeaders,
 		hasTools = false,
+		hasBufferedInputTools = false,
 		thinkingEnabled = false,
 		isOAuth,
 		maxRetryDelayMs,
@@ -4272,8 +4125,9 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 				!hostMatchesUrl(baseUrl, "githubCopilot")));
 	const oauthToken = isOAuth ?? isAnthropicOAuthToken(apiKey);
 	const supportsEagerToolInputStreaming = resolveEagerToolInputStreamingSupport(model, baseUrl);
+	// The beta streams every tool eagerly, so it is skipped when a tool needs buffered input.
 	const needsFineGrainedToolStreamingBeta =
-		hasTools && isOfficialAnthropicApiUrl(baseUrl) && !supportsEagerToolInputStreaming;
+		hasTools && !hasBufferedInputTools && isOfficialAnthropicApiUrl(baseUrl) && !supportsEagerToolInputStreaming;
 	const foundryCustomHeaders = resolveAnthropicCustomHeaders(model, baseUrl);
 	const tlsFetchOptions = buildClaudeCodeTlsFetchOptions(model, baseUrl);
 	// Disable Bun's native ~300s pre-response fetch timeout (issue #2422).
@@ -4281,7 +4135,10 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 	// per request, so the native ceiling can only short-circuit slow-prefill
 	// streams before the configured watchdog gets to govern them.
 	const fetchOptions: AnthropicFetchOptions = { ...tlsFetchOptions, timeout: false };
-	const baseFetch = args.fetch ?? fetch;
+	// Compression sits beneath the cch rewriter, which must hash the uncompressed
+	// body. Catalog rules scope it to verified hosts (official API, Copilot), so
+	// proxies pass through.
+	const baseFetch = wrapFetchForRequestCompression(args.fetch ?? fetch, model);
 	// Only OAuth requests inject the CC billing header; no API-key request can ever
 	// contain it, so there is no need to install the rewriter for those.
 	const cchFetch = oauthToken ? wrapFetchForCch(baseFetch) : baseFetch;
@@ -4445,6 +4302,20 @@ export function buildAnthropicClientOptions(args: AnthropicClientOptionsArgs): A
 		fetch: cchFetch,
 		fetchOptions,
 	};
+}
+
+/**
+ * Warm-up target for a first-party `anthropic` model: the effective official
+ * API URL plus the TLS options real requests use (sockets pool per TLS
+ * configuration, so a warm-up made with other options is never reused).
+ * `undefined` when requests resolve elsewhere — `ANTHROPIC_BASE_URL` or
+ * Foundry gateways never receive unsolicited probes.
+ */
+export function resolveAnthropicPrewarmTarget(model: Model<Api>): { url: string; init: RequestInit } | undefined {
+	if (!isAnthropicMessagesModel(model)) return undefined;
+	const baseUrl = resolveAnthropicBaseUrl(model) ?? "https://api.anthropic.com";
+	if (!isOfficialAnthropicApiUrl(baseUrl)) return undefined;
+	return { url: baseUrl, init: { ...buildClaudeCodeTlsFetchOptions(model, baseUrl) } };
 }
 
 function createClient(
@@ -5293,7 +5164,24 @@ type AnthropicParamBuildOptions = {
  * priority-tier request to first-party Anthropic.
  */
 function wantsAnthropicFastMode(model: Model<"anthropic-messages">, options: AnthropicOptions | undefined): boolean {
-	return model.compat.fastMode === true || (model.provider === "anthropic" && options?.serviceTier === "priority");
+	return model.compat.fastMode === true || (model.compat.firstPartyProvider && options?.serviceTier === "priority");
+}
+
+/**
+ * The block that decides whether an assistant turn is thinking-led. A
+ * `fallback` boundary is bookkeeping, not model output: a response that fell
+ * back before the primary emitted any reasoning opens with
+ * `[fallback, thinking(fallbackModel), …]` and is still a thinking-led turn,
+ * so treat the marker as transparent. Tolerates malformed blocks replayed off
+ * disk.
+ */
+function thinkingLedLeadBlock(content: readonly unknown[]): { type?: unknown } | undefined {
+	for (const block of content) {
+		if (block == null || typeof block !== "object") return undefined;
+		const typed = block as { type?: unknown };
+		if (typed.type !== "fallback") return typed;
+	}
+	return undefined;
 }
 
 /**
@@ -5307,14 +5195,8 @@ function hasThinkinglessAssistantHistory(messages: readonly Message[]): boolean 
 		if (message.role !== "assistant") continue;
 		if (!Array.isArray(message.content) || message.content.length === 0) continue;
 		hasAssistant = true;
-		const first = message.content[0];
-		if (
-			first != null &&
-			typeof first === "object" &&
-			(first.type === "thinking" || first.type === "redactedThinking")
-		) {
-			return false;
-		}
+		const first = thinkingLedLeadBlock(message.content);
+		if (first?.type === "thinking" || first?.type === "redactedThinking") return false;
 	}
 	return hasAssistant;
 }
@@ -5337,8 +5219,8 @@ function hasNonThinkingTurnAfterLastUser(messages: readonly Message[]): boolean 
 	const next = messages[lastUser + 1];
 	if (next.role !== "assistant") return false;
 	if (!Array.isArray(next.content) || next.content.length === 0) return false;
-	const first = next.content[0];
-	if (first == null || typeof first !== "object") return false;
+	const first = thinkingLedLeadBlock(next.content);
+	if (first === undefined) return false;
 	return first.type !== "thinking" && first.type !== "redactedThinking";
 }
 
@@ -5850,13 +5732,45 @@ function toWellFormedDeep(value: unknown): unknown {
 }
 
 /**
+ * Collapse a server-side-fallback turn for a request that cannot carry the
+ * `fallback` boundary marker: drop the markers and keep reasoning from one
+ * model only — the last segment that has any. Each model signed its reasoning
+ * against the turn's original prefix; replayed back-to-back without the
+ * marker, Anthropic validates them as one chain and rejects the latest turn
+ * with "`thinking` or `redacted_thinking` blocks in the latest assistant
+ * message cannot be modified". A turn whose reasoning sits in one segment
+ * keeps all of it.
+ */
+function collapseFallbackSegments(content: AssistantMessage["content"]): AssistantMessage["content"] {
+	let segments = 0;
+	let reasoningSegment = 0;
+	for (const block of content) {
+		if (block.type === "fallback") segments++;
+		else if (block.type === "thinking" || block.type === "redactedThinking") reasoningSegment = segments;
+	}
+	if (segments === 0) return content;
+	const collapsed: AssistantMessage["content"] = [];
+	let segment = 0;
+	for (const block of content) {
+		if (block.type === "fallback") {
+			segment++;
+			continue;
+		}
+		if ((block.type === "thinking" || block.type === "redactedThinking") && segment !== reasoningSegment) continue;
+		collapsed.push(block);
+	}
+	return collapsed;
+}
+
+/**
  * Serialize omp {@link Message}s to Anthropic wire messages.
  *
  * `opts.serverSideFallbackEnabled` — when the CURRENT request itself
- * opts into the server-side-fallback beta chain. Only then may a persisted
- * `fallback` content block from a prior turn be replayed on the wire;
- * otherwise the block is dropped to avoid a 400 on non-fallback requests
- * that don't send the beta.
+ * opts into the server-side-fallback beta chain. Only then, and only on the
+ * official endpoint, may a persisted `fallback` content block from a prior
+ * turn be replayed on the wire; otherwise the block is dropped to avoid a 400
+ * on requests that don't send the beta, and its turn keeps one model's
+ * reasoning (see {@link collapseFallbackSegments}).
  *
  * `opts.replayCompaction` — replay a user-role compaction summary that
  * carries an {@link AnthropicCompactionPayload} from this provider as a
@@ -5880,9 +5794,9 @@ export function convertAnthropicMessages(
 		compactionRequest?: AnthropicCompactionRequest;
 	},
 ): AnthropicMessageParam[] {
-	// Indices of params emitted from `developer` messages. After the main pass,
-	// the ones whose placement satisfies Anthropic's mid-conversation rules are
-	// upgraded from the `user` role to the authoritative `system` role.
+	// Indices of params emitted from agent-owned `developer` messages. After the
+	// main pass, the ones whose placement satisfies Anthropic's mid-conversation
+	// rules are upgraded from the `user` role to the authoritative `system` role.
 	const developerParams: Array<{ index: number; payload?: AnthropicMessagePayload }> = [];
 	const params: AnthropicMessageParam[] = [];
 	// Controls rendered from request-control markers. The assistant repairs
@@ -5921,7 +5835,7 @@ export function convertAnthropicMessages(
 	const transformedMessages = transformMessages(
 		messages,
 		model,
-		normalizeToolCallId,
+		id => normalizeToolCallId(id),
 		undefined,
 		undefined,
 		undefined,
@@ -6009,7 +5923,13 @@ export function convertAnthropicMessages(
 				blocks.push(...anthropicToolChangeBlocks(payload.toolChanges, isOAuthToken, model));
 				content = blocks;
 			}
-			if (msg.role === "developer") developerParams.push({ index: params.length, payload });
+			// User-attributed developer turns (text `@file` mentions, hidden extension
+			// messages) only borrow the slot: their content is the user's, so it stays
+			// on `user` instead of gaining system authority or ending the request in
+			// place of the user's turn. Provider controls only exist on `system`.
+			if (msg.role === "developer" && (msg.attribution !== "user" || hasProviderControls)) {
+				developerParams.push({ index: params.length, payload });
+			}
 			const param: AnthropicMessageParam & ConversationalUserCarrier = { role: "user", content };
 			// Record that this wire `user` came from a real conversational turn, so
 			// prompt-cache decimation can tell it apart from everything else that
@@ -6025,7 +5945,14 @@ export function convertAnthropicMessages(
 			params.push(param);
 		} else if (msg.role === "assistant") {
 			const blocks: ContentBlockParam[] = [];
-			const hasSignedThinking = msg.content.some(
+			// The fallback boundary replays ONLY when both sides are aligned: the
+			// current request opted into the beta chain, and the target is
+			// official Anthropic (the only endpoint that accepts the block).
+			const content =
+				opts?.serverSideFallbackEnabled && model.compat.officialEndpoint
+					? msg.content
+					: collapseFallbackSegments(msg.content);
+			const hasSignedThinking = content.some(
 				block =>
 					block.type === "thinking" && !!block.thinkingSignature && block.thinkingSignature.trim().length > 0,
 			);
@@ -6043,7 +5970,7 @@ export function convertAnthropicMessages(
 				blocks.push(compactionBlockParam(msg.providerPayload));
 			}
 
-			for (const block of msg.content) {
+			for (const block of content) {
 				if (block.type === "text") {
 					if (block.text.trim().length === 0) continue;
 					blocks.push({
@@ -6104,13 +6031,7 @@ export function convertAnthropicMessages(
 				} else if (block.type === "anthropicServerTool") {
 					blocks.push(block.block);
 				} else if (block.type === "fallback") {
-					// Replay ONLY when both sides are aligned: the current
-					// request opted into the beta chain, and the target is
-					// official Anthropic (the only endpoint that accepts the
-					// block on the wire). `transformMessages` already drops
-					// the block for cross-provider / non-official replays, so
-					// this is defense-in-depth for direct convert calls.
-					if (!opts?.serverSideFallbackEnabled || !model.compat.officialEndpoint) continue;
+					// Present only when this request can carry it (see `content`).
 					blocks.push({
 						type: "fallback",
 						from: block.from,
@@ -6403,10 +6324,20 @@ const ANTHROPIC_TOOL_SCHEMA_STRING_FORMATS = new Set([
 // Not `bash`: strict decoding fixes property order, so an optional key declared
 // before one the model has already written can no longer be emitted, and bash's
 // `timeout` vanished from every `async`-first call.
-const ANTHROPIC_STRICT_TOOL_ALLOWLIST = new Set(["python", "edit", "find"]);
+// `yield` carries a subagent's whole structured result. Its properties (`type`,
+// `data`, `error`) are declared in the order callers write them; schema-less and
+// workpool yields report `strict: false`. Strict only holds together with buffered
+// input streaming (see ANTHROPIC_BUFFERED_INPUT_TOOLS).
+const ANTHROPIC_STRICT_TOOL_ALLOWLIST = new Set(["python", "edit", "find", "yield"]);
 const MAX_ANTHROPIC_STRICT_TOOLS = 20;
 const MAX_ANTHROPIC_STRICT_OPTIONAL_PARAMETERS = 24;
 const MAX_ANTHROPIC_STRICT_UNION_PARAMETERS = 16;
+// Tools sent with `eager_input_streaming: false`, so the API buffers and validates
+// their input. Eagerly streamed `yield` input from Claude Haiku arrived as invalid
+// JSON (a large nested result closed with one brace too many) even with `strict`
+// set; buffered, it did not. Where the per-tool flag is unsupported, their presence
+// drops the request-wide fine-grained streaming beta instead.
+const ANTHROPIC_BUFFERED_INPUT_TOOLS = new Set(["yield"]);
 
 /** `minItems` / `maxItems` apply to arrays; Anthropic rejects them on `type: "object"` (including `minItems: 0`/`1`). */
 function isJsonSchemaArrayNode(schema: Record<string, unknown>): boolean {
@@ -6870,7 +6801,9 @@ function convertTools(
 		};
 		return {
 			...baseTool,
-			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
+			...(supportsEagerToolInputStreaming
+				? { eager_input_streaming: !ANTHROPIC_BUFFERED_INPUT_TOOLS.has(tool.name) }
+				: {}),
 			...(plan.strict ? { strict: true } : {}),
 			...(tool.deferLoading ? { defer_loading: true } : {}),
 		};

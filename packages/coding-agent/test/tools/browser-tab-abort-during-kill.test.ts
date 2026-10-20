@@ -31,6 +31,8 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { ReadyInfo, WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
@@ -155,7 +157,8 @@ function publishTab(name: string, browser: PuppeteerBrowserHandle, worker: FakeT
 		info: READY,
 		pending: new Map(),
 		kindTag: "headless",
-		activateForScreenshot: true,
+		ownsPage: true,
+		uploadDir: path.join(os.tmpdir(), `omp-uploads-abort-during-kill-${process.pid}`),
 	} as unknown as TabSession;
 	browser.refCount++;
 	registry.set(name, tab);
