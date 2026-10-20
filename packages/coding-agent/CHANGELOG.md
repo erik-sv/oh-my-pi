@@ -24,7 +24,8 @@
 ### Fixed
 
 - Resuming a session by path reads its SQL transcript once; upstream's missing-path check re-read it as a freshness gate.
-- Consult (`/seance`) now resolves SQL-backed session paths, project/global IDs, and nested subagent transcripts through the selected storage instead of requiring files on disk.
+- Consult (`/seance`) now resolves SQL-backed session paths, project/global IDs, and nested subagent transcripts through the selected storage instead of requiring files on disk. Model-initiated SQL consultations are restricted to the caller's own session and artifact tree.
+- RPC and rpc-ui now default job widgets off, avoiding widget-authoring model calls when no widget UI is rendered. Explicit configuration remains authoritative.
 - Fixed RPC startup timeouts when continuing SQL-backed chats in large session databases.
 - Unsupported RPC commands now preserve the request ID in error replies, so strict clients reject the request without terminating the session.
 - Disabled subscriptions remain visible when another organization or member still has an active credential.

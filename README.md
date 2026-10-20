@@ -126,9 +126,11 @@ Ensure bun's global bin (`~/.bun/bin`) is on your `PATH`, then run `omp --versio
 
 The v18.12.3 integration retains chunked SQL sessions, the two-connection SQL pool cap, direct SQL resume, `ephemeral_turn`, pre-agent `prompt_error` events, opt-in RPC message IDs, per-account usage, and PID-namespace-aware process ownership.
 
-Browser tabs still run in isolated subprocesses. Upstream worker-crash recovery reattaches the same page in a replacement subprocess; it never falls back to running tab code in the host process. Consult (`/seance`) resolves SQL-backed parent and subagent transcripts through the selected session storage.
+Browser tabs still run in isolated subprocesses. Upstream worker-crash recovery reattaches the same page in a replacement subprocess; it never falls back to running tab code in the host process. Consult (`/seance`) resolves SQL-backed transcripts through the selected storage. Model-initiated SQL consultations are restricted to the caller's own session and artifact tree; interactive, user-selected consultation remains available. RPC job widgets default off to avoid model calls for UI the host does not render.
 
 Build and smoke-test candidates with an isolated HOME and agent directory. Unset inherited `PI_CONFIG_FILES`, `OMP_SESSION_DB_OPTIONS`, and `OMP_SESSION_DB_URL` for tests. Validate new and resumed AgentDesk chats through completed SSE and persisted replies before activation. The local runtime selector, interactive CLI, and fixed service `OMP_BIN` are separate deployment surfaces; updating one does not update the others or replace running children.
+
+Before publishing a runtime selector, verify both upgrade and rollback resume with the previous artifact, plus a fresh candidate chat. Retain the tested binary hash, source commit, exact publication command, and previous selector beside the immutable artifact. Use `scripts/switch-omp-runtime.py` from AgentDesk with a freshly read expected generation. After publication, canary new and resumed local chats, verify their persisted `runtimeArtifact` identity, completed SSE, and persisted replies. A launch refusal or canary regression requires republishing the previous artifact with a new generation, not restoring the old selector file. Optional upstream RPC fields such as `resumedToolCallIds` and job `widget` remain additive.
 
 ### Shell completions
 

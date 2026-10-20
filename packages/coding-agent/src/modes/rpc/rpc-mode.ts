@@ -7,7 +7,8 @@
  * Protocol:
  * - Commands: JSON objects with `type` field, optional `id` for correlation
  * - Responses: JSON objects with `type: "response"`, `command`, `success`, and optional `data`/`error`
- * - Events: AgentSessionEvent objects streamed as they occur (message frames stamped with `messageId`)
+ * - Events: AgentSessionEvent objects streamed as they occur; message frames receive `messageId`
+ *   only after the client opts in with `set_event_filter`
  * - Prompt completion: one `prompt_result` per accepted prompt, correlated by the command `id`
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
  */
