@@ -924,7 +924,8 @@ export const cfgToolsMaxTimeout = register({
 });
 
 // Async jobs. RPC hosts start from the neutral background-job defaults (`protocolDefault`), as do the
-// bash/eval auto-background settings.
+// bash/eval auto-background settings. RPC clients (including rpc-ui, which only routes tool dialogs)
+// draw no job widgets, so they pin `async.widgets` off rather than pay for widget-authoring model calls.
 export const cfgAsyncEnabled = register({
 	id: "async.enabled",
 	protocolDefault: ["rpc"],
@@ -947,6 +948,8 @@ export const cfgAsyncMaxJobs = register({
 
 export const cfgAsyncWidgets = register({
 	id: "async.widgets",
+	protocolDefault: ["rpc"],
+	protocolValue: false,
 	type: "boolean",
 	default: true,
 	ui: {

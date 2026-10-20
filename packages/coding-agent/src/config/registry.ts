@@ -108,6 +108,12 @@ interface DefinitionBase {
 	 */
 	protocolDefault?: readonly ProtocolHost[];
 	/**
+	 * Value the `protocolDefault` hosts pin instead of {@link default}, for a setting whose neutral
+	 * protocol value differs from the interactive default (e.g. a UI-only feature that costs model
+	 * calls). Same precedence as the default pin: any configured layer wins.
+	 */
+	protocolValue?: unknown;
+	/**
 	 * Rejects a malformed configured value with a descriptive error. Runs on every load/reload and
 	 * before every write, so a typo fails loudly instead of silently reading as the default.
 	 */
@@ -489,6 +495,12 @@ export class Setting<T, Id extends string = string> extends Derived<T> {
 	/** Fresh copy of the default value (arrays/records are cloned so callers may mutate). */
 	get default(): T {
 		const value = this.definition.default;
+		return (typeof value === "object" && value !== null ? structuredClone(value) : value) as T;
+	}
+
+	/** Fresh copy of the value protocol hosts pin: `protocolValue` when declared, else the default. */
+	get protocolDefaultValue(): T {
+		const value = this.definition.protocolValue ?? this.definition.default;
 		return (typeof value === "object" && value !== null ? structuredClone(value) : value) as T;
 	}
 

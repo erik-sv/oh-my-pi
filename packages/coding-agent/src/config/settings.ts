@@ -1004,13 +1004,14 @@ export class Settings {
 	}
 
 	/**
-	 * Registry plumbing behind `Setting.pinDefault`: overrides `setting` with its default unless a
+	 * Registry plumbing behind `Setting.pinDefault`: overrides `setting` with its protocol value
+	 * (its default unless the definition declares `protocolValue`) unless a
 	 * layer configures it, keeping the override soft — a global write or unset of the setting, or a
 	 * disk reload or re-scope that makes a persisted layer configure it, drops it, and an explicit
 	 * override/clear ends it.
 	 */
 	pinDefaultValue(setting: AnySetting): void {
-		const value = setting.default;
+		const value = setting.protocolDefaultValue;
 		if (value === undefined || this.isConfigured(setting)) return;
 		this.writeValue(setting, value, "override");
 		this.#softPins.add(setting);

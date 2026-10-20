@@ -16,6 +16,7 @@ import {
 import { cfgSteeringMode } from "@oh-my-pi/pi-coding-agent/modes/settings";
 import { cfgEditFuzzyMatch, cfgEditModelVariants } from "@oh-my-pi/pi-coding-agent/edit/settings";
 import { cfgTaskMaxConcurrency } from "@oh-my-pi/pi-coding-agent/task/settings";
+import { cfgAsyncWidgets } from "@oh-my-pi/pi-coding-agent/tools/settings";
 import { cfgEvalPy } from "@oh-my-pi/pi-coding-agent/eval/settings";
 import { cfgModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { cfgSearxngBasicPassword, cfgSearxngEndpoint } from "@oh-my-pi/pi-coding-agent/web/settings";
@@ -236,6 +237,29 @@ describe("settings registry", () => {
 		cfgTaskMaxConcurrency.override(overridden, 4);
 		cfgTaskMaxConcurrency.set(overridden, 9);
 		expect(cfgTaskMaxConcurrency.get(overridden)).toBe(4);
+	});
+
+	it("pins the declared protocol value (job widgets off) beneath any configured value", () => {
+		const pinned = Settings.isolated();
+		expect(cfgAsyncWidgets.get(pinned)).toBe(true);
+		cfgAsyncWidgets.pinDefault(pinned);
+		expect(cfgAsyncWidgets.get(pinned)).toBe(false);
+		expect(cfgAsyncWidgets.provenance(pinned)).toBe("runtime");
+
+		// A host that configures the setting itself keeps its value.
+		const configured = Settings.isolated({ "async.widgets": true });
+		cfgAsyncWidgets.pinDefault(configured);
+		expect(cfgAsyncWidgets.get(configured)).toBe(true);
+
+		// A global write releases the pin, restoring the user's choice.
+		cfgAsyncWidgets.set(pinned, true);
+		expect(cfgAsyncWidgets.get(pinned)).toBe(true);
+		expect(cfgAsyncWidgets.provenance(pinned)).toBe("global");
+
+		// A setting without a declared protocol value still pins its default.
+		const plain = Settings.isolated();
+		cfgTaskMaxConcurrency.pinDefault(plain);
+		expect(cfgTaskMaxConcurrency.get(plain)).toBe(cfgTaskMaxConcurrency.default);
 	});
 
 	it("warns once per instance about an invalid configured value, unaffected by other instances", async () => {
