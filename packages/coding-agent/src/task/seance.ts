@@ -132,6 +132,21 @@ async function artifactSessionFiles(artifactsDir: string, storage: SessionStorag
 	return found;
 }
 
+/** Unambiguous agent transcript under `artifactsDir` matching `selector`, preferring direct children. */
+async function artifactIdMatch(
+	selector: string,
+	artifactsDir: string,
+	storage: SessionStorage,
+): Promise<string | undefined> {
+	const preferredDir = path.resolve(artifactsDir);
+	const files = await artifactSessionFiles(artifactsDir, storage);
+	const matches = [...files].flatMap(([id, candidates]) => {
+		const direct = candidates.filter(file => path.resolve(path.dirname(file)) === preferredDir);
+		return (direct.length > 0 ? direct : candidates).map(file => ({ id, path: file }));
+	});
+	return chooseId(matches, selector)?.path;
+}
+
 /**
  * Resolve an explicit session path or an unambiguous stored session id without opening its writer.
  * Ids search the caller's artifact tree, then the current project; `includeGlobal` (user-typed
@@ -168,14 +183,8 @@ export async function resolveSeanceSource(
 
 	const label = safeSourceLabel(source);
 	if (options.artifactsDirHint) {
-		const preferredDir = path.resolve(options.artifactsDirHint);
-		const files = await artifactSessionFiles(options.artifactsDirHint, storage);
-		const matches = [...files].flatMap(([id, candidates]) => {
-			const direct = candidates.filter(file => path.resolve(path.dirname(file)) === preferredDir);
-			return (direct.length > 0 ? direct : candidates).map(file => ({ id, path: file }));
-		});
-		const match = chooseId(matches, source);
-		if (match) return validateSourceFile(match.path, storage);
+		const match = await artifactIdMatch(source, options.artifactsDirHint, storage);
+		if (match) return validateSourceFile(match, storage);
 	}
 	const sessionDir = options.sessionDirHint ?? sessionDirForCwd(options.cwd);
 	const local = await listSessionsReadOnly(sessionDir, storage);
@@ -187,6 +196,65 @@ export async function resolveSeanceSource(
 	}
 	throw new Error(`Session "${label}" was not found.`);
 }
+
+/**
+ * Resolve a model-initiated seance source on shared (non-file) session storage, where one
+ * namespace holds every user's transcripts. Only the caller's own session file and the agent
+ * transcripts under its artifacts dir are candidates. Any other path or id is reported as not
+ * found without being read or matched, so the answer never reveals another session's existence.
+ */
+async function resolveOwnedSeanceSource(
+	selector: string,
+	options: { cwd: string; sessionFile: string | null; artifactsDir: string | undefined; storage: SessionStorage },
+): Promise<ResolvedSeanceSource> {
+	const source = selector.trim();
+	if (!source) throw new Error("A source session is required.");
+	const { sessionFile, artifactsDir, storage } = options;
+	if (!sessionFile) throw new Error("Seance requires a persisted caller session to locate its source.");
+
+	if (source.includes("/") || source.includes("\\") || source.endsWith(".jsonl")) {
+		// Normalize before comparing: `resolveToCwd` keeps absolute paths verbatim, `..` included.
+		const target = path.resolve(resolveToCwd(source, options.cwd));
+		if (target === path.resolve(sessionFile)) {
+			if (await storage.exists(sessionFile).catch(() => false)) return validateSourceFile(sessionFile, storage);
+		} else if (artifactsDir) {
+			for (const candidates of (await artifactSessionFiles(artifactsDir, storage)).values()) {
+				const file = candidates.find(candidate => path.resolve(candidate) === target);
+				if (file) return validateSourceFile(file, storage);
+			}
+		}
+		throw new Error("The selected session file was not found or could not be accessed.");
+	}
+
+	if (artifactsDir) {
+		const match = await artifactIdMatch(source, artifactsDir, storage);
+		if (match) return validateSourceFile(match, storage);
+	}
+	const own = (await storage.exists(sessionFile).catch(() => false))
+		? await validateSourceFile(sessionFile, storage).catch(() => undefined)
+		: undefined;
+	if (own && chooseId([own], source)) return own;
+	throw new Error(`Session "${safeSourceLabel(source)}" was not found.`);
+}
+
+/**
+ * Source files a human picked with the interactive `/seance` command, keyed by the caller's
+ * session file. Owner scoping binds model-chosen sources; these explicit picks keep their
+ * unscoped reach on shared storage. Only the TUI handler grants, and RPC/ACP dispatch runs no
+ * TUI-only command, so neither a model tool call nor a remote client can add an entry.
+ */
+const userSeanceSources = new Map<string, Set<string>>();
+
+/** Record a source the user chose through the TUI `/seance` command for this caller session. */
+export function grantUserSeanceSource(callerSessionFile: string, sourceFile: string): void {
+	let sources = userSeanceSources.get(callerSessionFile);
+	if (!sources) {
+		sources = new Set();
+		userSeanceSources.set(callerSessionFile, sources);
+	}
+	sources.add(sourceFile);
+}
+
 const modelSelectorInputSchema = type("string | string[]");
 export const seanceTaskSchemaFields = {
 	"sourceSession?": type("string"),
@@ -268,12 +336,27 @@ export async function prepareSeance(context: {
 	if (context.planMode || context.isolationRequested || context.hasCustomTools) {
 		throw new Error("Seance does not support plan mode, isolated execution, or custom tools.");
 	}
+	const storage = getDefaultSessionStorage();
 	const sessionFile = context.session.getSessionFile();
-	const source = await resolveSeanceSource(sourceSelector, {
-		cwd: context.session.cwd,
-		sessionDirHint: sessionFile ? path.dirname(sessionFile) : undefined,
-		artifactsDirHint: context.session.getArtifactsDir?.() ?? undefined,
-	});
+	const artifactsDir = context.session.getArtifactsDir?.() ?? undefined;
+	// A shared store (SQL in AgentDesk) holds other users' transcripts under the same
+	// project buckets, so a model-chosen source stays inside the caller's own session tree.
+	// Exact user `/seance` picks for this caller keep the unscoped resolution they were made with.
+	const userPicked = sessionFile !== null && userSeanceSources.get(sessionFile)?.has(sourceSelector) === true;
+	const source =
+		storage instanceof FileSessionStorage || userPicked
+			? await resolveSeanceSource(sourceSelector, {
+					cwd: context.session.cwd,
+					sessionDirHint: sessionFile ? path.dirname(sessionFile) : undefined,
+					artifactsDirHint: artifactsDir,
+					storage,
+				})
+			: await resolveOwnedSeanceSource(sourceSelector, {
+					cwd: context.session.cwd,
+					sessionFile,
+					artifactsDir,
+					storage,
+				});
 	const modelRegistry = context.session.modelRegistry;
 	if (!modelRegistry) throw new Error("Seance cannot resolve a model in this session.");
 	await modelRegistry.awaitBackgroundRefresh().catch(() => {});

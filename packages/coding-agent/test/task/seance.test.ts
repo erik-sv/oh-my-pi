@@ -8,7 +8,14 @@ import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/sessi
 import { sessionDirForCwd } from "@oh-my-pi/pi-coding-agent/session/session-paths";
 import { setDefaultSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
-import { resolveSeanceSource, restoreSeanceSession } from "@oh-my-pi/pi-coding-agent/task/seance";
+import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
+import {
+	grantUserSeanceSource,
+	prepareSeance,
+	resolveSeanceSource,
+	restoreSeanceSession,
+} from "@oh-my-pi/pi-coding-agent/task/seance";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { getAgentDir, getSessionsDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { SQL } from "bun";
 
@@ -333,6 +340,158 @@ describe("seance source resolution with SQL session storage", () => {
 			setDefaultSessionStorage(undefined);
 			await client.end();
 		}
+	});
+});
+
+describe("model-initiated seance on shared SQL session storage", () => {
+	const savedModel = [modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default")];
+
+	/**
+	 * Two users' sessions in one project bucket of one SQL store, as AgentDesk runs it. Alice's
+	 * artifacts dir (`…_shared`) is a string prefix of Bob's (`…_shared-bob`), so containment must
+	 * respect path boundaries.
+	 */
+	async function withSharedStore(
+		fn: (fixture: {
+			storage: SqlSessionStorage;
+			cwd: string;
+			alice: { file: string; artifactsDir: string; task: string };
+			bob: { file: string; other: string; task: string };
+			seance: (caller: { sessionFile: string | null; artifactsDir?: string }, source: string) => Promise<string>;
+		}) => Promise<void>,
+	): Promise<void> {
+		using tempDir = TempDir.createSync("@omp-seance-owner-scope-");
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		setDefaultSessionStorage(storage);
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const agent = getBundledAgent("seance");
+		if (!agent) throw new Error("Expected the bundled seance agent");
+		try {
+			await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+				const cwd = path.join(tempDir.path(), "project");
+				const sessionDir = sessionDirForCwd(cwd);
+				const aliceFile = path.join(sessionDir, "2026-10-01_shared.jsonl");
+				const aliceArtifacts = aliceFile.slice(0, -".jsonl".length);
+				const bobFile = path.join(sessionDir, "2026-10-01_shared-bob.jsonl");
+				const alice = {
+					file: aliceFile,
+					artifactsDir: aliceArtifacts,
+					task: path.join(aliceArtifacts, "nested", "alice-task.jsonl"),
+				};
+				const bob = {
+					file: bobFile,
+					other: path.join(sessionDir, "2026-10-01_bob-other.jsonl"),
+					task: path.join(bobFile.slice(0, -".jsonl".length), "bob-task.jsonl"),
+				};
+				await storage.writeText(alice.file, sessionBody("alice-session", cwd, savedModel));
+				await storage.writeText(alice.task, sessionBody("alice-task-header", cwd, savedModel));
+				await storage.writeText(bob.file, sessionBody("bob-session", cwd, savedModel));
+				await storage.writeText(bob.other, sessionBody("bob-other", cwd, savedModel));
+				await storage.writeText(bob.task, sessionBody("bob-task-header", cwd, savedModel));
+				await storage.drain();
+				const seance = async (caller: { sessionFile: string | null; artifactsDir?: string }, source: string) => {
+					const session = {
+						cwd,
+						getSessionFile: () => caller.sessionFile,
+						getArtifactsDir: () => caller.artifactsDir ?? null,
+						modelRegistry,
+					} as unknown as ToolSession;
+					const prepared = await prepareSeance({
+						session,
+						invocationKind: "task",
+						agent,
+						sourceSession: source,
+						planMode: false,
+						isolationRequested: false,
+						hasCustomTools: false,
+					});
+					return prepared.session.fork.sourceFile;
+				};
+				await fn({ storage, cwd, alice, bob, seance });
+			});
+		} finally {
+			setDefaultSessionStorage(undefined);
+			authStorage.close();
+			await client.end();
+		}
+	}
+
+	it("forks the caller's own session and its nested task transcripts by path or id", async () => {
+		await withSharedStore(async ({ alice, seance }) => {
+			const caller = { sessionFile: alice.file, artifactsDir: alice.artifactsDir };
+			await expect(seance(caller, alice.file)).resolves.toBe(alice.file);
+			await expect(seance(caller, "alice-session")).resolves.toBe(alice.file);
+			await expect(seance(caller, "alice-sess")).resolves.toBe(alice.file);
+			await expect(seance(caller, alice.task)).resolves.toBe(alice.task);
+			await expect(seance(caller, "alice-task")).resolves.toBe(alice.task);
+			// `..` that stays inside the caller's tree is normalized, not rejected.
+			await expect(seance(caller, `${alice.artifactsDir}/nested/../nested/alice-task.jsonl`)).resolves.toBe(
+				alice.task,
+			);
+		});
+	});
+
+	it("denies another user's same-project transcripts by path, id, prefix and traversal without reading them", async () => {
+		await withSharedStore(async ({ storage, alice, bob, seance }) => {
+			const touched: string[] = [];
+			for (const method of ["exists", "readText", "readTextSlices", "statSync"] as const) {
+				const original = storage[method].bind(storage) as unknown as (file: string, ...rest: unknown[]) => unknown;
+				vi.spyOn(storage, method).mockImplementation(((file: string, ...rest: unknown[]) => {
+					touched.push(file);
+					return original(file, ...rest);
+				}) as never);
+			}
+			const caller = { sessionFile: alice.file, artifactsDir: alice.artifactsDir };
+			const unavailable = "The selected session file was not found or could not be accessed.";
+
+			await expect(seance(caller, bob.file)).rejects.toThrow(unavailable);
+			await expect(seance(caller, bob.task)).rejects.toThrow(unavailable);
+			await expect(seance(caller, `${alice.artifactsDir}/../${path.basename(bob.file)}`)).rejects.toThrow(
+				unavailable,
+			);
+			await expect(
+				seance(caller, `${alice.artifactsDir}/nested/../../2026-10-01_shared-bob/bob-task.jsonl`),
+			).rejects.toThrow(unavailable);
+			// A missing path inside the caller's own tree fails identically, so the error reveals nothing.
+			await expect(seance(caller, path.join(alice.artifactsDir, "missing.jsonl"))).rejects.toThrow(unavailable);
+
+			await expect(seance(caller, "bob-session")).rejects.toThrow('Session "bob-session" was not found.');
+			await expect(seance(caller, "bob-task")).rejects.toThrow('Session "bob-task" was not found.');
+			// Bob owns two `bob…` sessions; an unscoped listing would report this prefix as ambiguous.
+			await expect(seance(caller, "bob")).rejects.toThrow('Session "bob" was not found.');
+
+			const foreign = [bob.file, bob.other, bob.task];
+			expect(touched.filter(file => foreign.includes(path.resolve(file)))).toEqual([]);
+		});
+	});
+
+	it("fails closed when the caller has no session identity", async () => {
+		await withSharedStore(async ({ alice, bob, seance }) => {
+			const anonymous = { sessionFile: null, artifactsDir: alice.artifactsDir };
+			const failure = "Seance requires a persisted caller session to locate its source.";
+			await expect(seance(anonymous, alice.task)).rejects.toThrow(failure);
+			await expect(seance(anonymous, "alice-task")).rejects.toThrow(failure);
+			await expect(seance(anonymous, bob.file)).rejects.toThrow(failure);
+		});
+	});
+
+	it("honors a TUI /seance pick only for the exact source and the caller that picked it", async () => {
+		await withSharedStore(async ({ alice, bob, seance }) => {
+			const caller = { sessionFile: alice.file, artifactsDir: alice.artifactsDir };
+			grantUserSeanceSource(alice.file, bob.file);
+
+			await expect(seance(caller, bob.file)).resolves.toBe(bob.file);
+			await expect(seance(caller, "bob-session")).rejects.toThrow('Session "bob-session" was not found.');
+			await expect(seance(caller, bob.task)).rejects.toThrow(
+				"The selected session file was not found or could not be accessed.",
+			);
+			await expect(seance({ sessionFile: alice.task }, bob.file)).rejects.toThrow(
+				"The selected session file was not found or could not be accessed.",
+			);
+		});
 	});
 });
 

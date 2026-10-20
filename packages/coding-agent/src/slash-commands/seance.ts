@@ -3,7 +3,7 @@ import { Snowflake } from "@oh-my-pi/pi-utils";
 import { sanitizeErrorLine } from "@oh-my-pi/pi-tui/chrome/error-block";
 import type { TaskParams, TaskToolDetails } from "@oh-my-pi/pi-tui/tools/task";
 import { discoverAgents } from "../task/discovery";
-import { isBundledSeance, resolveSeanceSource } from "../task/seance";
+import { grantUserSeanceSource, isBundledSeance, resolveSeanceSource } from "../task/seance";
 import { SEANCE_AGENT_NAME } from "../task/seance-policy";
 import seanceCommandPrompt from "../prompts/system/seance-command.md" with { type: "text" };
 import seanceCommandSolutionSpace from "../prompts/system/seance-command-solution-space.md" with { type: "text" };
@@ -42,6 +42,9 @@ async function launchSeance(ctx: InteractiveModeContext, sourceSession: string, 
 		ctx.showError("The task tool is not available for /seance.");
 		return;
 	}
+	// The user picked this source; the task tool's owner scoping applies to model-chosen ones.
+	const callerSessionFile = ctx.sessionManager.getSessionFile();
+	if (callerSessionFile) grantUserSeanceSource(callerSessionFile, sourceSession);
 	const params: TaskParams = {
 		agent: SEANCE_AGENT_NAME,
 		sourceSession,
