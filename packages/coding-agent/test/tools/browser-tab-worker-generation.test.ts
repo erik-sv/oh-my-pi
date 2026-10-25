@@ -128,19 +128,45 @@ let workerSeq = 0;
  * Headless-shaped browser handle. `closedTargets` records the ids the
  * supervisor closed through `closeCdpTarget`, which drives every orphan-page
  * cleanup path in this version (browser-level CDP session, not `page.close()`).
+ * Like Chromium, the session reports an accepted close with
+ * `Target.targetDestroyed` once target discovery is on.
  */
 function makeBrowser(): { handle: PuppeteerBrowserHandle; closedTargets: string[] } {
 	const closedTargets: string[] = [];
+	const destroyedListeners = new Set<(event: { targetId: string }) => void>();
+	let discovering = false;
 	const session = {
-		async send(method: string, params?: { targetId?: string }): Promise<unknown> {
+		on(event: string, listener: (event: { targetId: string }) => void): void {
+			if (event === "Target.targetDestroyed") destroyedListeners.add(listener);
+		},
+		off(event: string, listener: (event: { targetId: string }) => void): void {
+			if (event === "Target.targetDestroyed") destroyedListeners.delete(listener);
+		},
+		async send(method: string, params?: { targetId?: string; discover?: boolean }): Promise<unknown> {
+			if (method === "Target.setDiscoverTargets") {
+				discovering = params?.discover === true;
+				return {};
+			}
 			if (method === "Target.closeTarget") {
-				if (params?.targetId) closedTargets.push(params.targetId);
+				const targetId = params?.targetId;
+				if (targetId) {
+					closedTargets.push(targetId);
+					// The event follows the command's response, as on the wire.
+					if (discovering) {
+						queueMicrotask(() => {
+							for (const listener of destroyedListeners) listener({ targetId });
+						});
+					}
+				}
 				return { success: true };
 			}
 			if (method === "Target.getTargets") return { targetInfos: [] };
 			return {};
 		},
-		async detach(): Promise<void> {},
+		async detach(): Promise<void> {
+			discovering = false;
+			destroyedListeners.clear();
+		},
 	};
 	// Only the members the worker-backed headless path touches; a real puppeteer
 	// Browser cannot be constructed without Chromium.
