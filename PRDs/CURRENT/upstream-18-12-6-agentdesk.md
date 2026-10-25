@@ -1,5 +1,5 @@
 # Upstream 18.12.6 AgentDesk Integration
-Status: Integration built and scoped TypeScript/RPC/browser/cross-version checks passed. Native tests and coordinated AgentDesk deployment remain gates; not activated.
+Status: Integration built; scoped TypeScript, native, RPC, browser, cross-version and AgentDesk sandbox checks passed. Coordinated production deployment and canaries remain gates; not activated.
 Current Goal: Land the deployed 18.12.3 fork and upstream's latest stable patches (v18.12.4 through v18.12.6) on fork `main` without changing AgentDesk's runtime contracts.
 
 ## Overview
@@ -49,6 +49,9 @@ Run from the worktree with `env -u PI_CONFIG_FILES -u OMP_SESSION_DB_OPTIONS -u 
 - Live Codex `gpt-6.1-sol` recalled the same seed through 18.12.3, 18.12.6 and rollback to 18.12.3 using one SQLite-backed transcript, with no physical JSONL file. Evidence: `/home/agentdesk/tmp/omp18126-cross-2u_n7h0y/`.
 - Compiled RPC pre-agent failure order is response/failed response/prompt_error/prompt_result, with one prompt_error and agentInvoked false. Compiled browser navigation returned Example Domain and closed its tabs.
 - `cargo-nextest` is unavailable. Ordinary `cargo test --profile local` covers pi-shell, pi-edit, pi-builtins, pi-vcs and pi-natives instead. The upstream native delta is confined to those five crates (28 files, 2296 insertions, 295 deletions); this is scoped verification, not a full-workspace test claim.
+- Native behavioral coverage: 3,439 passed and two existing tests ignored across 22 test binaries in those five crates. Compilation ran under agentdesk-gate; execution ran serially in the host namespace because process tests require the host PID view. This host lacked `en_US.UTF-8`, so `localedef` supplied an isolated locale through `LOCPATH`. One upstream test asserted Git's exact fatal-error wording; that assertion was removed while retaining exit-status 128 and the actual worktree behavior checks. The corrected shell suite passed 941 tests, with one ignored.
+- AgentDesk PR #245 landed as `6ffb5068ca972b2841ed6d6a35552d9bdc689b67`. Its owning gate passed 2,375 browser tests; 34 targeted Rust regressions passed. An isolated application/runtime sandbox exposed Sol and completed fresh, stopped-child SQL resume, and branch-at-ordinal requests with persisted replies. Desktop and mobile model pickers showed GPT-6.1 Sol. The owning sandbox teardown removed its processes, database, role and directory.
+- The compiled artifact uses runtime source at `417ab3b1cb5c87ff03c2ab6f27bf7a53653ad859`. Subsequent changes are this verification record and the test-only Git wording assertion removal; runtime code and artifact bytes are unchanged.
 
 ## Open items
 - Fork `main` needs this branch landed through a PR. The parent owns commit, push, PR, build and activation.
