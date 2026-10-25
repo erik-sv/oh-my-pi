@@ -10,7 +10,11 @@ import { describe, expect, it } from "bun:test";
 import * as path from "node:path";
 import type { Usage } from "@oh-my-pi/pi-ai";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import {
+	SqlSessionStorage,
+	type SqlSessionStorageClient,
+	type SqlSessionStorageTransaction,
+} from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { SQL } from "bun";
 
@@ -47,6 +51,43 @@ async function sqlBody(client: SQL, sessionFile: string): Promise<string> {
 		sessionFile,
 	])) as Array<{ content: string }>;
 	return rows.map(row => row.content).join("");
+}
+
+/**
+ * Bun.SQL wrapper that can pause the next rewrite inside its transaction:
+ * the chunk backend publishes a rewrite as delete+insert, so the first
+ * `DELETE` on the chunk table after `holdNextReplace` is set is the replace.
+ */
+class HeldSqlClient implements SqlSessionStorageClient {
+	readonly options: SqlSessionStorageClient["options"];
+	holdNextReplace = false;
+	readonly replaceStarted = Promise.withResolvers<void>();
+	readonly allowReplace = Promise.withResolvers<void>();
+	readonly #client: InstanceType<typeof SQL>;
+
+	constructor(client: InstanceType<typeof SQL>) {
+		this.#client = client;
+		this.options = client.options;
+	}
+
+	unsafe(query: string, values?: unknown[]) {
+		return this.#client.unsafe(query, values);
+	}
+
+	begin<T>(callback: (transaction: SqlSessionStorageTransaction) => Promise<T>): Promise<T> {
+		return this.#client.begin(transaction =>
+			callback({
+				unsafe: (query, values) => {
+					if (this.holdNextReplace && query.startsWith("DELETE FROM omp_session_chunks")) {
+						this.holdNextReplace = false;
+						this.replaceStarted.resolve();
+						return this.allowReplace.promise.then(() => transaction.unsafe(query, values));
+					}
+					return transaction.unsafe(query, values);
+				},
+			}),
+		) as Promise<T>;
+	}
 }
 
 describe("SessionManager + SqlSessionStorage (SQLite)", () => {
@@ -232,6 +273,52 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		expect(await sqlBody(client, sessionFile)).toBe(peerBody);
 		expect(peerBody).toContain("durable SQL peer turn");
 		expect(peerBody).toContain("original local turn");
+		await client.end();
+	});
+
+	it("recovers a fenced rewrite size conflict with the real SQLite backend", async () => {
+		const client = new SQL("sqlite::memory:");
+		const heldClient = new HeldSqlClient(client);
+		const storage = await SqlSessionStorage.create({ client: heldClient });
+		const manager = SessionManager.create("/cwd", virtualDir("/sessions/rewrite-race"), storage);
+		await manager.ensureOnDisk();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		manager.appendMessage({
+			role: "assistant",
+			provider: "anthropic",
+			model: "claude-3-7-sonnet",
+			content: [{ type: "text", text: "seed reply" }],
+			usage: fakeUsage(1, 1),
+			api: "anthropic-messages",
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		manager.appendMessage({ role: "user", content: "before rewrite", timestamp: Date.now() });
+		await manager.flush();
+		await storage.drain();
+		const turn = manager.getEntries().find(entry => entry.type === "message" && entry.message.role === "user");
+		if (turn?.type !== "message" || turn.message.role !== "user") throw new Error("Expected user turn");
+		turn.message.content = "pruned before rewrite";
+
+		heldClient.holdNextReplace = true;
+		const rewritePublished = manager.rewriteEntries();
+		await heldClient.replaceStarted.promise;
+		manager.appendMessage({ role: "user", content: "fenced append", timestamp: Date.now() });
+		heldClient.allowReplace.resolve();
+		await rewritePublished.catch(() => {});
+		await manager.flush().catch(() => {});
+
+		manager.appendMessage({ role: "user", content: "later turn", timestamp: Date.now() });
+		await manager.flush().catch(() => {});
+		await storage.drain().catch(() => {});
+
+		const body = await storage.readText(sessionFile);
+		expect(body).toContain("fenced append");
+		expect(body).toContain("later turn");
+		expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(body, "utf8"));
+		await manager.close();
 		await client.end();
 	});
 });

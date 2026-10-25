@@ -189,6 +189,14 @@ export interface ThinkingConfig {
 	 * provides an explicit wire off-path.
 	 */
 	requiresEffort?: boolean;
+	/**
+	 * The catalog has no evidence this model reasons (unclassified id, no
+	 * capability metadata). The ladder is offered for the user to opt into:
+	 * sessions leave thinking unset until the user picks an effort, and a
+	 * request without an effort goes out as non-reasoning (see
+	 * `withoutUnverifiedThinking`).
+	 */
+	unverified?: boolean;
 }
 
 // `Provider` is any provider-id string; `KnownProvider` (re-exported above) enumerates
@@ -563,6 +571,8 @@ export interface OpenAICompat {
 	reasoningDeltasMayBeCumulative?: boolean;
 	/** Strip leaked DeepSeek chat-template special tokens from visible content deltas. Default: auto-detected. */
 	stripDeepseekSpecialTokens?: boolean;
+	/** Drop assistant thinking blocks from replayed chat-completions history. Default: false. */
+	stripThinkingHistory?: boolean;
 	/** Heal leaked chat-template/tool-call/thinking markup from visible content deltas. Default: auto-detected. */
 	streamMarkupHealingPattern?: OpenAIStreamMarkupHealingPattern;
 	/** Whether this wire may revise already-streamed text (`stream-revision` axis). Unassigned: append-only. */
@@ -800,8 +810,8 @@ export interface AnthropicCompat {
 }
 
 /**
- * Compatibility settings for Bedrock Converse prompt caching. Cache pricing is
- * deliberately not used to infer these request-shape capabilities.
+ * Compatibility settings for Bedrock Converse requests and native streaming
+ * side-compaction. Cache pricing does not imply these capabilities.
  */
 export interface BedrockCompat {
 	/** Explicit disabled-thinking wire form; unset preserves the provider's existing behavior. */
@@ -849,9 +859,14 @@ export interface BedrockCompat {
 	 * local prefix-binding safeguards. Default: true.
 	 */
 	supportsThinkingBindingControls?: boolean;
+	/**
+	 * Whether the model supports a compaction-only Bedrock Runtime
+	 * InvokeModelWithResponseStream request. Ordinary turns still use Converse.
+	 */
+	supportsServerCompaction?: boolean;
 }
 
-/** Fully-resolved Bedrock Converse prompt-cache capabilities, materialized once by `buildModel`. */
+/** Fully-resolved Bedrock Converse and side-compaction capabilities, materialized once by `buildModel`. */
 export interface ResolvedBedrockCompat {
 	/** See {@link BedrockCompat.disabledThinking}. */
 	disabledThinking?: BedrockCompat["disabledThinking"];
@@ -866,6 +881,8 @@ export interface ResolvedBedrockCompat {
 	supportsForcedToolChoice: boolean;
 	/** See {@link BedrockCompat.supportsThinkingBindingControls}. */
 	supportsThinkingBindingControls: boolean;
+	/** See {@link BedrockCompat.supportsServerCompaction}; false unless the Bedrock model-card policy opts in. */
+	supportsServerCompaction: boolean;
 	/**
 	 * Stream-watchdog idle-timeout fallback in ms for hosts with no keepalive
 	 * events; 0 disables the idle watchdog. Undefined defers to
@@ -1034,6 +1051,7 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "requiresAssistantAfterToolResult"
 			| "requiresAssistantContentForToolCalls"
 			| "stripDeepseekSpecialTokens"
+			| "stripThinkingHistory"
 			| "streamMarkupHealingPattern"
 			| "reasoningDeltasMayBeCumulative"
 			| "emptyLengthFinishIsContextError"
@@ -1072,6 +1090,9 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 		cacheControlFormat?: OpenAICompat["cacheControlFormat"];
 		thinkingKeep?: OpenAICompat["thinkingKeep"];
 		streamIdleTimeoutMs?: number;
+		stripThinkingHistory?: boolean;
+		/** The configured `baseUrl` is the official OpenAI API (provider `openai`); unset otherwise. */
+		officialEndpoint?: boolean;
 		toolStrictMode: ResolvedToolStrictMode;
 		/** The model sits behind Vercel AI Gateway. */
 		isVercelGatewayHost: boolean;
@@ -1137,9 +1158,11 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	isVercelGatewayHost: boolean;
 	/**
 	 * The configured endpoint is first-party OpenAI (`provider === "openai"` on
-	 * an `api.openai.com` or unset baseUrl). Gates official-only Responses
-	 * behavior: default-on stateful `previous_response_id` chaining and the
-	 * `text.verbosity` field.
+	 * an `api.openai.com` or unset baseUrl), or the Codex backend
+	 * (`openai-codex-responses` on the default Codex baseUrl). Gates platform
+	 * OpenAI's official-only Responses behavior (default-on stateful
+	 * `previous_response_id` chaining and the `text.verbosity` field; the Codex
+	 * adapter is not governed by either gate) and host request-size budgets.
 	 */
 	officialEndpoint: boolean;
 	/** Run Harmony-protocol leak detection/mitigation on streamed output. */
@@ -1283,6 +1306,18 @@ export interface GoogleCompat {
 	antigravityUsageLabel?: string;
 	/** Strip image inputs before encoding (text-only serving of a multimodal id). */
 	stripImageInput?: boolean;
+	/**
+	 * Largest width or height a single image may carry for a Claude reader on
+	 * this host (see {@link AnthropicCompat.maxImageDimension}). Setting this or
+	 * {@link maxImagePayloadBytes} turns on Claude's image clamp, many-image
+	 * cap included; unset leaves images as sent.
+	 */
+	maxImageDimension?: number;
+	/**
+	 * Largest base64 payload a single image may carry, in bytes (see
+	 * {@link AnthropicCompat.maxImagePayloadBytes}).
+	 */
+	maxImagePayloadBytes?: number;
 	/** Thinking-loop watchdog guard family applied to streamed reasoning. */
 	thinkingLoopGuard?: "gemini" | "deepseek" | "xai";
 	/** See {@link BedrockCompat.supportsSamplingParams}. */
@@ -1298,6 +1333,8 @@ export type ResolvedGoogleCompat = Required<
 		| "thinkingLoopGuard"
 		| "antigravityUsageLabel"
 		| "supportsSamplingParams"
+		| "maxImageDimension"
+		| "maxImagePayloadBytes"
 	>
 > & {
 	streamFirstEventTimeoutMs?: number;
@@ -1305,7 +1342,17 @@ export type ResolvedGoogleCompat = Required<
 	thinkingLoopGuard?: GoogleCompat["thinkingLoopGuard"];
 	antigravityUsageLabel?: string;
 	supportsSamplingParams?: boolean;
+	maxImageDimension?: number;
+	maxImagePayloadBytes?: number;
 };
+
+/** Ollama chat history compatibility resolved by the catalog. */
+export interface OllamaCompat {
+	/** Omit assistant thinking when the deployment rejects it in history. */
+	stripThinkingHistory?: boolean;
+}
+
+export type ResolvedOllamaCompat = Required<OllamaCompat>;
 
 /** Sparse, user-authored compat overrides for a given API (models.json / config vocabulary). */
 export type CompatConfigOf<TApi extends Api> = TApi extends
@@ -1323,7 +1370,9 @@ export type CompatConfigOf<TApi extends Api> = TApi extends
 				? DevinCompat
 				: TApi extends "google-generative-ai" | "google-vertex" | "google-gemini-cli"
 					? GoogleCompat
-					: undefined;
+					: TApi extends "ollama-chat"
+						? OllamaCompat
+						: undefined;
 
 /** Resolved compat for a given API: complete record, materialized once by `buildModel`. */
 export type CompatOf<TApi extends Api> = TApi extends "openrouter"
@@ -1340,7 +1389,9 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 						? ResolvedDevinCompat
 						: TApi extends "google-generative-ai" | "google-vertex" | "google-gemini-cli"
 							? ResolvedGoogleCompat
-							: undefined;
+							: TApi extends "ollama-chat"
+								? ResolvedOllamaCompat
+								: undefined;
 
 /** Provider-native compaction endpoint configuration for one model. */
 export interface RemoteCompactionConfig<TApi extends Api = Api> {
@@ -1432,7 +1483,8 @@ export type ModelTokenizer =
 	| "qwen3"
 	| "deepseek-v3"
 	| "kimi-k2"
-	| "glm5";
+	| "glm5"
+	| "o200k";
 
 /** One account's discovered entitlements on a model; see {@link Model.accountAccess}. */
 export interface ModelAccountAccess {
@@ -1489,6 +1541,8 @@ export interface Model<TApi extends Api = Api> {
 	requiresGlyphTokenization?: boolean;
 	/** Whether this model requires Cursor's tool-schema combiner projection. */
 	requiresCursorToolSchemaProjection?: boolean;
+	/** Whether advertised tool schemas occupy every model request's context (false for deferred catalogs). */
+	toolSchemasInContext?: boolean;
 	/** Whether this model requires tool-result images hoisted into sibling user content blocks. */
 	requiresToolResultImageHoisting?: boolean;
 	/**
@@ -1537,6 +1591,12 @@ export interface Model<TApi extends Api = Api> {
 	 * than OMP's general image pipeline. `stb` local backends reject WebP.
 	 */
 	imageInputDecoder?: "stb";
+	/**
+	 * Most images one request may carry, from user configuration. Replaces the
+	 * catalog's `image-count-budget` for hosts no rule names, such as a custom
+	 * gateway in front of a vendor with a higher limit.
+	 */
+	imageCountBudget?: number;
 	/**
 	 * Native provider tool-call support. `false` is the only unsupported signal:
 	 * `true` and `undefined` both mean callers may use native tools. Catalog and
@@ -1619,6 +1679,8 @@ export interface Model<TApi extends Api = Api> {
 	contextWindow: number | null;
 	/** Preserve the host's supplied window instead of applying inferred expansion or reference-price caps. */
 	contextWindowAuthoritative?: boolean;
+	/** The long-context price tier does not cap the runtime context window when extended context is off. */
+	longContextWindowUncapped?: boolean;
 	/** Optional larger prompt window available when extended context is enabled. */
 	maxContextWindow?: number;
 	maxTokens: number | null;
@@ -1660,8 +1722,6 @@ export interface Model<TApi extends Api = Api> {
 	preferWebsockets?: boolean;
 	/** Codex Responses Lite transport: send the lite marker and carry instructions/tools as input items (mirrors codex-rs `use_responses_lite`). */
 	useResponsesLite?: boolean;
-	/** Codex Code Mode restriction: model expects tools routed through a programmatic exec surface (mirrors codex-rs `tool_mode`). */
-	toolMode?: "code_mode_only";
 	/**
 	 * Service-tier ids the provider advertises for this model (Codex discovery
 	 * `service_tiers[].id`, e.g. `priority`, `ultrafast`). Absent when the
@@ -1762,6 +1822,7 @@ export interface ModelSpec<TApi extends Api = Api> extends Omit<
 	| "compatConfig"
 	| "requiresGlyphTokenization"
 	| "requiresCursorToolSchemaProjection"
+	| "toolSchemasInContext"
 	| "requiresToolResultImageHoisting"
 	| "supportsAssistantPrefill"
 	| "supportsComputerUseConfig"

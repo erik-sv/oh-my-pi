@@ -25,9 +25,9 @@ function withoutPartial(event: AssistantMessageEvent): RpcDeltaMessageUpdateFram
  * splits one message across two ids.
  *
  * AgentDesk fork: ids are written only after the host sends `set_event_filter`.
- * Hosts that never opt in (AgentDesk) prefer a frame `messageId` over the
- * provider `responseId` they reconcile persisted history with, and `msg-N`
- * restarts in every process, so stamping by default collides across restarts.
+ * AgentDesk reconciles persisted history using the provider `responseId`, but
+ * its normalizer gives an explicit frame `messageId` precedence. Since `msg-N`
+ * restarts in every process, default stamping would override the stable identity.
  */
 export class RpcSessionEventForwarder {
 	#filter: Set<string> | undefined;

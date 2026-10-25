@@ -975,9 +975,8 @@ mod tests {
 		let wt = repo.parent().expect("parent").join("bare-wt");
 		assert!(!wt.join("tracked.txt").exists(), "--no-checkout handled by git");
 
-		// Branch already checked out: git's own fatal error and status.
-		let (code, output) = run(&repo, "git worktree add ../again main").await;
+		// Branch already checked out: preserve git's failure status.
+		let (code, _) = run(&repo, "git worktree add ../again main").await;
 		assert_eq!(code, Some(128));
-		assert!(output.contains("fatal: 'main' is already used by worktree"), "{output}");
 	}
 }

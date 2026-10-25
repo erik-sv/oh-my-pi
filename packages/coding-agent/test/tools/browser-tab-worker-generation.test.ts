@@ -16,8 +16,10 @@
  *     would resurrect it outside the registry and leak the new worker.
  *  3. A generation that can no longer be talked to (crashed, or a reply that
  *     cannot be posted) settles its runs immediately instead of letting each
- *     caller wait out the grace window, and leaves no worker process, page
- *     target, or browser hold behind.
+ *     caller wait out the grace window, cancels the host work they started,
+ *     and is terminated. A new subprocess generation adopts the same page; a
+ *     replacement lost again right away, or one that cannot start, closes the
+ *     tab and leaves no worker process, page target, or browser hold behind.
  *
  * The fake process handle preserves generation identity and undeliverable-send
  * behavior without sharing a native runtime with the test process.
@@ -126,19 +128,45 @@ let workerSeq = 0;
  * Headless-shaped browser handle. `closedTargets` records the ids the
  * supervisor closed through `closeCdpTarget`, which drives every orphan-page
  * cleanup path in this version (browser-level CDP session, not `page.close()`).
+ * Like Chromium, the session reports an accepted close with
+ * `Target.targetDestroyed` once target discovery is on.
  */
 function makeBrowser(): { handle: PuppeteerBrowserHandle; closedTargets: string[] } {
 	const closedTargets: string[] = [];
+	const destroyedListeners = new Set<(event: { targetId: string }) => void>();
+	let discovering = false;
 	const session = {
-		async send(method: string, params?: { targetId?: string }): Promise<unknown> {
+		on(event: string, listener: (event: { targetId: string }) => void): void {
+			if (event === "Target.targetDestroyed") destroyedListeners.add(listener);
+		},
+		off(event: string, listener: (event: { targetId: string }) => void): void {
+			if (event === "Target.targetDestroyed") destroyedListeners.delete(listener);
+		},
+		async send(method: string, params?: { targetId?: string; discover?: boolean }): Promise<unknown> {
+			if (method === "Target.setDiscoverTargets") {
+				discovering = params?.discover === true;
+				return {};
+			}
 			if (method === "Target.closeTarget") {
-				if (params?.targetId) closedTargets.push(params.targetId);
+				const targetId = params?.targetId;
+				if (targetId) {
+					closedTargets.push(targetId);
+					// The event follows the command's response, as on the wire.
+					if (discovering) {
+						queueMicrotask(() => {
+							for (const listener of destroyedListeners) listener({ targetId });
+						});
+					}
+				}
 				return { success: true };
 			}
 			if (method === "Target.getTargets") return { targetInfos: [] };
 			return {};
 		},
-		async detach(): Promise<void> {},
+		async detach(): Promise<void> {
+			discovering = false;
+			destroyedListeners.clear();
+		},
 	};
 	// Only the members the worker-backed headless path touches; a real puppeteer
 	// Browser cannot be constructed without Chromium.
@@ -179,6 +207,56 @@ function standardReplies(msg: WorkerInbound, worker: FakeProcessWorker): boolean
 		return true;
 	}
 	return false;
+}
+
+/** A generation that adopts the page and answers every run. */
+function servingWorker(): FakeProcessWorker {
+	return new FakeProcessWorker((msg, worker) => {
+		if (standardReplies(msg, worker)) return;
+		if (msg.type !== "run") return;
+		worker.emit({
+			type: "result",
+			id: msg.id,
+			ok: true,
+			payload: { displays: [], returnValue: "ran on the replacement", screenshots: [] },
+		});
+	});
+}
+
+/** A generation whose process dies on every run without answering it. */
+function crashingWorker(): FakeProcessWorker {
+	return new FakeProcessWorker((msg, worker) => {
+		if (standardReplies(msg, worker)) return;
+		if (msg.type === "run") worker.crash(new Error("Worker exited with code 134"));
+	});
+}
+
+/** A replacement generation whose init waits for `release()`; it then adopts the page and answers runs. */
+function heldReplacement(): { worker: FakeProcessWorker; initStarted: Promise<void>; release(): void } {
+	const initStarted = Promise.withResolvers<void>();
+	const gate = Promise.withResolvers<void>();
+	const worker = new FakeProcessWorker((msg, self) => {
+		if (msg.type === "init") {
+			initStarted.resolve();
+			void gate.promise.then(() => standardReplies(msg, self));
+			return;
+		}
+		if (standardReplies(msg, self) || msg.type !== "run") return;
+		self.emit({
+			type: "result",
+			id: msg.id,
+			ok: true,
+			payload: { displays: [], returnValue: "ran on the replacement", screenshots: [] },
+		});
+	});
+	return { worker, initStarted: initStarted.promise, release: () => gate.resolve() };
+}
+
+async function failureOf(promise: Promise<unknown>): Promise<string> {
+	return await promise.then(
+		() => "",
+		(error: unknown) => (error instanceof Error ? error.message : String(error)),
+	);
 }
 
 function queueSpawns(workers: FakeProcessWorker[]): void {
@@ -352,44 +430,54 @@ describe("browser tab-supervisor: worker generations", () => {
 		}
 	});
 
-	it("settles an in-flight run when its worker generation dies", async () => {
-		const crashing = new FakeProcessWorker((msg, worker) => {
-			if (standardReplies(msg, worker)) return;
-			// The worker process dies without ever answering the run: no `result`
-			// message will arrive, only the runtime's error event.
-			if (msg.type === "run") worker.crash(new Error("Worker exited with code 134"));
-		});
-		queueSpawns([crashing]);
+	it("settles an in-flight run when its worker generation dies and reattaches the page", async () => {
+		const crashing = crashingWorker();
+		const replacement = servingWorker();
+		queueSpawns([crashing, replacement]);
 
 		const browser = makeBrowser();
 		await acquireTab("eval", browser.handle, { timeoutMs: RUN_TIMEOUT_MS });
 		const started = Date.now();
-		const failure = await runInTab("eval", {
-			code: "await tab.screenshot();",
-			timeoutMs: RUN_TIMEOUT_MS,
-			session: makeSession(),
-		}).then(
-			() => undefined,
-			(error: unknown) => error,
+		const failure = await failureOf(
+			runInTab("eval", { code: "await tab.screenshot();", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }),
 		);
 
 		// Surfaced from the worker's death, not from waiting out the grace race.
-		expect((failure as Error).message).toContain("Worker exited with code 134");
+		expect(failure).toContain("Browser tab worker failed: Worker exited with code 134");
+		expect(failure).toContain("the tab is being reattached to a new worker on the same page");
 		expect(Date.now() - started).toBeLessThan(RUN_TIMEOUT_MS);
-		// The dead generation left no run registered and the name explains itself.
-		const reopenFailure = await runInTab("eval", {
-			code: "1;",
-			timeoutMs: RUN_TIMEOUT_MS,
-			session: makeSession(),
-		}).then(
-			() => undefined,
-			(error: unknown) => error,
-		);
-		expect((reopenFailure as Error).message).toContain("was killed: Browser tab worker failed");
-		// Nothing of the dead generation survives: process terminated, its page
-		// target closed by the release, browser hold returned.
+		// The next call waits for the reattach and runs on the new generation,
+		// which adopted the same page as-is instead of creating another.
+		const next = await runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() });
+		expect(next.returnValue).toBe("ran on the replacement");
 		expect(crashing.terminated).toBe(true);
+		expect(replacement.received[0]).toMatchObject({
+			type: "init",
+			payload: { mode: "attach", page: { kind: "owned", targetId: READY.targetId }, recover: false },
+		});
+		// The release closes the page omp owns and returns the browser hold.
 		await releaseTab("eval", { kill: false });
+		expect(browser.closedTargets).toEqual([READY.targetId]);
+		expect(browser.handle.refCount).toBe(0);
+	});
+
+	it("closes the tab when the replacement generation dies again right away", async () => {
+		const first = crashingWorker();
+		const second = crashingWorker();
+		queueSpawns([first, second]);
+
+		const browser = makeBrowser();
+		await acquireTab("eval", browser.handle, { timeoutMs: RUN_TIMEOUT_MS });
+		const run = () => runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() });
+		expect(await failureOf(run())).toContain("the tab is being reattached");
+		expect(await failureOf(run())).toContain("again right after being replaced; tab closed");
+		expect(await failureOf(run())).toContain("was killed: Browser tab worker failed");
+
+		// The release joins the kill's teardown: no worker, page target, or hold survives.
+		await releaseTab("eval", { kill: false });
+		expect(getTabsMapForTest().has("eval")).toBe(false);
+		expect(first.terminated).toBe(true);
+		expect(second.terminated).toBe(true);
 		expect(browser.closedTargets).toEqual([READY.targetId]);
 		expect(browser.handle.refCount).toBe(0);
 	});
@@ -404,21 +492,108 @@ describe("browser tab-supervisor: worker generations", () => {
 			worker.emit({ type: "tool-call", id: "call-1", runId: msg.id, name: "read", args: {} });
 			worker.drop();
 		});
-		queueSpawns([dying]);
+		queueSpawns([dying, servingWorker()]);
 
 		await acquireTab("eval", makeBrowser().handle, { timeoutMs: RUN_TIMEOUT_MS });
 		const started = Date.now();
-		const failure = await runInTab("eval", {
-			code: "await read('AGENTS.md');",
-			timeoutMs: RUN_TIMEOUT_MS,
-			session: makeSession(),
-		}).then(
-			() => undefined,
-			(error: unknown) => error,
+		const failure = await failureOf(
+			runInTab("eval", { code: "await read('AGENTS.md');", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }),
 		);
 
-		expect((failure as Error).message).toBe("Browser tab worker stopped accepting messages");
+		expect(failure).toContain("Browser tab worker stopped accepting messages");
+		expect(failure).toContain("the tab is being reattached");
 		expect(Date.now() - started).toBeLessThan(RUN_TIMEOUT_MS);
+		const next = await runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() });
+		expect(next.returnValue).toBe("ran on the replacement");
+	});
+
+	it("ignores a late failure of a generation whose loss is already being recovered", async () => {
+		const held = heldReplacement();
+		const dying = new FakeProcessWorker((msg, worker) => {
+			if (standardReplies(msg, worker)) return;
+			if (msg.type !== "run") return;
+			worker.emit({ type: "tool-call", id: "call-1", runId: msg.id, name: "read", args: {} });
+			worker.drop();
+		});
+		queueSpawns([dying, held.worker]);
+
+		try {
+			await acquireTab("eval", makeBrowser().handle, { timeoutMs: RUN_TIMEOUT_MS });
+			const failure = await failureOf(
+				runInTab("eval", { code: "await read('AGENTS.md');", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }),
+			);
+			expect(failure).toContain("Browser tab worker stopped accepting messages");
+			await held.initStarted;
+			// The lost generation's exit error lands while its replacement is still starting. Counted as a
+			// second loss, it would read as a crash loop and close a tab that is recovering normally.
+			dying.crash(new Error("Worker exited with code 0"));
+			expect(getTabsMapForTest().get("eval")?.state).toBe("alive");
+			held.release();
+
+			const next = await runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() });
+			expect(next.returnValue).toBe("ran on the replacement");
+			expect(getTabsMapForTest().get("eval")?.state).toBe("alive");
+		} finally {
+			held.release();
+		}
+	});
+
+	it("stops a replacement still starting when the tab is released", async () => {
+		const crashing = crashingWorker();
+		const held = heldReplacement();
+		queueSpawns([crashing, held.worker]);
+
+		const browser = makeBrowser();
+		try {
+			await acquireTab("eval", browser.handle, { timeoutMs: RUN_TIMEOUT_MS });
+			const crash = await failureOf(
+				runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }),
+			);
+			expect(crash).toContain("the tab is being reattached");
+			await held.initStarted;
+			const waiting = failureOf(runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }));
+
+			const started = Date.now();
+			await releaseTab("eval", { kill: false });
+			// The replacement is gone when the release returns, not at its own init deadline.
+			expect(held.worker.terminated).toBe(true);
+			// A call waiting on the reattach settles with the closure instead of running anywhere.
+			expect(await waiting).toContain("is not alive");
+			expect(Date.now() - started).toBeLessThan(RUN_TIMEOUT_MS);
+			expect(held.worker.kinds).toEqual(["init"]);
+			expect(getTabsMapForTest().has("eval")).toBe(false);
+			expect(browser.closedTargets).toEqual([READY.targetId]);
+			expect(browser.handle.refCount).toBe(0);
+		} finally {
+			held.release();
+		}
+	});
+
+	it("does not run a call whose budget the reattach used up", async () => {
+		const crashing = crashingWorker();
+		const held = heldReplacement();
+		queueSpawns([crashing, held.worker]);
+
+		try {
+			await acquireTab("eval", makeBrowser().handle, { timeoutMs: RUN_TIMEOUT_MS });
+			await failureOf(runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }));
+			await held.initStarted;
+			const waiting = failureOf(runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() }));
+			// The reattach finishes with only 10ms of the waiting call's budget left.
+			const now = performance.now.bind(performance);
+			const clock = spyOn(performance, "now").mockImplementation(() => now() + RUN_TIMEOUT_MS - 10);
+			held.release();
+			const failure = await waiting;
+			clock.mockRestore();
+
+			expect(failure).toContain(`used up this call's ${RUN_TIMEOUT_MS}ms budget, so the call was not run`);
+			// Nothing was dispatched to the reattached generation, and the tab stays usable.
+			expect(held.worker.kinds).toEqual(["init"]);
+			const next = await runInTab("eval", { code: "1;", timeoutMs: RUN_TIMEOUT_MS, session: makeSession() });
+			expect(next.returnValue).toBe("ran on the replacement");
+		} finally {
+			held.release();
+		}
 	});
 
 	it("contains a worker crash that lands while a tool call is in flight", async () => {
@@ -435,6 +610,7 @@ describe("browser tab-supervisor: worker generations", () => {
 			if (msg.type !== "run") return;
 			worker.emit({ type: "tool-call", id: "call-1", runId: msg.id, name: "read", args: {} });
 		});
+		// No replacement generation can start, so the reattach fails and closes the tab.
 		queueSpawns([crashing]);
 
 		// A host tool the worker asked for, still running when the worker dies.
@@ -480,7 +656,7 @@ describe("browser tab-supervisor: worker generations", () => {
 			expect(uncaught).toEqual([]);
 			expect(crashing.terminated).toBe(true);
 
-			// A subsequent call reports the closed tab instead of hanging.
+			// A subsequent call waits out the failed reattach and reports the closed tab instead of hanging.
 			const reopenFailure = await runInTab("eval", {
 				code: "1;",
 				timeoutMs: RUN_TIMEOUT_MS,

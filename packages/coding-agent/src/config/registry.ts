@@ -105,6 +105,8 @@ interface DefinitionBase {
 	 * Protocol hosts (RPC/ACP embedders) that start from this setting's default rather than the local
 	 * user's interactive preference: at startup the default is pinned as a runtime override unless
 	 * the host configured a value itself (caller overrides, project settings, `--config`, global config).
+	 * A definition may declare `protocolValue` (typed like its default) to pin that instead, when the
+	 * neutral protocol value differs from the interactive default.
 	 */
 	protocolDefault?: readonly ProtocolHost[];
 	/**
@@ -122,6 +124,7 @@ interface DefinitionBase {
 export interface BooleanDefinition extends DefinitionBase {
 	type: "boolean";
 	default: boolean | undefined;
+	protocolValue?: boolean;
 	env?: SettingEnv<boolean>;
 	ui?: UiBoolean;
 }
@@ -129,6 +132,7 @@ export interface BooleanDefinition extends DefinitionBase {
 export interface StringDefinition extends DefinitionBase {
 	type: "string";
 	default: string | undefined;
+	protocolValue?: string;
 	env?: SettingEnv<string>;
 	ui?: UiString;
 }
@@ -136,6 +140,7 @@ export interface StringDefinition extends DefinitionBase {
 export interface NumberDefinition extends DefinitionBase {
 	type: "number";
 	default: number | undefined;
+	protocolValue?: number;
 	env?: SettingEnv<number>;
 	ui?: UiNumber;
 }
@@ -144,6 +149,7 @@ export interface EnumDefinition<T extends readonly string[] = readonly string[]>
 	type: "enum";
 	values: T;
 	default: T[number];
+	protocolValue?: T[number];
 	env?: SettingEnv<T[number]>;
 	ui?: UiEnum<T>;
 }
@@ -151,6 +157,7 @@ export interface EnumDefinition<T extends readonly string[] = readonly string[]>
 export interface ArrayDefinition<T = unknown> extends DefinitionBase {
 	type: "array";
 	default: readonly T[];
+	protocolValue?: readonly T[];
 	env?: SettingEnv<readonly T[]>;
 	/**
 	 * Closed vocabulary for the entries (`label` names one entry in messages, e.g. "status line
@@ -164,6 +171,7 @@ export interface ArrayDefinition<T = unknown> extends DefinitionBase {
 export interface RecordDefinition<T = unknown> extends DefinitionBase {
 	type: "record";
 	default: Readonly<Record<string, T>>;
+	protocolValue?: Readonly<Record<string, T>>;
 	env?: SettingEnv<Readonly<Record<string, T>>>;
 	ui?: UiBase;
 }
@@ -489,6 +497,13 @@ export class Setting<T, Id extends string = string> extends Derived<T> {
 	/** Fresh copy of the default value (arrays/records are cloned so callers may mutate). */
 	get default(): T {
 		const value = this.definition.default;
+		return (typeof value === "object" && value !== null ? structuredClone(value) : value) as T;
+	}
+
+	/** Fresh copy of the value protocol hosts pin: `protocolValue` when declared, else the default. */
+	get protocolDefaultValue(): T {
+		const { protocolValue } = this.definition;
+		const value = protocolValue === undefined ? this.definition.default : protocolValue;
 		return (typeof value === "object" && value !== null ? structuredClone(value) : value) as T;
 	}
 

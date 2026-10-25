@@ -1,0 +1,529 @@
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { CURRENT_SESSION_VERSION } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { sessionDirForCwd } from "@oh-my-pi/pi-coding-agent/session/session-paths";
+import { setDefaultSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { SqlSessionStorage } from "@oh-my-pi/pi-coding-agent/session/sql-session-storage";
+import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
+import {
+	grantUserSeanceSource,
+	prepareSeance,
+	resolveSeanceSource,
+	restoreSeanceSession,
+} from "@oh-my-pi/pi-coding-agent/task/seance";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { getAgentDir, getSessionsDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { SQL } from "bun";
+
+function sessionHeader(id: string, cwd: string) {
+	return {
+		type: "session",
+		version: CURRENT_SESSION_VERSION,
+		id,
+		timestamp: "2026-10-01T00:00:00.000Z",
+		cwd,
+	};
+}
+
+function modelChange(id: string, parentId: string | null, model: string, role: string) {
+	return {
+		type: "model_change",
+		id,
+		parentId,
+		timestamp: "2026-10-01T00:00:01.000Z",
+		model,
+		role,
+	};
+}
+
+function modelUsage(id: string, parentId: string, activeLeafId: string | null) {
+	return {
+		type: "model_usage",
+		id,
+		parentId,
+		timestamp: "2026-10-01T00:00:02.000Z",
+		purpose: "task-completion-probe",
+		role: "smol",
+		api: "openai-completions",
+		provider: "openai",
+		model: "gpt-4o",
+		usage: {
+			input: 11,
+			output: 2,
+			cacheRead: 3,
+			cacheWrite: 0,
+			totalTokens: 16,
+			cost: { input: 0.0011, output: 0.0004, cacheRead: 0.00003, cacheWrite: 0, total: 0.00153 },
+		},
+		stopReason: "stop",
+		activeLeafId,
+	};
+}
+
+function sessionBody(id: string, cwd: string, entries: unknown[] = []): string {
+	return `${[sessionHeader(id, cwd), ...entries].map(entry => JSON.stringify(entry)).join("\n")}\n`;
+}
+
+async function writeSession(file: string, id: string, cwd: string, entries: unknown[] = []): Promise<void> {
+	await fs.mkdir(path.dirname(file), { recursive: true });
+	await Bun.write(file, sessionBody(id, cwd, entries));
+}
+
+/** Point the agent dir (and so every project's session bucket) at a temp root for one test. */
+async function withAgentDir<T>(agentDir: string, fn: () => Promise<T>): Promise<T> {
+	const originalAgentDir = getAgentDir();
+	const originalAgentDirOverride = process.env.PI_CODING_AGENT_DIR;
+	setAgentDir(agentDir);
+	try {
+		return await fn();
+	} finally {
+		if (originalAgentDirOverride !== undefined) {
+			setAgentDir(originalAgentDirOverride);
+		} else {
+			setAgentDir(originalAgentDir);
+			delete process.env.PI_CODING_AGENT_DIR;
+		}
+	}
+}
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
+
+describe("seance source resolution", () => {
+	it("resolves paths and stored IDs to read-only source metadata with the active model and default fallback", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-source-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const file = path.join(sessionDir, "saved.jsonl");
+		await writeSession(file, "saved-source-id", cwd, [
+			modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default"),
+			modelChange("active-model", "default-model", "anthropic/claude-sonnet-4-6", "fast"),
+		]);
+		const original = await fs.readFile(file);
+		const options = { cwd, sessionDirHint: sessionDir };
+
+		await expect(resolveSeanceSource(file, options)).resolves.toEqual({
+			file,
+			id: "saved-source-id",
+			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+		});
+		await expect(resolveSeanceSource("saved-source-id", options)).resolves.toEqual({
+			file,
+			id: "saved-source-id",
+			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+		});
+		expect(await fs.readFile(file)).toEqual(original);
+	});
+
+	it("restores the model from the active branch after late usage and returns no models for a null active leaf", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-active-model-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const file = path.join(sessionDir, "late-usage.jsonl");
+		const entries = [
+			modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default"),
+			modelChange("probe-owner", "default-model", "openai/gpt-4o", "fast"),
+			modelChange("active-model", "default-model", "anthropic/claude-sonnet-4-6", "fast"),
+			modelUsage("late-usage", "probe-owner", "active-model"),
+		];
+		await writeSession(file, "active-model-source", cwd, entries);
+		await expect(resolveSeanceSource(file, { cwd, sessionDirHint: sessionDir })).resolves.toMatchObject({
+			id: "active-model-source",
+			modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+		});
+
+		const clearedFile = path.join(sessionDir, "cleared-usage.jsonl");
+		await writeSession(clearedFile, "cleared-model-source", cwd, [
+			...entries.slice(0, 3),
+			modelUsage("cleared-usage", "probe-owner", null),
+		]);
+		await expect(resolveSeanceSource(clearedFile, { cwd, sessionDirHint: sessionDir })).resolves.toMatchObject({
+			id: "cleared-model-source",
+			modelSelectors: [],
+		});
+	});
+
+	it("fails closed for missing paths and IDs, ambiguous prefixes, and files without a session header", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-source-invalid-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const options = { cwd, sessionDirHint: sessionDir };
+		await writeSession(path.join(sessionDir, "first.jsonl"), "ambiguous-first", cwd);
+		await writeSession(path.join(sessionDir, "second.jsonl"), "ambiguous-second", cwd);
+		const malformedFile = path.join(sessionDir, "malformed.jsonl");
+		await Bun.write(malformedFile, `${JSON.stringify({ type: "session", version: CURRENT_SESSION_VERSION })}\n`);
+
+		await expect(resolveSeanceSource(path.join(sessionDir, "missing.jsonl"), options)).rejects.toThrow(
+			"The selected session file was not found or could not be accessed.",
+		);
+		await expect(resolveSeanceSource("not-present", options)).rejects.toThrow('Session "not-present" was not found.');
+		await expect(resolveSeanceSource("ambiguous", options)).rejects.toThrow(
+			'Session selector "ambiguous" is ambiguous.',
+		);
+		await expect(resolveSeanceSource(malformedFile, options)).rejects.toThrow(
+			"The selected file does not contain a valid session header.",
+		);
+	});
+
+	it("leaves orphaned backups untouched during local source ID lookup", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-read-only-source-");
+		const cwd = path.join(tempDir.path(), "project");
+		const sessionDir = path.join(tempDir.path(), "sessions");
+		const sourceFile = path.join(sessionDir, "source.jsonl");
+		const orphanFile = path.join(sessionDir, "orphan.jsonl");
+		const backupFile = `${orphanFile}.1700000000000.bak`;
+		await writeSession(sourceFile, "source-id", cwd);
+		await writeSession(backupFile, "orphan-id", cwd);
+		const originalBackup = await fs.readFile(backupFile);
+
+		await expect(resolveSeanceSource("source-id", { cwd, sessionDirHint: sessionDir })).resolves.toMatchObject({
+			file: sourceFile,
+			id: "source-id",
+		});
+		expect(await fs.readFile(backupFile)).toEqual(originalBackup);
+		await expect(fs.stat(orphanFile)).rejects.toThrow();
+	});
+
+	it("rejects ambiguous duplicate IDs among nested artifact histories", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-nested-ambiguity-");
+		const cwd = path.join(tempDir.path(), "project");
+		const artifactsDir = path.join(tempDir.path(), "artifacts");
+		await writeSession(path.join(artifactsDir, "history-one", "worker.jsonl"), "worker-id", cwd);
+		await writeSession(path.join(artifactsDir, "history-two", "worker.jsonl"), "worker-id", cwd);
+
+		await expect(resolveSeanceSource("worker", { cwd, artifactsDirHint: artifactsDir })).rejects.toThrow(
+			'Session selector "worker" is ambiguous.',
+		);
+	});
+
+	it("prefers a direct artifact child over a nested history with the same ID", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-direct-child-");
+		const cwd = path.join(tempDir.path(), "project");
+		const artifactsDir = path.join(tempDir.path(), "artifacts");
+		const directFile = path.join(artifactsDir, "worker.jsonl");
+		await writeSession(directFile, "worker-id", cwd);
+		await writeSession(path.join(artifactsDir, "history", "worker.jsonl"), "worker-id", cwd);
+
+		await expect(resolveSeanceSource("worker", { cwd, artifactsDirHint: artifactsDir })).resolves.toMatchObject({
+			file: directFile,
+			id: "worker-id",
+		});
+	});
+
+	it("finds an id stored only in another project only when global lookup is requested", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-global-lookup-");
+		await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+			const cwd = path.join(tempDir.path(), "project");
+			const otherCwd = path.join(tempDir.path(), "other-project");
+			const foreignFile = path.join(sessionDirForCwd(otherCwd), "foreign.jsonl");
+			await writeSession(foreignFile, "foreign-project-id", otherCwd);
+
+			await expect(resolveSeanceSource("foreign-project-id", { cwd })).rejects.toThrow(
+				'Session "foreign-project-id" was not found.',
+			);
+			await expect(resolveSeanceSource("foreign-project-id", { cwd, includeGlobal: true })).resolves.toMatchObject({
+				file: foreignFile,
+				id: "foreign-project-id",
+			});
+		});
+	});
+
+	it("expands a home-relative source path", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-home-path-");
+		const home = path.join(tempDir.path(), "home");
+		vi.spyOn(os, "homedir").mockReturnValue(home);
+		const file = path.join(home, "saved", "home-source.jsonl");
+		await writeSession(file, "home-source-id", home);
+
+		const resolved = await resolveSeanceSource("~/saved/home-source.jsonl", {
+			cwd: path.join(tempDir.path(), "project"),
+		});
+		expect(path.resolve(resolved.file)).toBe(file);
+		expect(resolved.id).toBe("home-source-id");
+	});
+
+	it("does not create a default session bucket or migrate legacy directories on unhinted lookup", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-unhinted-read-only-");
+		await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+			const cwd = path.join(tempDir.path(), "project");
+			const sessionsRoot = getSessionsDir();
+			const defaultSessionDir = sessionDirForCwd(cwd);
+			const homeEncoded = os
+				.homedir()
+				.replace(/^[/\\]/, "")
+				.replace(/[/\\:]/g, "-");
+			const legacyDir = path.join(sessionsRoot, `--${homeEncoded}-seance-readonly-probe--`);
+			const migratedLegacyDir = path.join(sessionsRoot, "-seance-readonly-probe");
+			const backupFile = path.join(legacyDir, "orphan.jsonl.1700000000000.bak");
+			await writeSession(backupFile, "orphan-id", cwd);
+			const originalBackup = await fs.readFile(backupFile);
+
+			const sourceFile = path.join(defaultSessionDir, "source.jsonl");
+			await writeSession(sourceFile, "source-id", cwd);
+			await expect(resolveSeanceSource("source-id", { cwd })).resolves.toMatchObject({
+				file: sourceFile,
+				id: "source-id",
+			});
+
+			const emptyCwd = path.join(tempDir.path(), "empty-project");
+			const emptySessionDir = sessionDirForCwd(emptyCwd);
+			await expect(fs.stat(emptySessionDir)).rejects.toThrow();
+			await expect(
+				resolveSeanceSource("missing-unhinted-source", { cwd: emptyCwd, includeGlobal: true }),
+			).rejects.toThrow('Session "missing-unhinted-source" was not found.');
+			await expect(fs.stat(emptySessionDir)).rejects.toThrow();
+			expect(await fs.readFile(backupFile)).toEqual(originalBackup);
+			expect((await fs.stat(legacyDir)).isDirectory()).toBe(true);
+			await expect(fs.stat(migratedLegacyDir)).rejects.toThrow();
+		});
+	});
+});
+
+describe("seance source resolution with SQL session storage", () => {
+	it("resolves paths, project ids, artifact ids and global ids through the default SQL storage", async () => {
+		using tempDir = TempDir.createSync("@omp-seance-sql-");
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		// AgentDesk wires SQL as the process default; consult callers pass no storage.
+		setDefaultSessionStorage(storage);
+		try {
+			await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+				const cwd = path.join(tempDir.path(), "project");
+				const sessionDir = sessionDirForCwd(cwd);
+				const sourceFile = path.join(sessionDir, "2026-10-01_sql-source-id.jsonl");
+				const workerFile = path.join(tempDir.path(), "artifacts", "parent", "worker.jsonl");
+				const foreignFile = path.join(getSessionsDir(), "-elsewhere-", "2026-10-01_foreign-sql-id.jsonl");
+				await storage.writeText(
+					sourceFile,
+					sessionBody("sql-source-id", cwd, [
+						modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default"),
+						modelChange("active-model", "default-model", "anthropic/claude-sonnet-4-6", "fast"),
+					]),
+				);
+				await storage.writeText(workerFile, sessionBody("worker-id", cwd));
+				await storage.writeText(foreignFile, sessionBody("foreign-sql-id", path.join(tempDir.path(), "elsewhere")));
+				await storage.drain();
+				const expected = {
+					file: sourceFile,
+					id: "sql-source-id",
+					modelSelectors: ["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"],
+				};
+
+				await expect(resolveSeanceSource(sourceFile, { cwd })).resolves.toEqual(expected);
+				await expect(resolveSeanceSource("sql-source-id", { cwd, sessionDirHint: sessionDir })).resolves.toEqual(
+					expected,
+				);
+				await expect(resolveSeanceSource("sql-source-id", { cwd })).resolves.toEqual(expected);
+				await expect(
+					resolveSeanceSource("worker", { cwd, artifactsDirHint: path.join(tempDir.path(), "artifacts") }),
+				).resolves.toMatchObject({ file: workerFile, id: "worker-id" });
+				await expect(resolveSeanceSource("foreign-sql-id", { cwd })).rejects.toThrow(
+					'Session "foreign-sql-id" was not found.',
+				);
+				await expect(resolveSeanceSource("foreign-sql-id", { cwd, includeGlobal: true })).resolves.toMatchObject({
+					file: foreignFile,
+					id: "foreign-sql-id",
+				});
+				await expect(resolveSeanceSource(path.join(sessionDir, "missing.jsonl"), { cwd })).rejects.toThrow(
+					"The selected session file was not found or could not be accessed.",
+				);
+				// Every lookup went through SQL: no session bucket or transcript reached the disk.
+				await expect(fs.stat(sessionDir)).rejects.toThrow();
+				await expect(fs.stat(workerFile)).rejects.toThrow();
+			});
+		} finally {
+			setDefaultSessionStorage(undefined);
+			await client.end();
+		}
+	});
+});
+
+describe("model-initiated seance on shared SQL session storage", () => {
+	const savedModel = [modelChange("default-model", null, "anthropic/claude-sonnet-4-5", "default")];
+
+	/**
+	 * Two users' sessions in one project bucket of one SQL store, as AgentDesk runs it. Alice's
+	 * artifacts dir (`…_shared`) is a string prefix of Bob's (`…_shared-bob`), so containment must
+	 * respect path boundaries.
+	 */
+	async function withSharedStore(
+		fn: (fixture: {
+			storage: SqlSessionStorage;
+			cwd: string;
+			alice: { file: string; artifactsDir: string; task: string };
+			bob: { file: string; other: string; task: string };
+			seance: (caller: { sessionFile: string | null; artifactsDir?: string }, source: string) => Promise<string>;
+		}) => Promise<void>,
+	): Promise<void> {
+		using tempDir = TempDir.createSync("@omp-seance-owner-scope-");
+		const client = new SQL("sqlite::memory:");
+		const storage = await SqlSessionStorage.create({ client });
+		setDefaultSessionStorage(storage);
+		const authStorage = await AuthStorage.create(":memory:");
+		authStorage.keys.setRuntime("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const agent = getBundledAgent("seance");
+		if (!agent) throw new Error("Expected the bundled seance agent");
+		try {
+			await withAgentDir(path.join(tempDir.path(), "agent"), async () => {
+				const cwd = path.join(tempDir.path(), "project");
+				const sessionDir = sessionDirForCwd(cwd);
+				const aliceFile = path.join(sessionDir, "2026-10-01_shared.jsonl");
+				const aliceArtifacts = aliceFile.slice(0, -".jsonl".length);
+				const bobFile = path.join(sessionDir, "2026-10-01_shared-bob.jsonl");
+				const alice = {
+					file: aliceFile,
+					artifactsDir: aliceArtifacts,
+					task: path.join(aliceArtifacts, "nested", "alice-task.jsonl"),
+				};
+				const bob = {
+					file: bobFile,
+					other: path.join(sessionDir, "2026-10-01_bob-other.jsonl"),
+					task: path.join(bobFile.slice(0, -".jsonl".length), "bob-task.jsonl"),
+				};
+				await storage.writeText(alice.file, sessionBody("alice-session", cwd, savedModel));
+				await storage.writeText(alice.task, sessionBody("alice-task-header", cwd, savedModel));
+				await storage.writeText(bob.file, sessionBody("bob-session", cwd, savedModel));
+				await storage.writeText(bob.other, sessionBody("bob-other", cwd, savedModel));
+				await storage.writeText(bob.task, sessionBody("bob-task-header", cwd, savedModel));
+				await storage.drain();
+				const seance = async (caller: { sessionFile: string | null; artifactsDir?: string }, source: string) => {
+					const session = {
+						cwd,
+						getSessionFile: () => caller.sessionFile,
+						getArtifactsDir: () => caller.artifactsDir ?? null,
+						modelRegistry,
+					} as unknown as ToolSession;
+					const prepared = await prepareSeance({
+						session,
+						invocationKind: "task",
+						agent,
+						sourceSession: source,
+						planMode: false,
+						isolationRequested: false,
+						hasCustomTools: false,
+					});
+					return prepared.session.fork.sourceFile;
+				};
+				await fn({ storage, cwd, alice, bob, seance });
+			});
+		} finally {
+			setDefaultSessionStorage(undefined);
+			authStorage.close();
+			await client.end();
+		}
+	}
+
+	it("forks the caller's own session and its nested task transcripts by path or id", async () => {
+		await withSharedStore(async ({ alice, seance }) => {
+			const caller = { sessionFile: alice.file, artifactsDir: alice.artifactsDir };
+			await expect(seance(caller, alice.file)).resolves.toBe(alice.file);
+			await expect(seance(caller, "alice-session")).resolves.toBe(alice.file);
+			await expect(seance(caller, "alice-sess")).resolves.toBe(alice.file);
+			await expect(seance(caller, alice.task)).resolves.toBe(alice.task);
+			await expect(seance(caller, "alice-task")).resolves.toBe(alice.task);
+			// `..` that stays inside the caller's tree is normalized, not rejected.
+			await expect(seance(caller, `${alice.artifactsDir}/nested/../nested/alice-task.jsonl`)).resolves.toBe(
+				alice.task,
+			);
+		});
+	});
+
+	it("denies another user's same-project transcripts by path, id, prefix and traversal without reading them", async () => {
+		await withSharedStore(async ({ storage, alice, bob, seance }) => {
+			const touched: string[] = [];
+			for (const method of ["exists", "readText", "readTextSlices", "statSync"] as const) {
+				const original = storage[method].bind(storage) as unknown as (file: string, ...rest: unknown[]) => unknown;
+				vi.spyOn(storage, method).mockImplementation(((file: string, ...rest: unknown[]) => {
+					touched.push(file);
+					return original(file, ...rest);
+				}) as never);
+			}
+			const caller = { sessionFile: alice.file, artifactsDir: alice.artifactsDir };
+			const unavailable = "The selected session file was not found or could not be accessed.";
+
+			await expect(seance(caller, bob.file)).rejects.toThrow(unavailable);
+			await expect(seance(caller, bob.task)).rejects.toThrow(unavailable);
+			await expect(seance(caller, `${alice.artifactsDir}/../${path.basename(bob.file)}`)).rejects.toThrow(
+				unavailable,
+			);
+			await expect(
+				seance(caller, `${alice.artifactsDir}/nested/../../2026-10-01_shared-bob/bob-task.jsonl`),
+			).rejects.toThrow(unavailable);
+			// A missing path inside the caller's own tree fails identically, so the error reveals nothing.
+			await expect(seance(caller, path.join(alice.artifactsDir, "missing.jsonl"))).rejects.toThrow(unavailable);
+
+			await expect(seance(caller, "bob-session")).rejects.toThrow('Session "bob-session" was not found.');
+			await expect(seance(caller, "bob-task")).rejects.toThrow('Session "bob-task" was not found.');
+			// Bob owns two `bob…` sessions; an unscoped listing would report this prefix as ambiguous.
+			await expect(seance(caller, "bob")).rejects.toThrow('Session "bob" was not found.');
+
+			const foreign = [bob.file, bob.other, bob.task];
+			expect(touched.filter(file => foreign.includes(path.resolve(file)))).toEqual([]);
+		});
+	});
+
+	it("fails closed when the caller has no session identity", async () => {
+		await withSharedStore(async ({ alice, bob, seance }) => {
+			const anonymous = { sessionFile: null, artifactsDir: alice.artifactsDir };
+			const failure = "Seance requires a persisted caller session to locate its source.";
+			await expect(seance(anonymous, alice.task)).rejects.toThrow(failure);
+			await expect(seance(anonymous, "alice-task")).rejects.toThrow(failure);
+			await expect(seance(anonymous, bob.file)).rejects.toThrow(failure);
+		});
+	});
+
+	it("honors a TUI /seance pick only for the exact source and the caller that picked it", async () => {
+		await withSharedStore(async ({ alice, bob, seance }) => {
+			const caller = { sessionFile: alice.file, artifactsDir: alice.artifactsDir };
+			grantUserSeanceSource(alice.file, bob.file);
+
+			await expect(seance(caller, bob.file)).resolves.toBe(bob.file);
+			await expect(seance(caller, "bob-session")).rejects.toThrow('Session "bob-session" was not found.');
+			await expect(seance(caller, bob.task)).rejects.toThrow(
+				"The selected session file was not found or could not be accessed.",
+			);
+			await expect(seance({ sessionFile: alice.task }, bob.file)).rejects.toThrow(
+				"The selected session file was not found or could not be accessed.",
+			);
+		});
+	});
+});
+
+describe("seance cold restore", () => {
+	it("revives with whichever bundled read-only tools were persisted and refuses a contract without read", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			authStorage.keys.setRuntime("anthropic", "test-key");
+			const modelRegistry = new ModelRegistry(authStorage);
+			using tempDir = TempDir.createSync("@omp-seance-restore-");
+			const cwd = tempDir.path();
+			const init = {
+				systemPrompt: ["restricted seance prompt"],
+				task: "Read the source transcript.",
+				// `glob.enabled: false` trimmed glob at spawn; `write` never belongs to a seance.
+				tools: ["read", "grep", "write", "yield"],
+				agent: "seance",
+				resolvedModel: "anthropic/claude-sonnet-4-5",
+				restrictToolNames: true,
+				spawns: "",
+			};
+
+			await expect(restoreSeanceSession({ init, cwd, modelRegistry })).resolves.toEqual({
+				cwd,
+				modelPattern: "anthropic/claude-sonnet-4-5",
+				toolNames: ["read", "grep", "yield"],
+			});
+			await expect(
+				restoreSeanceSession({ init: { ...init, tools: ["grep", "glob", "yield"] }, cwd, modelRegistry }),
+			).resolves.toBeUndefined();
+		} finally {
+			authStorage.close();
+		}
+	});
+});

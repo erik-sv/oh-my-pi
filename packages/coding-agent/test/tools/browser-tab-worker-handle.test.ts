@@ -30,7 +30,7 @@ describe("tab worker subprocess lifetime", () => {
 	});
 
 	it.skipIf(!CHROMIUM_AVAILABLE)(
-		"contains a fatal worker exit and keeps the parent usable",
+		"contains a fatal worker exit, reattaches the tab, and keeps the parent usable",
 		async () => {
 			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 			const failedName = `native-exit-${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -45,7 +45,16 @@ describe("tab worker subprocess lifetime", () => {
 					() => undefined,
 					(error: unknown) => error,
 				);
-				expect((failure as Error).message).toContain("Browser tab worker exited with code 134");
+				// The call in flight fails instead of hanging or taking the parent down.
+				expect(failure).toBeInstanceOf(Error);
+
+				// The next call on the same tab runs on a reattached subprocess.
+				const reattached = await runInTab(failedName, {
+					code: "return 1;",
+					timeoutMs: 10_000,
+					session: makeSession(),
+				});
+				expect(reattached.returnValue).toBe(1);
 
 				await acquireTab(healthyName, browser, { timeoutMs: 10_000 });
 				const result = await runInTab(healthyName, {

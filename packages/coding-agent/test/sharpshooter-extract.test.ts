@@ -40,10 +40,15 @@ function assistantResponse(content: AssistantMessage["content"]): AssistantMessa
 	};
 }
 
-function extractionDependencies(cwd: string, messages: AgentMessage[], sessionId = "session-extract") {
+function extractionDependencies(
+	cwd: string,
+	messages: AgentMessage[],
+	sessionId = "session-extract",
+	overrides: Record<string, unknown> = {},
+) {
 	const model = getBundledModel("anthropic", "claude-haiku-4-5");
 	if (!model) throw new Error("Expected bundled Claude Haiku model");
-	const settings = Settings.isolated({ "sharpshooter.model": `${model.provider}/${model.id}` });
+	const settings = Settings.isolated({ "sharpshooter.model": `${model.provider}/${model.id}`, ...overrides });
 	const modelRegistry = {
 		getAll: () => [model],
 		getAvailable: () => [model],
@@ -132,6 +137,35 @@ describe("maybeStartSharpshooterExtraction", () => {
 		expect(completion).toHaveBeenCalledTimes(1);
 		pending.resolve(assistantResponse([{ type: "text", text: "No tool call." }]));
 		await flushSharpshooterExtraction(deps.session);
+	});
+
+	it("gates short prompts on sharpshooter.minPromptLength, counting user-perceived characters", async () => {
+		const cwd = path.join(os.tmpdir(), "sharpshooter-min-length-project");
+		const agentDir = path.join(os.tmpdir(), "sharpshooter-min-length-agent");
+		const completion = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValue(assistantResponse([{ type: "text", text: "No tool call." }]));
+
+		// Await the session's in-flight extraction (none when the gate drops the prompt) before counting calls.
+		const extractionStarts = async (text: string, overrides: Record<string, unknown> = {}): Promise<boolean> => {
+			completion.mockClear();
+			const deps = extractionDependencies(
+				cwd,
+				[message("user", [{ type: "text", text }])],
+				`session-${text}`,
+				overrides,
+			);
+			maybeStartSharpshooterExtraction({ agentDir, ...deps });
+			await flushSharpshooterExtraction(deps.session);
+			return completion.mock.calls.length === 1;
+		};
+
+		expect(await extractionStarts("用方案二")).toBe(false);
+		expect(await extractionStarts("用方案二", { "sharpshooter.minPromptLength": 4 })).toBe(true);
+		// Values below the floor of 2 still drop one-character acks.
+		expect(await extractionStarts("好", { "sharpshooter.minPromptLength": 0 })).toBe(false);
+		// "👍" is one character even though its UTF-16 length is 2.
+		expect(await extractionStarts("👍", { "sharpshooter.minPromptLength": 2 })).toBe(false);
 	});
 
 	it("queues only deltas whose evidence is a verbatim prompt substring", async () => {

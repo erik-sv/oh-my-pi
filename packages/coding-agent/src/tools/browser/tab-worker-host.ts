@@ -1,5 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
-import type { WorkerHandle as SubprocessHandle } from "../../subprocess/worker-client";
+import type { SpawnedSubprocess, WorkerHandle as SubprocessHandle } from "../../subprocess/worker-client";
 import {
 	createWorkerHandle,
 	createWorkerSubprocess,
@@ -52,12 +52,30 @@ export interface WorkerHandle {
 	close(): Promise<boolean>;
 }
 
+/**
+ * The error a generation reports once its process has exited: the subprocess
+ * error (with its stderr tail) plus how it ended, so the supervisor can say so
+ * without parsing the message.
+ */
+export class TabWorkerExitError extends Error {
+	constructor(
+		message: string,
+		/** `exit code N` or `signal SIGNAME`. */
+		readonly status: string,
+		cause: Error,
+	) {
+		super(message, { cause });
+		this.name = "TabWorkerExitError";
+	}
+}
+
 const WORKER_CLOSE_TIMEOUT_MS = 750;
 
 class ProcessWorkerHandle implements WorkerHandle {
 	readonly mode = "process" as const;
 	readonly id = ++nextWorkerId;
 	#base: SubprocessHandle<WorkerInbound, WorkerOutbound>;
+	#proc: SpawnedSubprocess<WorkerOutbound>["proc"];
 	#usable = true;
 	#terminated = false;
 	#detachers = new Set<() => void>();
@@ -74,6 +92,7 @@ class ProcessWorkerHandle implements WorkerHandle {
 			reportCleanExit: true,
 			unref: false,
 		});
+		this.#proc = spawned.proc;
 		this.#base = createWorkerHandle(spawned, message => {
 			const result = spawned.proc.send(message);
 			if (isThenable(result)) result.then(undefined, () => {});
@@ -117,7 +136,15 @@ class ProcessWorkerHandle implements WorkerHandle {
 	}
 
 	onError(handler: (error: Error) => void): () => void {
-		return this.#track(this.#base.onError(handler));
+		return this.#track(this.#base.onError(error => handler(this.#withExitStatus(error))));
+	}
+
+	/** Type an error raised after the process exited; one raised while it still runs (a bad IPC frame) is kept. */
+	#withExitStatus(error: Error): Error {
+		const { exitCode, signalCode } = this.#proc;
+		if (exitCode !== null) return new TabWorkerExitError(error.message, `exit code ${exitCode}`, error);
+		if (signalCode !== null) return new TabWorkerExitError(error.message, `signal ${signalCode}`, error);
+		return error;
 	}
 
 	async close(): Promise<boolean> {
