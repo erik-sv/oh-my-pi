@@ -1242,6 +1242,18 @@ export function parseSqlSessionDbOptions(optionsJson: string): {
 	return { connectionOptions: { ...connectionOptions, max: SQL_SESSION_POOL_MAX }, createTable };
 }
 
+function isExplicitFreshRpcSession(parsed: Args): boolean {
+	return (
+		parsed.mode === "rpc" &&
+		!!parsed.sessionDir &&
+		!parsed.noSession &&
+		!parsed.continue &&
+		!parsed.resume &&
+		!parsed.fork &&
+		!isForeignSessionImport(parsed)
+	);
+}
+
 /**
  * When `--session-storage sql` is requested, build a SQL-backed
  * {@link SqlSessionStorage} from the connection in OMP_SESSION_DB_URL (a
@@ -1275,8 +1287,8 @@ export async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 		createTable = parsedOptions.createTable;
 	}
 
-	// Only direct RPC resumes can skip discovery during startup. Every picker,
-	// import, fork, and new-session flow keeps the complete metadata index.
+	// Explicit RPC launches need only their transcript and sidecars. Pickers,
+	// imports, forks, and implicit auto-resume still require session discovery.
 	const initialPath =
 		parsed.mode === "rpc" &&
 		!parsed.noSession &&
@@ -1292,6 +1304,7 @@ export async function setupSessionStorageBackend(parsed: Args): Promise<void> {
 		createTable,
 		sessionRoot: parsed.sessionDir ?? getSessionsDir(),
 		initialPath,
+		lazyIndex: isExplicitFreshRpcSession(parsed),
 	});
 	setDefaultSessionStorage(storage);
 	logger.debug("Session storage backend: sql", { adapter: storage.adapter, table: storage.table });
@@ -1420,8 +1433,15 @@ export async function createSessionManager(
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		await getDefaultSessionStorage().ensureCompleteIndex?.();
-		return SessionManager.create(cwd, parsed.sessionDir);
+		const storage = getDefaultSessionStorage();
+		if (isExplicitFreshRpcSession(parsed) && storage instanceof SqlSessionStorage) {
+			const manager = SessionManager.create(cwd, parsed.sessionDir, storage);
+			const sessionFile = manager.getSessionFile();
+			if (sessionFile) await storage.prepareSession(sessionFile);
+			return manager;
+		}
+		await storage.ensureCompleteIndex?.();
+		return SessionManager.create(cwd, parsed.sessionDir, storage);
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so

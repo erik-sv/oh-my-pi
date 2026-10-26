@@ -144,6 +144,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	#firstDrainError: Error | undefined;
 	#knownPaths: Set<string> | undefined;
 	#refreshPromise: Promise<void> | undefined;
+	#indexLoadPromise: Promise<void> | undefined;
 	#refreshChanges: Set<string> | undefined;
 
 	#assertPathKnown(path: string): void {
@@ -156,6 +157,23 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	#ensurePaths(...paths: string[]): Promise<void> {
 		return this.#knownPaths && paths.some(path => !this.#knownPaths?.has(path)) ? this.refresh() : RESOLVED;
+	}
+
+	/** Hydrate explicit paths while leaving unrelated session discovery deferred. */
+	async preparePaths(...paths: string[]): Promise<void> {
+		while (this.#knownPaths) {
+			const missing = paths.filter(path => !this.#knownPaths?.has(path));
+			if (missing.length === 0) return;
+			if (this.#indexLoadPromise) {
+				await this.#indexLoadPromise;
+				continue;
+			}
+			const pending = this.#reloadIndex(missing).finally(() => {
+				if (this.#indexLoadPromise === pending) this.#indexLoadPromise = undefined;
+			});
+			this.#indexLoadPromise = pending;
+			await pending;
+		}
 	}
 
 	#markIndexChanged(path: string): void {
@@ -187,9 +205,13 @@ export class IndexedSessionStorage implements SessionStorage {
 
 	refresh(): Promise<void> {
 		if (this.#refreshPromise) return this.#refreshPromise;
-		const pending = this.#reloadIndex().finally(() => {
-			this.#refreshPromise = undefined;
-		});
+		const pending = (this.#indexLoadPromise ?? RESOLVED)
+			.then(() => this.#reloadIndex())
+			.finally(() => {
+				this.#refreshPromise = undefined;
+				if (this.#indexLoadPromise === pending) this.#indexLoadPromise = undefined;
+			});
+		this.#indexLoadPromise = pending;
 		this.#refreshPromise = pending;
 		return pending;
 	}
@@ -203,7 +225,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		try {
 			const rows = await this.#backend.loadIndex(paths);
 			this.#refreshChanges = undefined;
-			for (const key of this.#index.keys()) {
+			for (const key of paths ?? this.#index.keys()) {
 				if (!changed.has(key)) this.#index.delete(key);
 			}
 			for (const row of rows) {
@@ -213,7 +235,9 @@ export class IndexedSessionStorage implements SessionStorage {
 					: null;
 				this.#setIndex(row.path, row.size, row.mtimeMs, title);
 			}
-			if (!paths) {
+			if (paths) {
+				for (const path of paths) this.#knownPaths?.add(path);
+			} else {
 				this.#knownPaths = undefined;
 				this.ensureCompleteIndex = undefined;
 			}

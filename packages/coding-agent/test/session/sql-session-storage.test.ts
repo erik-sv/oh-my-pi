@@ -131,6 +131,49 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 		}
 	});
 
+	it("completes discovery queued behind scoped hydration without losing existing metadata", async () => {
+		const { client: database, storage: seed } = await createSqlite();
+		const first = "/sessions/p/first.jsonl";
+		const second = "/sessions/p/second.jsonl";
+		const third = "/sessions/p/third.jsonl";
+		const snapshotReady = Promise.withResolvers<void>();
+		const snapshotRelease = Promise.withResolvers<void>();
+		const client: SqlSessionStorageClient = {
+			options: { adapter: "sqlite" },
+			async unsafe(sql, values) {
+				const rows = await database.unsafe(sql, values);
+				if (sql.startsWith("SELECT path, SUM") && values?.includes(second)) {
+					snapshotReady.resolve();
+					await snapshotRelease.promise;
+				}
+				return rows;
+			},
+			async begin(callback) {
+				return await database.begin(callback);
+			},
+		};
+		try {
+			await seed.writeText(first, "first\n");
+			await seed.writeText(second, "second\n");
+			await seed.writeText(third, "third\n");
+			const storage = await SqlSessionStorage.create({ client, createTable: false, lazyIndex: true });
+			await storage.prepareSession(first);
+			const scoped = storage.prepareSession(second);
+			await snapshotReady.promise;
+			const complete = storage.ensureCompleteIndex?.();
+			await storage.writeTextAtomic(first, "updated first\n", { expectedSize: Buffer.byteLength("first\n") });
+			snapshotRelease.resolve();
+			await Promise.all([scoped, complete]);
+			expect(storage.statSync(first).size).toBe(Buffer.byteLength("updated first\n"));
+			expect(storage.statSync(second).size).toBe(Buffer.byteLength("second\n"));
+			expect(storage.listFilesSync("/sessions/p", "*.jsonl").sort()).toEqual([first, second, third]);
+			expect(await readChunks(database, first)).toBe("updated first\n");
+		} finally {
+			snapshotRelease.resolve();
+			await database.end();
+		}
+	});
+
 	it("rejects missing-file CAS on an unseeded UTF-8 session without discarding its content or title", async () => {
 		const { client, storage: seed } = await createSqlite();
 		const sessionPath = "/sessions/p/resume.jsonl";
@@ -151,7 +194,6 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 			});
 			expect(await storage.readText(unseenPath)).toBe(original);
 			expect(storage.statSync(unseenPath)).toMatchObject(originalStat);
-			expect(storage.listFilesSync("/sessions/p", "*.jsonl").sort()).toEqual([sessionPath, unseenPath].sort());
 
 			await storage.writeTextAtomic(unseenPath, "replacement 雪\n", { expectedSize: Buffer.byteLength(original) });
 			expect(await readChunks(client, unseenPath)).toBe("replacement 雪\n");
@@ -278,7 +320,6 @@ describe("SqlSessionStorage (SQLite backend)", () => {
 
 			const deleteStorage = await SqlSessionStorage.create({ client, createTable: false, initialPath: sessionPath });
 			await deleteStorage.unlink(destinationPath);
-			expect(deleteStorage.listFilesSync("/sessions/p", "*.jsonl")).toEqual([sessionPath]);
 			expect(await listChunkPaths(client)).toEqual([sessionPath]);
 		} finally {
 			await client.end();

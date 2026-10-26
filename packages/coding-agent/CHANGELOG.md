@@ -29,6 +29,7 @@
 - Consult (`/seance`) now resolves SQL-backed session paths, project/global IDs, and nested subagent transcripts through the selected storage instead of requiring files on disk. Model-initiated SQL consultations are restricted to the caller's own session and artifact tree.
 - RPC and rpc-ui now default job widgets off, avoiding widget-authoring model calls when no widget UI is rendered. Explicit configuration remains authoritative.
 - Fixed RPC startup timeouts when continuing SQL-backed chats in large session databases.
+- Fresh RPC sessions with an explicit session directory now load only their new SQL transcript paths instead of scanning all historical chunks before startup. History discovery remains available on demand.
 - Unsupported RPC commands now preserve the request ID in error replies, so strict clients reject the request without terminating the session.
 - Disabled subscriptions remain visible when another organization or member still has an active credential.
 - Browser timeouts and tab shutdown no longer post cancellation to a terminated or replacement worker, crash the parent, or evict a tab reopened during cleanup.

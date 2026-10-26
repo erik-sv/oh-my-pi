@@ -86,6 +86,8 @@ export interface SqlSessionStorageOptions {
 	 * unknown-path operation hydrates the full index. Omit for normal startup.
 	 */
 	initialPath?: string;
+	/** Start with an empty index; callers must prepare paths before synchronous access. */
+	lazyIndex?: boolean;
 }
 
 interface DialectQueries {
@@ -335,6 +337,16 @@ function byteSuffix(chunks: readonly string[], maxBytes: number): string {
 	return Buffer.concat(buffers, total).toString("utf-8");
 }
 
+function sessionStoragePaths(sessionPath: string): string[] {
+	const resolved = path.resolve(sessionPath);
+	const paths = [resolved, `${resolved}.bak`];
+	if (resolved.endsWith(".jsonl")) {
+		const artifactsDir = resolved.slice(0, -".jsonl".length);
+		paths.push(path.join(artifactsDir, "draft.txt"), path.join(artifactsDir, ".draft-only-session"));
+	}
+	return paths;
+}
+
 /**
  * SQL-backed implementation of {@link SessionStorage} using `bun:sql`. Each
  * session JSONL file is stored as an append-only set of chunk rows — one row per
@@ -366,14 +378,19 @@ export class SqlSessionStorage extends IndexedSessionStorage {
 	static async create(options: SqlSessionStorageOptions): Promise<SqlSessionStorage> {
 		const backend = new SqlSessionStorageBackend(options);
 		const storage = new SqlSessionStorage(backend, backend.adapter, backend.table, options.sessionRoot);
-		const initialPath = options.initialPath === undefined ? undefined : path.resolve(options.initialPath);
-		const initialPaths = initialPath === undefined ? undefined : [initialPath, `${initialPath}.bak`];
-		if (initialPath?.endsWith(".jsonl")) {
-			const artifactsDir = initialPath.slice(0, -".jsonl".length);
-			initialPaths?.push(path.join(artifactsDir, "draft.txt"), path.join(artifactsDir, ".draft-only-session"));
-		}
+		const initialPaths =
+			options.initialPath !== undefined
+				? sessionStoragePaths(options.initialPath)
+				: options.lazyIndex
+					? []
+					: undefined;
 		await storage.initialize(initialPaths);
 		return storage;
+	}
+
+	/** Hydrate a transcript and its fixed sidecars without discovering unrelated sessions. */
+	async prepareSession(sessionPath: string): Promise<void> {
+		await this.preparePaths(...sessionStoragePaths(sessionPath));
 	}
 
 	get adapter(): SqlSessionStorageAdapter {

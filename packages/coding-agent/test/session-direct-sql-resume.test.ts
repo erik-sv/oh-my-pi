@@ -228,6 +228,29 @@ describe("direct SQL resume caller boundaries", () => {
 		expect((await SessionManager.list(root, sessionDir, storage)).map(session => session.id)).toContain("other");
 	});
 
+	it("persists an explicit fresh RPC session before discovering unrelated history", async () => {
+		const args = parseArgs(["--mode", "rpc", "--session-storage", "sql", "--session-dir", sessionDir]);
+		await setupBackend(args);
+		const storage = getDefaultSessionStorage();
+		expect(() => storage.existsSync(otherPath)).toThrow("Session index is incomplete");
+		const manager = await createSessionManager(args, root, settings);
+		if (!manager) throw new Error("Expected fresh RPC session");
+		managers.push(manager);
+		expect(manager.buildSessionContext().messages).toEqual([]);
+		manager.appendMessage({ role: "user", content: "Fresh RPC conversation", timestamp: 10 });
+		await manager.ensureOnDisk();
+		const fresh = manager.getSessionFile();
+		if (!fresh) throw new Error("Expected durable fresh session");
+		expect(() => storage.existsSync(otherPath)).toThrow("Session index is incomplete");
+		const reopened = await SessionManager.open(fresh, sessionDir, storage);
+		managers.push(reopened);
+		expect(reopened.buildSessionContext().messages).toMatchObject([
+			{ role: "user", content: "Fresh RPC conversation" },
+		]);
+		expect((await SessionManager.list(root, sessionDir, storage)).map(session => session.id)).toContain("other");
+		expect(await storage.readText(firstPath)).toBe(transcript("first", "Resume the original café conversation"));
+	});
+
 	it("persists a fresh-session boundary after a direct resume without hiding older history", async () => {
 		const storage = await partialStorage();
 		const manager = await openFirst(storage);
@@ -256,7 +279,6 @@ describe("direct SQL resume caller boundaries", () => {
 	});
 
 	it.each([
-		{ name: "explicit new session", flags: [] },
 		{ name: "continue", flags: ["--continue"] },
 		{ name: "ID resume", flags: ["--resume", "oth"] },
 		{ name: "picker", flags: ["--resume"] },
@@ -277,19 +299,13 @@ describe("direct SQL resume caller boundaries", () => {
 		await setupBackend(args);
 		const storage = getDefaultSessionStorage();
 		expect(storage.listFilesSync(sessionDir, "*.jsonl").sort()).toEqual([firstPath, otherPath].sort());
-		if (["explicit new session", "continue", "ID resume", "fork"].includes(name)) {
+		if (["continue", "ID resume", "fork"].includes(name)) {
 			const manager = await createSessionManager(args, root, settings);
 			if (!manager) throw new Error("Expected selected session");
 			managers.push(manager);
-			if (name === "explicit new session") {
-				expect(manager.buildSessionContext().messages).toEqual([]);
-				expect(manager.getSessionId()).not.toBe("first");
-				expect(manager.getSessionId()).not.toBe("other");
-			} else {
-				const text =
-					name === "fork" ? "Resume the original café conversation" : "Unrelated local history remains available";
-				expect(manager.buildSessionContext().messages).toMatchObject([{ role: "user", content: text }]);
-			}
+			const text =
+				name === "fork" ? "Resume the original café conversation" : "Unrelated local history remains available";
+			expect(manager.buildSessionContext().messages).toMatchObject([{ role: "user", content: text }]);
 		}
 	});
 });
