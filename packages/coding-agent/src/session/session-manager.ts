@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
+	AssistantRetryRecovery,
 	ImageContent,
 	Message,
 	MessageAttribution,
@@ -50,6 +51,7 @@ import {
 	snapcompactHistoryBlockOptions,
 } from "./session-context";
 import {
+	applyRetryRecoveryEntries,
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type CredentialPinEntry,
@@ -65,6 +67,8 @@ import {
 	lastSelfSelectedLeafId,
 	type NewSessionOptions,
 	type ResetBoundaryEntry,
+	RETRY_RECOVERY_ENTRY_TYPE,
+	type RetryRecoveryEntryData,
 	type ServiceTierChangeEntry,
 	sessionEntryLeafId,
 	type SessionEntry,
@@ -135,6 +139,12 @@ const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
  * inside every read-to-publish window exhausts them.
  */
 const MAX_WRITE_CONFLICT_RECOVERIES = 3;
+/**
+ * While session persistence keeps failing, log it again at most this often,
+ * with the number of failures since the previous log. A different kind of
+ * failure logs at once.
+ */
+const PERSISTENCE_FAILURE_RELOG_INTERVAL_MS = 60_000;
 
 /** A fresh session id. */
 export function mintSessionId(): string {
@@ -921,6 +931,15 @@ export class SessionManager {
 	/** Byte length this manager last loaded or durably wrote; `null` means the path was absent. */
 	#expectedDiskSize: number | null = null;
 	/**
+	 * Bytes of hot-path appends to `path` that a `defersSyncPublish` backend
+	 * has queued but not confirmed. The backend's per-path queue publishes them
+	 * before any rewrite of the same path queued later, so a synchronous
+	 * rewrite issued meanwhile must expect them on top of `#expectedDiskSize`.
+	 * A rewrite that queues on `path` takes them over: their confirmations then
+	 * record nothing, since the rewrite's own confirmation records the body.
+	 */
+	#unconfirmedAppends: { path: string; bytes: number } | undefined;
+	/**
 	 * Generation of the latest deferred publish queued on a `defersSyncPublish`
 	 * backend. A deferred-rewrite confirmation older than the latest queued
 	 * publish is stale (the backend no longer holds its body) and must record
@@ -956,7 +975,8 @@ export class SessionManager {
 	/** Serializes async disk work (flush/close/atomic rewrite). Appends are synchronous and bypass it. */
 	#diskTail: Promise<void> = Promise.resolve();
 	#diskFailure: Error | undefined;
-	#diskFailureLogged = false;
+	/** Last log of the latched failure, so a failure that persists stays visible. */
+	#diskFailureReport: { loggedAt: number; kind: string; failuresSinceLog: number } | undefined;
 	/** FIFO reservation for atomic batches and authoritative recovery. */
 	#atomicPersistenceTail: Promise<void> = Promise.resolve();
 	/** Observer notifications withheld until their entries are proven durable. */
@@ -1047,7 +1067,33 @@ export class SessionManager {
 
 	#clearDiskError(): void {
 		this.#diskFailure = undefined;
-		this.#diskFailureLogged = false;
+		this.#diskFailureReport = undefined;
+	}
+
+	/**
+	 * Log a persistence failure. The first one since the last success also
+	 * reaches the persistence observers; later ones log again when the kind of
+	 * failure changes or {@link PERSISTENCE_FAILURE_RELOG_INTERVAL_MS} passed,
+	 * so writes that keep failing never go silent.
+	 */
+	#reportDiskFailure(error: Error, firstMessage: string): void {
+		const now = Date.now();
+		const report = this.#diskFailureReport;
+		if (!report) {
+			this.#diskFailureReport = { loggedAt: now, kind: error.name, failuresSinceLog: 0 };
+			logger.error(firstMessage, { sessionFile: this.#sessionFile, error: error.message, stack: error.stack });
+			this.#notifyPersistenceErrorObservers(error);
+			return;
+		}
+		report.failuresSinceLog++;
+		if (report.kind === error.name && now - report.loggedAt < PERSISTENCE_FAILURE_RELOG_INTERVAL_MS) return;
+		logger.error("Session persistence is still failing.", {
+			sessionFile: this.#sessionFile,
+			error: error.message,
+			firstError: this.#diskFailure?.message,
+			failuresSinceLastLog: report.failuresSinceLog,
+		});
+		this.#diskFailureReport = { loggedAt: now, kind: error.name, failuresSinceLog: 0 };
 	}
 
 	/**
@@ -1074,17 +1120,7 @@ export class SessionManager {
 		// A line that failed to land leaves its blob refs unreferenced on disk,
 		// so the next persist must re-check those blobs instead of trusting the memo.
 		forgetExternalizedImages(this.#blobs);
-
-		if (!this.#diskFailureLogged) {
-			this.#diskFailureLogged = true;
-			logger.error("Session persistence error.", {
-				sessionFile: this.#sessionFile,
-				error: error.message,
-				stack: error.stack,
-			});
-			this.#notifyPersistenceErrorObservers(error);
-		}
-
+		this.#reportDiskFailure(error, "Session persistence error.");
 		return this.#diskFailure;
 	}
 
@@ -1348,14 +1384,7 @@ export class SessionManager {
 		const error = new SessionPersistenceIndeterminateError(operationError, recoveryErrors);
 		this.#diskFailure = error;
 		forgetExternalizedImages(this.#blobs);
-		if (!this.#diskFailureLogged) {
-			this.#diskFailureLogged = true;
-			logger.error("Session persistence became indeterminate.", {
-				sessionFile: this.#sessionFile,
-				error: error.message,
-			});
-			this.#notifyPersistenceErrorObservers(error);
-		}
+		this.#reportDiskFailure(error, "Session persistence became indeterminate.");
 		return error;
 	}
 
@@ -1634,7 +1663,14 @@ export class SessionManager {
 			this.#closeWriterEventually();
 			for (let recoveries = 0; ; recoveries++) {
 				try {
-					const options = { expectedSize: this.#expectedDiskSize };
+					// Appends this manager queued on the path but the store has not
+					// confirmed land before this rewrite, so expect their bytes too.
+					const pending = this.#unconfirmedAppends;
+					const expectedSize =
+						pending?.path === targetPath && pending.bytes > 0
+							? (this.#expectedDiskSize ?? 0) + pending.bytes
+							: this.#expectedDiskSize;
+					const options = { expectedSize };
 					if (this.#storage.writeLinesSync) this.#storage.writeLinesSync(targetPath, body.lines, options);
 					else this.#storage.writeTextSync(targetPath, body.lines.join(""), options);
 					break;
@@ -1646,6 +1682,8 @@ export class SessionManager {
 				}
 			}
 			this.#clearDiskError();
+			// The queued body includes those appends; their confirmations must not count them again.
+			if (this.#unconfirmedAppends?.path === targetPath) this.#unconfirmedAppends = undefined;
 			if (this.#storage.defersSyncPublish) {
 				this.#fileIsCurrent = false;
 				this.#rewriteRequired = true;
@@ -1904,15 +1942,41 @@ export class SessionManager {
 				// the line: a lost publish must not leave the record describing bytes
 				// the store never accepted, or the next recovery rewrite hands the
 				// backend CAS an impossible `expectedSize`.
-				if (writer.appendSync) writer.appendSync(line);
-				const confirmed = writer.appendSync ? writer.flush() : writer.append(line);
-				void confirmed
-					.then(() => this.#recordDurableAppend(line))
-					.catch(err => {
+				const bytes = Buffer.byteLength(line, "utf8");
+				const sessionFile = this.#sessionFile;
+				let ledger: { path: string; bytes: number } | undefined;
+				let confirmed: Promise<void>;
+				if (writer.appendSync) {
+					writer.appendSync(line);
+					// Queued now, ahead of any rewrite of this path issued before it confirms.
+					if (sessionFile) {
+						ledger =
+							this.#unconfirmedAppends?.path === sessionFile
+								? this.#unconfirmedAppends
+								: { path: sessionFile, bytes: 0 };
+						ledger.bytes += bytes;
+						this.#unconfirmedAppends = ledger;
+					}
+					confirmed = writer.flush();
+				} else {
+					confirmed = writer.append(line);
+				}
+				void confirmed.then(
+					() => {
+						if (ledger) {
+							// A rewrite queued behind this line took it over.
+							if (this.#unconfirmedAppends !== ledger) return;
+							ledger.bytes -= bytes;
+						}
+						this.#recordDurableAppend(line);
+					},
+					err => {
+						if (ledger && this.#unconfirmedAppends === ledger) ledger.bytes -= bytes;
 						this.#fileIsCurrent = false;
 						this.#rewriteRequired = true;
 						this.#noteDiskFailure(err);
-					});
+					},
+				);
 			}
 		} catch (err) {
 			this.#fileIsCurrent = false;
@@ -2065,6 +2129,7 @@ export class SessionManager {
 		this.#titleUpdatedAt = header.timestamp;
 		const repairedUsage = normalizeLoadedUsage(entries);
 		if (repairedUsage > 0) logger.warn("Loaded assistant messages with incomplete usage", { count: repairedUsage });
+		applyRetryRecoveryEntries(entries);
 		this.#index.rebuild(entries);
 	}
 
@@ -3614,6 +3679,22 @@ export class SessionManager {
 	}
 
 	/**
+	 * Record an auto-retry outcome on the earlier assistant entry `targetId`.
+	 * The entry's message changes in memory; the transcript only gains an
+	 * appended record that loading applies again, so a large transcript is
+	 * never rewritten to annotate one turn.
+	 */
+	appendRetryRecovery(targetId: string, retryRecovery: AssistantRetryRecovery): string {
+		const target = this.#index.get(targetId);
+		if (target?.type !== "message" || target.message.role !== "assistant") {
+			throw new Error(`Assistant entry ${targetId} not found`);
+		}
+		target.message.retryRecovery = retryRecovery;
+		const data: RetryRecoveryEntryData = { targetId, retryRecovery };
+		return this.appendCustomEntry(RETRY_RECOVERY_ENTRY_TYPE, data);
+	}
+
+	/**
 	 * Rewrite the session file after in-place entry updates (e.g. pruning old tool
 	 * outputs). Use sparingly.
 	 */
@@ -4098,6 +4179,7 @@ export class SessionManager {
 		const sourceHeader = sourceEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 		const history = sourceEntries.filter(entry => entry.type !== "session") as SessionEntry[];
 		normalizeLoadedUsage(history);
+		applyRetryRecoveryEntries(history);
 		if (options?.resetInheritedCost) SessionManager.#resetInheritedUsageCost(history);
 		manager.#resetToNewSession(
 			{

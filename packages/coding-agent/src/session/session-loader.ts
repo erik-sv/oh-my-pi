@@ -14,7 +14,13 @@ import {
 	resolveImageDataUrlSync,
 } from "./blob-store";
 import { buildSessionContext } from "./session-context";
-import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
+import {
+	applyRetryRecoveryEntries,
+	type FileEntry,
+	type RawFileEntry,
+	type SessionEntry,
+	type SessionHeader,
+} from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
 import { isExternalizableImagePosition, isPersistenceTruncatedString } from "./session-persistence";
 import { FileSessionStorage, getDefaultSessionStorage, type SessionStorage } from "./session-storage";
@@ -725,6 +731,7 @@ export async function loadSessionMessagesReadOnly(filePath: string): Promise<Age
 	for (const entry of entries) repairTruncatedSnapcompactFrames(entry);
 	const blobs = new BlobStore(getBlobsDir());
 	const sessionEntries = entries.filter((e): e is SessionEntry => e.type !== "session");
+	applyRetryRecoveryEntries(sessionEntries);
 	const { messages } = buildSessionContext(sessionEntries, undefined, undefined, {
 		transcript: true,
 		collapseCompactedHistory: true,

@@ -6547,7 +6547,7 @@ export class AgentSession implements SettingsScope {
 			await Promise.all(this.#abortUnwinds);
 			await this.#advisors.waitForPendingCardEvents();
 			// Core subscribers run asynchronously. Retry recovery can still be
-			// rewriting entries before it publishes auto_retry_end.
+			// recording its outcome before it publishes auto_retry_end.
 			await this.#drainInFlightEventHandlers();
 			await this.#waitForPostPromptRecovery();
 			// An abort can finish (and schedule its drain) after the waits above returned.

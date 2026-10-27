@@ -214,7 +214,13 @@ await Bun.write(${JSON.stringify(resultPath)}, JSON.stringify(result));
 process.exit(0);
 `,
 	);
-	const child = await $`bun ${scriptPath}`.cwd(repoRoot).quiet().nothrow();
+	// The launcher's /proc/self/fd config belongs to its process, not this child.
+	// This harness supplies isolated settings instead.
+	const child = await $`bun ${scriptPath}`
+		.cwd(repoRoot)
+		.env({ ...process.env, PI_CONFIG_FILES: undefined })
+		.quiet()
+		.nothrow();
 	const stdout = child.stdout.toString();
 	const stderr = child.stderr.toString();
 	if (child.exitCode !== 0)

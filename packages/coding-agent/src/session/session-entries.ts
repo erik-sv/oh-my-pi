@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type {
+	AssistantRetryRecovery,
 	ImageContent,
 	MessageAttribution,
 	ServiceTierByFamily,
@@ -367,6 +368,40 @@ export function resolveSessionLeafId(entries: readonly SessionEntry[]): string |
 	const leafId = sessionEntryLeafId(last);
 	if (leafId === null || leafId === last.id || entries.some(entry => entry.id === leafId)) return leafId;
 	return lastSelfSelectedLeafId(entries);
+}
+
+/**
+ * `customType` of the custom entry that records an auto-retry outcome for an
+ * earlier assistant entry. Appending it keeps the transcript append-only where
+ * editing the earlier entry in place would rewrite the whole file.
+ */
+export const RETRY_RECOVERY_ENTRY_TYPE = "retry_recovery";
+
+/** `data` of a {@link RETRY_RECOVERY_ENTRY_TYPE} custom entry. */
+export interface RetryRecoveryEntryData {
+	/** Id of the assistant message entry the retry superseded. */
+	targetId: string;
+	retryRecovery: AssistantRetryRecovery;
+}
+
+/**
+ * Set `message.retryRecovery` on each assistant entry a retry-recovery entry
+ * targets, so a loaded session matches the live one that recorded it. Later
+ * records win; a missing or non-assistant target is skipped. Transcripts that
+ * carry `retryRecovery` inline need no record and load unchanged.
+ */
+export function applyRetryRecoveryEntries(entries: readonly SessionEntry[]): void {
+	let byId: Map<string, SessionEntry> | undefined;
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== RETRY_RECOVERY_ENTRY_TYPE) continue;
+		const data = entry.data as Partial<RetryRecoveryEntryData> | undefined;
+		if (typeof data?.targetId !== "string" || data.retryRecovery?.kind !== "auto-retry") continue;
+		byId ??= new Map(entries.map(candidate => [candidate.id, candidate]));
+		const target = byId.get(data.targetId);
+		if (target?.type === "message" && target.message.role === "assistant") {
+			target.message.retryRecovery = data.retryRecovery;
+		}
+	}
 }
 
 /** Raw logical file entry after loaders strip any fixed-width title slot. */

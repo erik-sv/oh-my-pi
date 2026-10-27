@@ -54,15 +54,19 @@ async function sqlBody(client: SQL, sessionFile: string): Promise<string> {
 }
 
 /**
- * Bun.SQL wrapper that can pause the next rewrite inside its transaction:
- * the chunk backend publishes a rewrite as delete+insert, so the first
- * `DELETE` on the chunk table after `holdNextReplace` is set is the replace.
+ * Bun.SQL wrapper that can pause the next rewrite or append inside its
+ * transaction: the chunk backend publishes a rewrite as delete+insert, so the
+ * first `DELETE` on the chunk table after `holdNextReplace` is set is the
+ * replace; an append starts by reading the first chunk rows.
  */
 class HeldSqlClient implements SqlSessionStorageClient {
 	readonly options: SqlSessionStorageClient["options"];
 	holdNextReplace = false;
 	readonly replaceStarted = Promise.withResolvers<void>();
 	readonly allowReplace = Promise.withResolvers<void>();
+	holdNextAppend = false;
+	readonly appendStarted = Promise.withResolvers<void>();
+	readonly allowAppend = Promise.withResolvers<void>();
 	readonly #client: InstanceType<typeof SQL>;
 
 	constructor(client: InstanceType<typeof SQL>) {
@@ -82,6 +86,11 @@ class HeldSqlClient implements SqlSessionStorageClient {
 						this.holdNextReplace = false;
 						this.replaceStarted.resolve();
 						return this.allowReplace.promise.then(() => transaction.unsafe(query, values));
+					}
+					if (this.holdNextAppend && query.startsWith("SELECT seq, content, title")) {
+						this.holdNextAppend = false;
+						this.appendStarted.resolve();
+						return this.allowAppend.promise.then(() => transaction.unsafe(query, values));
 					}
 					return transaction.unsafe(query, values);
 				},
@@ -318,6 +327,81 @@ describe("SessionManager + SqlSessionStorage (SQLite)", () => {
 		expect(body).toContain("fenced append");
 		expect(body).toContain("later turn");
 		expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(body, "utf8"));
+		await manager.close();
+		await client.end();
+	});
+
+	/**
+	 * The incident shape: a hot append is still on the wire when rewriteEntries()
+	 * arms its atomic fence, and turns recorded inside the fence replace the
+	 * transcript synchronously while that append is unconfirmed.
+	 */
+	async function raceRewriteWithUnconfirmedAppend(sessionName: string) {
+		const client = new SQL("sqlite::memory:");
+		const heldClient = new HeldSqlClient(client);
+		const storage = await SqlSessionStorage.create({ client: heldClient });
+		const sessionDir = virtualDir(`/sessions/${sessionName}`);
+		const manager = SessionManager.create("/cwd", sessionDir, storage);
+		manager.appendMessage(assistantMessage("seed reply"));
+		await manager.flush();
+		const sessionFile = manager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected session file");
+
+		heldClient.holdNextAppend = true;
+		manager.appendCustomEntry("unconfirmed_append", { padding: "x".repeat(400) });
+		await heldClient.appendStarted.promise;
+		const rewrite = manager.rewriteEntries();
+		// Let the scheduled rewrite arm its fence and park on the writer close.
+		const fenceArmed = Promise.withResolvers<void>();
+		setImmediate(fenceArmed.resolve);
+		await fenceArmed.promise;
+		manager.appendMessage({ role: "user", content: "fenced turn", timestamp: Date.now() });
+		manager.appendMessage(assistantMessage("reply during the stalled append"));
+		return { client, heldClient, storage, sessionDir, manager, sessionFile, rewrite };
+	}
+
+	/** The durable SQL body holds exactly the in-memory journal, and the CAS token describes it. */
+	async function expectDurableJournal(client: SQL, sessionDir: string, manager: SessionManager, sessionFile: string) {
+		const body = await sqlBody(client, sessionFile);
+		expect(manager.captureState().expectedDiskSize).toBe(Buffer.byteLength(body, "utf8"));
+		const reopened = await SessionManager.open(sessionFile, sessionDir, await SqlSessionStorage.create({ client }));
+		expect(reopened.getEntries().map(entry => entry.id)).toEqual(manager.getEntries().map(entry => entry.id));
+		await reopened.close();
+	}
+
+	it("persists turns recorded while a rewrite waits on an unconfirmed append", async () => {
+		const { client, heldClient, storage, sessionDir, manager, sessionFile, rewrite } =
+			await raceRewriteWithUnconfirmedAppend("append-rewrite-race");
+
+		heldClient.allowAppend.resolve();
+		await rewrite;
+		await storage.drain();
+		// Nothing else is appended: the session must converge on its own
+		// instead of latching the self-race until a later turn retries it.
+		await manager.flush();
+		await expectDurableJournal(client, sessionDir, manager, sessionFile);
+
+		manager.appendMessage({ role: "user", content: "later turn", timestamp: Date.now() });
+		await manager.flush();
+		await expectDurableJournal(client, sessionDir, manager, sessionFile);
+		await manager.close();
+		await client.end();
+	});
+
+	it("recovers when the unconfirmed append a rewrite waited on fails", async () => {
+		const { client, heldClient, storage, sessionDir, manager, sessionFile, rewrite } =
+			await raceRewriteWithUnconfirmedAppend("append-rewrite-race-failed");
+
+		heldClient.allowAppend.reject(new Error("connection reset during append"));
+		await rewrite.catch(() => {});
+		// The failed publish surfaces through drain and the latched failure.
+		await storage.drain().catch(() => {});
+		await manager.flush().catch(() => {});
+
+		// The next turn retries the whole journal against the size the store holds.
+		manager.appendMessage({ role: "user", content: "later turn", timestamp: Date.now() });
+		await manager.flush();
+		await expectDurableJournal(client, sessionDir, manager, sessionFile);
 		await manager.close();
 		await client.end();
 	});

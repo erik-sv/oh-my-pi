@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent, AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { ApiKey, AssistantMessage, AssistantRetryRecovery, Model, Usage } from "@oh-my-pi/pi-ai";
@@ -161,7 +162,9 @@ describe("AgentSession retry recovery", () => {
 		fixtureDir.removeSync();
 	});
 
-	async function runCredentialRecovery(): Promise<RecoveryRun> {
+	async function runCredentialRecovery(options?: {
+		onRetryStart?: (sessionManager: SessionManager) => void;
+	}): Promise<RecoveryRun> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) {
 			throw new Error("Expected bundled Anthropic test model to exist");
@@ -215,6 +218,7 @@ describe("AgentSession retry recovery", () => {
 		mockSchedulerWaitWithClock();
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		session.subscribe(event => {
+			if (event.type === "auto_retry_start") options?.onRetryStart?.(sessionManager);
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
 
@@ -255,45 +259,20 @@ describe("AgentSession retry recovery", () => {
 		sessions.push(session);
 		mockSchedulerWaitWithClock();
 
-		const rewriteStarted = Promise.withResolvers<void>();
-		const resumeRewrite = Promise.withResolvers<void>();
-		const rewriteEntries = sessionManager.rewriteEntries.bind(sessionManager);
-		vi.spyOn(sessionManager, "rewriteEntries").mockImplementation(async () => {
-			rewriteStarted.resolve();
-			await resumeRewrite.promise;
-			await rewriteEntries();
-		});
 		const retryEndEvents: AutoRetryEndEvent[] = [];
 		const unsubscribe = session.subscribe(event => {
 			if (event.type === "auto_retry_end") retryEndEvents.push(event);
 		});
-		let idleResolved = false;
-		const completion = (async () => {
+		try {
 			await session.prompt("Recover from the transient failure.");
 			await session.waitForIdle();
-			idleResolved = true;
-			unsubscribe();
-		})();
-
-		try {
-			await Promise.race([rewriteStarted.promise, completion]);
-			// Drain runnable work without releasing the recovery persistence gate.
-			const nextImmediate = Promise.withResolvers<void>();
-			setImmediate(nextImmediate.resolve);
-			await nextImmediate.promise;
-			expect(idleResolved).toBe(false);
-			expect(retryEndEvents).toEqual([]);
+			// Observed at the moment waitForIdle resolves, before any further yield.
+			expect(retryEndEvents).toHaveLength(1);
+			expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
+			expect(recoveredAssistantEntry(sessionManager).message.retryRecovery?.status).toBe("recovered");
 		} finally {
-			resumeRewrite.resolve();
-			try {
-				await completion;
-			} finally {
-				unsubscribe();
-			}
+			unsubscribe();
 		}
-
-		expect(retryEndEvents).toHaveLength(1);
-		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
 	});
 
 	it("marks a recovered retry error, emits it, persists it, and excludes only model-context replay", async () => {
@@ -782,5 +761,26 @@ describe("AgentSession retry recovery", () => {
 			role: "assistant",
 			content: [{ type: "text", text: "recovered after credential switch" }],
 		});
+	});
+
+	it("records a recovered retry by appending to the transcript instead of rewriting it", async () => {
+		let transcriptAtRetry = "";
+		const { sessionManager } = await runCredentialRecovery({
+			onRetryStart: manager => {
+				const sessionFile = manager.getSessionFile();
+				// Synchronous on purpose: the snapshot must precede the retry.
+				if (sessionFile) transcriptAtRetry = fs.readFileSync(sessionFile, "utf8");
+			},
+		});
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected recovery run to persist a session file");
+		expect(transcriptAtRetry).toContain("rate_limit_error");
+
+		// Ingest pipelines prove a transcript append-only by its unchanged prefix.
+		// Only the fixed-width title slot on the first line may change in place.
+		const transcript = await Bun.file(sessionFile).text();
+		const body = (text: string) => text.slice(text.indexOf("\n") + 1);
+		expect(body(transcript).startsWith(body(transcriptAtRetry))).toBe(true);
+		expect(recoveredAssistantEntry(sessionManager).message.retryRecovery?.status).toBe("recovered");
 	});
 });

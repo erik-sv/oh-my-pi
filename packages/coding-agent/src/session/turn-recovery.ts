@@ -871,7 +871,7 @@ export class TurnRecovery {
 		let retryErrors: RetryErrorUpdate[] | undefined;
 		try {
 			if (record.terminalTurn) await this.persistTerminalEmptyErrorTurn(record.terminalTurn);
-			if (record.retryErrors) retryErrors = await this.#markPendingRetryErrors(record.retryErrors);
+			if (record.retryErrors) retryErrors = this.#markPendingRetryErrors(record.retryErrors);
 		} finally {
 			try {
 				await this.#host.emitSessionEvent({
@@ -968,7 +968,7 @@ export class TurnRecovery {
 		});
 	}
 
-	async #markPendingRetryErrors(completion: RetryErrorCompletion): Promise<RetryErrorUpdate[]> {
+	#markPendingRetryErrors(completion: RetryErrorCompletion): RetryErrorUpdate[] {
 		if (this.#pendingRetryErrors.length === 0) return [];
 		const branch = this.#host.sessionManager.getBranchView();
 		const branchById = new Map<string, SessionEntry>();
@@ -1014,16 +1014,15 @@ export class TurnRecovery {
 					note: pending.note,
 				};
 			}
-			entry.message.retryRecovery = retryRecovery;
+			// Appended, not rewritten: the annotation is a few hundred bytes and the
+			// transcript can be hundreds of MB that ingesters re-import on any rewrite.
+			this.#host.sessionManager.appendRetryRecovery(entry.id, retryRecovery);
 			retryErrors.push({
 				entryId: entry.id,
 				persistenceKey: pending.persistenceKey,
 				note: retryRecovery.note,
 				retryRecovery,
 			});
-		}
-		if (retryErrors.length > 0) {
-			await this.#host.sessionManager.rewriteEntries();
 		}
 		return retryErrors;
 	}

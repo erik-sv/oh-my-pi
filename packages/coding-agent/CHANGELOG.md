@@ -24,6 +24,7 @@
 
 ### Fixed
 
+- SQL-backed sessions keep saving when a turn lands while a transcript rewrite waits on an unconfirmed append, repeated save failures stay in the log, and a successful auto-retry now appends its recovery status instead of rewriting the whole transcript.
 - Resuming a session by path reads its SQL transcript once; upstream's missing-path check re-read it as a freshness gate.
 - Consult (`/seance`) now resolves SQL-backed session paths, project/global IDs, and nested subagent transcripts through the selected storage instead of requiring files on disk. Model-initiated SQL consultations are restricted to the caller's own session and artifact tree.
 - RPC and rpc-ui now default job widgets off, avoiding widget-authoring model calls when no widget UI is rendered. Explicit configuration remains authoritative.

@@ -10,7 +10,7 @@
  * path; it is not a general-purpose mock.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, setSystemTime, vi } from "bun:test";
 import {
 	IndexedSessionStorage,
 	type SessionStorageBackend,
@@ -18,6 +18,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/indexed-session-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionWriteConflictError } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { logger } from "@oh-my-pi/pi-utils";
 
 class FakeBackend implements SessionStorageBackend {
 	readonly files = new Map<string, string>();
@@ -147,6 +148,39 @@ async function makeManager(): Promise<{
 }
 
 describe("SessionManager + indexed backend durability", () => {
+	afterEach(() => {
+		setSystemTime();
+		vi.restoreAllMocks();
+	});
+
+	it("keeps logging a persistence failure that persists instead of going silent", async () => {
+		const backend = new FakeBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		const manager = SessionManager.create("/cwd", "/sessions/proj", storage);
+		const errorLog = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+		// A stalled publish: every later turn fail-fasts against it.
+		const hold = Promise.withResolvers<void>();
+		backend.holdNextWrite = hold;
+		manager.appendMessage(assistantMessage("first turn"));
+		await backend.writeHeld.promise;
+		manager.appendMessage({ role: "user", content: "second turn", timestamp: Date.now() });
+		manager.appendMessage({ role: "user", content: "third turn", timestamp: Date.now() });
+		expect(errorLog).toHaveBeenCalledTimes(1);
+
+		setSystemTime(new Date(Date.now() + 10 * 60_000));
+		manager.appendMessage({ role: "user", content: "fourth turn", timestamp: Date.now() });
+		expect(errorLog).toHaveBeenCalledTimes(2);
+		expect(errorLog.mock.calls[1]?.[1]).toMatchObject({ failuresSinceLastLog: 2 });
+
+		hold.resolve();
+		await storage.drain().catch(() => {});
+		await manager.close();
+		const body = backend.files.get(manager.getSessionFile() ?? "") ?? "";
+		expect(body).toContain("fourth turn");
+	});
+
 	it("does not advance the durable size before the backend confirms the append", async () => {
 		const { backend, storage, manager } = await makeManager();
 		const sessionFile = manager.getSessionFile();
